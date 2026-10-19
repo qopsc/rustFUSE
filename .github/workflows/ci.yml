@@ -10,9 +10,7 @@ env:
 
 jobs:
   lint:
-    runs-on:
-      - nscloud-ubuntu-22.04-amd64-4x16-with-cache
-      - nscloud-cache-tag-rustfuse-linux
+    runs-on: namespace-profile-rustfuse-linux
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,14 +26,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: nscloud-ubuntu-22.04-amd64-4x16-with-cache
-            cache: rustfuse-linux
-          - runner: nscloud-macos-sequoia-arm64-6x14-with-cache
-            cache: rustfuse-macos
-    runs-on:
-      - ${{ matrix.runner }}
-      - nscloud-cache-tag-${{ matrix.cache }}
+        os: [linux, macos]
+    runs-on: namespace-profile-rustfuse-${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,9 +37,7 @@ jobs:
       - run: cargo test --all-targets
 
   integration:
-    runs-on:
-      - nscloud-ubuntu-22.04-amd64-4x16-with-cache
-      - nscloud-cache-tag-rustfuse-linux
+    runs-on: namespace-profile-rustfuse-linux
     services:
       rustfs:
         image: rustfs/rustfs:latest
