@@ -302,6 +302,7 @@ commit), two machines on one host against rustFS in docker:
 | Hub memory | 516 MB | 127 MB |
 | Local index (`.rustfuse/`) | 0.9–1.3 GB | 210–270 MB |
 | `git status`, repeated | 0.33–0.5 s | 0.06 s (fsmonitor hook) |
+| Branch diverged on two machines, 2000 files each, sync after | 13–16 s | 0.5–0.7 s |
 
 What changed: inline threshold 4 KiB → 256 bytes; files are written in
 parallel on apply (directories first, permissions last); the index rewrites
@@ -370,7 +371,7 @@ crates/
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
-| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook (**done**). Next: batched git cleanup, compression, encryption, 25 GB repos |
+| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup (**done**). Next: compression, encryption, 25 GB repos |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
@@ -393,6 +394,4 @@ Open:
   conflict copies.
 - A 3-way text merge for ordinary files (instead of a conflict copy) is a
   possible later addition.
-- Worktree cleanup and conflict handling call the `git` binary once per
-  path; very large diverged commits (thousands of files) are slow to
-  clean up. Batching is planned with Phase 4.
+
