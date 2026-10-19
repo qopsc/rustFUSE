@@ -940,3 +940,64 @@ async fn running_daemons_propagate_changes() {
     }
     assert_same(&dirs[0], &dirs[1]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fsmonitor_hook_reports_changes() {
+    use rustfuse_sync::fsmonitor::hook;
+    fn answer(out: Vec<u8>) -> (String, Vec<String>) {
+        let mut parts: Vec<String> = out
+            .split(|&b| b == 0)
+            .map(|p| String::from_utf8(p.to_vec()).unwrap())
+            .collect();
+        assert_eq!(parts.pop().as_deref(), Some(""));
+        let token = parts.remove(0);
+        (token, parts)
+    }
+    let c = Cluster::new(1, |root: &Path| {
+        fs::create_dir_all(root.join("proj/src")).unwrap();
+        fs::write(root.join("proj/src/lib.rs"), "fn main() {}").unwrap();
+        git_repo(&root.join("proj"));
+    })
+    .await;
+    let Cluster {
+        _tmp,
+        dirs,
+        replicas,
+        hub,
+        ..
+    } = c;
+    let proj = dirs[0].join("proj");
+    // Without a daemon, git is told to check everything.
+    assert_eq!(answer(hook(2, "", &proj.join("src"))).1, ["/"]);
+
+    let mut r = replicas.into_iter().next().unwrap();
+    let task = tokio::spawn(async move {
+        r.run(&hub, Duration::from_millis(50), Duration::from_secs(3600))
+            .await
+    });
+    let sock = dirs[0].join(".rustfuse").join(rustfuse_sync::fsmonitor::SOCKET);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !sock.exists() {
+        assert!(std::time::Instant::now() < deadline, "daemon did not start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ask = |token: String| {
+        let proj = proj.clone();
+        tokio::task::spawn_blocking(move || answer(hook(2, &token, &proj)))
+    };
+    let (t0, all) = ask(String::new()).await.unwrap();
+    assert_eq!(all, ["/"]);
+
+    // A change made just before the query is always in the answer.
+    fs::write(proj.join("src/lib.rs"), "fn main() { edited() }").unwrap();
+    fs::write(proj.join("new.txt"), "new").unwrap();
+    fs::write(dirs[0].join("outside.txt"), "not in the repo").unwrap();
+    let (t1, paths) = ask(t0).await.unwrap();
+    assert_eq!(paths, ["new.txt", "new.txt/", "src/lib.rs", "src/lib.rs/"]);
+
+    // git writing its own files changes nothing it needs to hear about.
+    git(&proj, &["add", "-A"]);
+    let (t2, paths) = ask(t1.clone()).await.unwrap();
+    assert_eq!((t2, paths.len()), (t1, 0));
+    task.abort();
+}
