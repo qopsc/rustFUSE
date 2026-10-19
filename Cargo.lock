@@ -2131,6 +2131,7 @@ dependencies = [
  "clap",
  "futures",
  "getrandom 0.4.3",
+ "rustfuse-hub",
  "rustfuse-store",
  "rustfuse-sync",
  "rustfuse-types",
@@ -2147,8 +2148,25 @@ dependencies = [
  "bytes",
  "fastcdc",
  "futures",
+ "getrandom 0.4.3",
  "rustfuse-store",
  "rustfuse-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "rustfuse-hub"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "postcard",
+ "rustfuse-store",
+ "rustfuse-types",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -2174,6 +2192,7 @@ dependencies = [
 name = "rustfuse-sync"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "getrandom 0.4.3",
@@ -2184,6 +2203,7 @@ dependencies = [
  "rayon",
  "redb",
  "rustfuse-chunk",
+ "rustfuse-hub",
  "rustfuse-store",
  "rustfuse-types",
  "serde",
@@ -2192,7 +2212,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "zstd",
 ]
 
 [[package]]

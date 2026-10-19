@@ -78,7 +78,14 @@ impl Applier<'_> {
         // 1. Park nodes that move away or disappear, deepest first.
         let mut leaving: Vec<&NodeChange> = changes
             .iter()
-            .filter(|c| c.old_path.is_some() && (c.new.is_none() || c.new_path != c.old_path))
+            .filter(|c| {
+                // Also park nodes whose directory changes identity at the
+                // same path (directories merged by conflict resolution).
+                c.old_path.is_some()
+                    && (c.new.is_none()
+                        || c.new_path != c.old_path
+                        || c.old.as_ref().map(|e| e.parent) != c.new.as_ref().map(|e| e.parent))
+            })
             .collect();
         leaving.sort_by_key(|c| std::cmp::Reverse(c.old_path.as_ref().unwrap().components().count()));
         let mut staged: HashSet<NodeId> = HashSet::new();

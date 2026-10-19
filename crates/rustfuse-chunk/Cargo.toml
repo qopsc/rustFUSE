@@ -13,6 +13,7 @@ blake3 = "1.8.7"
 bytes = "1.12.1"
 fastcdc = "5.0.0"
 futures = "0.3.34"
+getrandom = "0.4.3"
 rustfuse-store = { version = "0.1.0", path = "../rustfuse-store" }
 rustfuse-types = { version = "0.1.0", path = "../rustfuse-types" }
 thiserror = "2.0.21"

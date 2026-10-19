@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **draft for review** · 2026-10-19
+Status: **Phases 0–2 implemented** · 2026-10-19
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -116,24 +116,30 @@ through the hub acting as an S3 proxy (Phase 5).
 
 ### 5.2 Operations
 
+Two state-based ops, grouped into **changesets** (one per capture, all ops
+sharing one version):
+
 ```
-Create  { node, parent, name, kind, mode, content? | symlink target }
-Write   { node, base_version, content }          content = chunk list + size
-Rename  { node, base_parent, base_name, parent, name }
-Delete  { node, base_version }
-SetMeta { node, mode?, mtime? }                   uid/gid are not synced
+Upsert { node, entry, base: Option<Versions>, changed: {loc, data, meta} }
+Remove { node, base: Versions }
+entry    = { parent, name, mode, mtime, content }   uid/gid are not synced
+Versions = { loc, data, meta }, each a Version = (HLC time, replica)
 ```
 
-Every node carries a **version** = (replica, counter) of the last op applied
-to it. An op's `base_version` says which version the author saw; if the
-receiver's current version differs, the op is **concurrent** and goes
-through conflict resolution (§7).
+Each node keeps a **version per part**: location (parent + name), data
+(content + mtime) and meta (permission bits). An op names the parts it
+changes and the versions its author saw (`base`), so the receiver can tell a
+clean change from a concurrent one per part, and a rename on one machine
+composes with an edit on another (§7.2). Applying the same changeset twice
+changes nothing.
 
-The hub assigns each accepted op a sequence number. A daemon's state is
-"applied up to seq N" plus its own unpushed outbox. Offline work just grows
-the outbox; reconnecting pushes it, and the hub accepts it as-is (the hub
-does not resolve conflicts: every daemon resolves deterministically from
-the same ordered log, so all replicas converge to the same result).
+The hub assigns each accepted changeset a sequence number. A machine's
+state is the log "applied up to seq N", plus its own **outbox** of
+changesets not yet seen in the log; its disk shows the log with the outbox
+replayed on top. Offline work just grows the outbox; reconnecting sends it,
+and the hub accepts it as-is (the hub does not resolve conflicts: every
+machine resolves deterministically from the same ordered log, so all
+replicas converge to the same result).
 
 ### 5.3 Content
 
@@ -243,27 +249,35 @@ before you commit over a concurrent session.
 
 ## 9. Hub
 
-- Rust, tokio; one process per deployment, run next to rustFS.
-- Per volume: append-only op log in embedded `redb`, archived to the bucket
-  as immutable segments plus periodic snapshots. The hub can be rebuilt
-  from the bucket.
-- API (gRPC or a lean framed protocol over TLS): `push(volume, ops) → seqs`,
-  `subscribe(volume, from_seq)` stream, `snapshot`, `auth`.
-- Auth: per-machine keys, revocable.
-- HA is optional; if the hub is down, every machine keeps working offline.
+- Rust, tokio; one process (`rustfuse hub`) per deployment, run next to
+  rustFS. One hub serves every volume in a bucket.
+- Per volume: the hub numbers each changeset and writes it to the bucket
+  (`log/{seq}`) **before** acknowledging it, then streams it to every
+  connected machine. Recent changesets are cached in memory; older ones
+  are read back from the bucket. A restarted or replacement hub continues
+  from the bucket alone.
+- Snapshots (`snap/{seq}`) are written by the machine whose changeset lands
+  at seq 1 or a multiple of 256; new machines attach from the latest
+  snapshot plus the log tail, straight from the bucket.
+- Protocol: TCP, length-prefixed zstd + postcard frames. `Hello{volume,
+  token, after}` subscribes from a position; `Push(changeset)` appends.
+- Auth (Phase 2): one shared token per hub, from `RUSTFUSE_HUB_TOKEN`.
+  **No TLS yet**: run it on a trusted network or a tunnel. Per-machine keys
+  and TLS come with remote access in Phase 5.
+- HA is optional; if the hub is down, every machine keeps working offline,
+  and content waits in a local spool if the bucket is unreachable too.
 
 ## 10. Code layout
 
 ```
 crates/
-  rustfuse-types   ids, HLC, ops, errors            (exists)
-  rustfuse-store   ObjectStore trait + S3 + memory  (exists, Phase 0)
+  rustfuse-types   ids, HLC, versions, ops, changesets, snapshots
+  rustfuse-store   ObjectStore trait + S3 + memory + prefix views
   rustfuse-chunk   FastCDC + BLAKE3 + packs
-  rustfuse-index   local redb index, outbox, conflicts
-  rustfuse-watch   FSEvents / inotify / scanner
-  rustfuse-sync    capture, apply, conflict rules (generic + git)
-  rustfuse-hub     hub server
-  rustfuse         CLI + daemon: init, attach, status, conflicts, bench
+  rustfuse-hub     log in the bucket, wire protocol, hub server + client
+  rustfuse-sync    tree + conflict rules, redb index, scanner, watcher,
+                   applier, outbox, sync loop
+  rustfuse         CLI: hub, init, attach, sync, status, conflicts, bench
   rustfuse-fuse    optional mount frontend (Phase 6)
 ```
 
@@ -288,19 +302,31 @@ crates/
 | Phase | Deliverable |
 |---|---|
 | **0. Foundations** | Workspace, CI, rustFS harness, S3 layer (**done**) |
-| **1. Single machine** | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
-| **2. Hub + multi-machine** | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
+| **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
+| **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, exclusions, `rustfuse conflicts`, git scenario tests |
 | **4. Scale & speed** | 25 GB / 500k-file repos, parallel clone, fsmonitor hook, compression, encryption |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
-## 13. Open questions
+## 13. Decisions and open questions
 
-1. **Presentation (§2)**: native folder + daemon (recommended) or a FUSE
-   mount?
-2. **Hub placement**: run `rustfuse-hub` next to rustFS (recommended), or
-   must it be serverless (log in the bucket only, polling for changes)?
-3. **Conflict copies for worktree files**: is a sibling
-   `name.conflict-…` file acceptable, or would you rather get an automatic
-   3-way text merge with conflict markers for text files?
+Decided (2026-10-19):
+
+1. **Presentation (§2)**: plain local folder plus daemon first; an optional
+   FUSE mount later (Phase 6).
+2. **Hub placement**: `rustfuse-hub` runs next to rustFS.
+3. **Conflicting edits to the same file**: a sibling conflict copy
+   (`name.conflict-<machine>-<time>.ext`). An automatic 3-way text merge
+   can be added later for text files.
+
+Open:
+
+- Known in Phase 2: in git, a ref changed on two machines keeps the later
+  value and the other as a branch named `<ref>.conflict-…`; worktree files
+  follow their own last write, so after such a conflict `git status` can
+  show changes until the branches are merged. Phase 3 merges refs by
+  ancestry and recovers the index.
+- `git status` on one machine rewrites `.git/index`, which then syncs. The
+  recommendation is `core.checkStat=minimal` and `core.trustctime=false`;
+  Phase 3 treats the index specially.
