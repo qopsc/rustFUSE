@@ -95,6 +95,9 @@ pub struct SealedPack {
 /// so identical content is stored once.
 pub struct PackBuilder {
     seed: [u8; 16],
+    /// Random per builder: a restarted process must never reuse a pack id
+    /// (that would overwrite a pack other files still point into).
+    nonce: [u8; 16],
     counter: u64,
     current: PackId,
     buf: Vec<u8>,
@@ -105,8 +108,11 @@ impl PackBuilder {
     /// `seed` must be unique per writer (e.g. random per replica) so pack ids
     /// from different machines never collide.
     pub fn new(seed: [u8; 16]) -> Self {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).expect("no system randomness");
         let mut b = PackBuilder {
             seed,
+            nonce,
             counter: 0,
             current: PackId(0),
             buf: Vec::new(),
@@ -119,6 +125,7 @@ impl PackBuilder {
     fn next_id(&mut self) -> PackId {
         let mut h = blake3::Hasher::new();
         h.update(&self.seed);
+        h.update(&self.nonce);
         h.update(&self.counter.to_le_bytes());
         self.counter += 1;
         let bytes: [u8; 16] = h.finalize().as_bytes()[..16].try_into().unwrap();
@@ -349,5 +356,18 @@ mod tests {
             }
         }
         assert!(sealed >= 5);
+    }
+
+    #[test]
+    fn restarted_builders_never_reuse_pack_ids() {
+        let data = pseudo_random(1000, 4);
+        let ids: Vec<PackId> = (0..2)
+            .map(|_| {
+                let mut b = PackBuilder::new([3; 16]);
+                b.add(prepare(hash(&data), &data));
+                b.seal().unwrap().id
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
     }
 }

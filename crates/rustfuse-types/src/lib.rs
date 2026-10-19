@@ -7,13 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// Version of the on-bucket encoding of changesets and snapshots.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Files up to this size are stored inside the operation, not in packs.
 pub const INLINE_MAX: u64 = 4096;
 
 /// Identifies one machine's replica of a volume.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ReplicaId(pub u64);
 
 /// Stable identity of a file or directory, independent of its path:
@@ -153,27 +153,144 @@ pub struct Entry {
     pub content: Content,
 }
 
-/// A state-based change to one node. Upserts are idempotent: applying the
-/// same op twice gives the same tree.
+/// Hybrid logical clock reading: nanoseconds since the Unix epoch, nudged
+/// forward so that every reading is later than any it has seen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Hlc(pub u64);
+
+/// Issues [`Hlc`] readings for one replica.
+#[derive(Clone, Debug, Default)]
+pub struct Clock {
+    last: u64,
+}
+
+impl Clock {
+    pub fn new(last: Hlc) -> Self {
+        Clock { last: last.0 }
+    }
+
+    pub fn now(&mut self) -> Hlc {
+        let wall = Timestamp::now().0.max(0) as u64;
+        self.last = wall.max(self.last + 1);
+        Hlc(self.last)
+    }
+
+    /// Moves the clock past a reading seen from another replica.
+    pub fn observe(&mut self, t: Hlc) {
+        self.last = self.last.max(t.0);
+    }
+
+    pub fn last(&self) -> Hlc {
+        Hlc(self.last)
+    }
+}
+
+/// Identifies one change: when and where it was made. Ordered by time, so
+/// "later" in conflict rules is the greater version (`docs/design.md` §7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Version {
+    pub time: Hlc,
+    pub replica: ReplicaId,
+}
+
+/// Last change to each independently mergeable part of a node, so a rename
+/// on one machine and an edit on another both apply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Versions {
+    /// Parent and name.
+    pub loc: Version,
+    /// Content and mtime.
+    pub data: Version,
+    /// Permission bits.
+    pub meta: Version,
+}
+
+impl Versions {
+    pub fn all(v: Version) -> Self {
+        Versions {
+            loc: v,
+            data: v,
+            meta: v,
+        }
+    }
+}
+
+/// Which parts of a node an upsert changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fields(pub u8);
+
+impl Fields {
+    pub const LOC: Fields = Fields(1);
+    pub const DATA: Fields = Fields(2);
+    pub const META: Fields = Fields(4);
+    pub const ALL: Fields = Fields(7);
+
+    pub fn contains(self, f: Fields) -> bool {
+        self.0 & f.0 == f.0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::ops::BitOr for Fields {
+    type Output = Fields;
+    fn bitor(self, rhs: Fields) -> Fields {
+        Fields(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Fields {
+    fn bitor_assign(&mut self, rhs: Fields) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// A node as the volume knows it: its entry plus the version of each part.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Node {
+    pub entry: Entry,
+    pub versions: Versions,
+}
+
+/// A change to one node. Ops say which versions their author started from,
+/// so a receiver can tell a clean change from a concurrent one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
-    /// Create, modify, move or rename a node.
+    /// Create, modify, move or rename a node. `entry` is the full new
+    /// state; only the parts in `changed` count as changed.
     Upsert {
         node: NodeId,
         entry: Entry,
+        /// Versions the author saw; `None` for a new node.
+        base: Option<Versions>,
+        changed: Fields,
     },
     Remove {
         node: NodeId,
+        base: Versions,
     },
 }
 
-/// One batch of operations from one replica, stored as `log/{seq}`.
+impl Op {
+    pub fn node(&self) -> NodeId {
+        match self {
+            Op::Upsert { node, .. } | Op::Remove { node, .. } => *node,
+        }
+    }
+}
+
+/// One batch of operations from one replica. Every op in it carries the
+/// changeset's version. The hub assigns `seq` and stores it as `log/{seq}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changeset {
     pub format: u32,
+    /// Position in the volume's log (0 until the hub accepts it).
     pub seq: u64,
-    pub replica: ReplicaId,
-    pub time: Timestamp,
+    pub version: Version,
+    /// The author's own counter, to match accepted changesets to its outbox.
+    pub local: u64,
     pub ops: Vec<Op>,
 }
 
@@ -183,7 +300,10 @@ pub struct Changeset {
 pub struct Snapshot {
     pub format: u32,
     pub seq: u64,
-    pub nodes: Vec<(NodeId, Entry)>,
+    pub nodes: Vec<(NodeId, Node)>,
+    /// Removed nodes, kept so late concurrent changes resolve the same way
+    /// on every machine.
+    pub removed: Vec<(NodeId, Node)>,
 }
 
 #[cfg(test)]
@@ -212,6 +332,25 @@ mod tests {
         ] {
             assert_eq!(SystemTime::from(Timestamp::from(t)), t);
         }
+    }
+
+    #[test]
+    fn clock_is_monotonic_and_observes() {
+        let mut c = Clock::default();
+        let a = c.now();
+        let b = c.now();
+        assert!(b > a);
+        c.observe(Hlc(b.0 + 1_000_000_000_000));
+        assert!(c.now().0 > b.0 + 1_000_000_000_000);
+        let v1 = Version {
+            time: Hlc(5),
+            replica: ReplicaId(9),
+        };
+        let v2 = Version {
+            time: Hlc(6),
+            replica: ReplicaId(1),
+        };
+        assert!(v2 > v1, "versions order by time first");
     }
 
     #[test]

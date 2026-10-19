@@ -1,5 +1,6 @@
-//! End-to-end: a writer pushes a directory, a follower materializes it, and
-//! both stay byte-for-byte identical through edits, moves and deletes.
+//! End-to-end: several machines share a volume through an in-process hub
+//! and stay byte-for-byte identical through edits, moves, deletes,
+//! conflicts and offline work.
 //!
 //! Runs against the in-memory store, or against a real S3 endpoint when
 //! `RUSTFUSE_TEST_S3_ENDPOINT` is set.
@@ -9,19 +10,23 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rustfuse_store::{MemoryStore, ObjectStore, S3Config, S3Store};
-use rustfuse_sync::{Config, Replica, Role, STATE_DIR};
+use async_trait::async_trait;
+use bytes::Bytes;
+use rustfuse_store::{ListPage, MemoryStore, ObjectMeta, ObjectStore, PrefixStore, S3Config, S3Store};
+use rustfuse_sync::{Config, HubSpec, Replica, STATE_DIR};
 use rustfuse_types::ReplicaId;
 
-async fn store(volume_prefix: &str) -> Arc<dyn ObjectStore> {
+/// Root store holding `volumes/`.
+async fn root_store(run_prefix: &str) -> Arc<dyn ObjectStore> {
     match std::env::var("RUSTFUSE_TEST_S3_ENDPOINT") {
         Ok(endpoint) => {
             let mut cfg =
                 S3Config::new(std::env::var("RUSTFUSE_TEST_S3_BUCKET").unwrap_or("rustfuse-test".into()));
             cfg.endpoint = Some(endpoint);
-            cfg.prefix = volume_prefix.to_owned();
+            cfg.prefix = run_prefix.to_owned();
             cfg.access_key =
                 Some(std::env::var("RUSTFUSE_TEST_S3_ACCESS_KEY").unwrap_or("rustfsadmin".into()));
             cfg.secret_key =
@@ -34,18 +39,67 @@ async fn store(volume_prefix: &str) -> Arc<dyn ObjectStore> {
     }
 }
 
-fn config(replica: u64, role: Role) -> Config {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+fn config(volume: &str, replica: u64) -> Config {
     Config {
-        volume: format!("test-{nanos}"),
+        volume: volume.to_owned(),
         bucket: "unused".into(),
         endpoint: None,
         region: "us-east-1".into(),
         prefix: String::new(),
         path_style: true,
+        hub: None,
         replica: ReplicaId(replica),
         seed: [replica as u8; 16],
-        role,
+    }
+}
+
+/// A store that can be switched off to simulate losing the network.
+struct Flaky {
+    inner: Arc<dyn ObjectStore>,
+    offline: Arc<AtomicBool>,
+}
+
+impl Flaky {
+    fn check(&self) -> rustfuse_store::Result<()> {
+        if self.offline.load(Ordering::SeqCst) {
+            return Err(rustfuse_store::Error::Backend(Box::new(std::io::Error::other(
+                "offline",
+            ))));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for Flaky {
+    async fn get(&self, key: &str) -> rustfuse_store::Result<Bytes> {
+        self.check()?;
+        self.inner.get(key).await
+    }
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> rustfuse_store::Result<Bytes> {
+        self.check()?;
+        self.inner.get_range(key, range).await
+    }
+    async fn put(&self, key: &str, data: Bytes) -> rustfuse_store::Result<()> {
+        self.check()?;
+        self.inner.put(key, data).await
+    }
+    async fn head(&self, key: &str) -> rustfuse_store::Result<Option<ObjectMeta>> {
+        self.check()?;
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> rustfuse_store::Result<()> {
+        self.check()?;
+        self.inner.delete(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> rustfuse_store::Result<ListPage> {
+        self.check()?;
+        self.inner.list(prefix, after, limit).await
     }
 }
 
@@ -126,47 +180,120 @@ fn assert_same(a: &Path, b: &Path) {
     if da != db {
         let only_a: Vec<_> = da.iter().filter(|l| !db.contains(l)).collect();
         let only_b: Vec<_> = db.iter().filter(|l| !da.contains(l)).collect();
-        panic!("trees differ\nonly in source: {only_a:#?}\nonly in follower: {only_b:#?}");
+        panic!(
+            "trees differ\nonly in {}: {only_a:#?}\nonly in {}: {only_b:#?}",
+            a.display(),
+            b.display()
+        );
     }
 }
 
-struct Pair {
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Machines sharing one volume through one hub.
+struct Cluster {
     _tmp: tempfile::TempDir,
-    src: PathBuf,
-    dst: PathBuf,
-    writer: Replica,
-    follower: Replica,
+    dirs: Vec<PathBuf>,
+    replicas: Vec<Replica>,
+    offline: Vec<Arc<AtomicBool>>,
+    hub: HubSpec,
 }
 
-impl Pair {
-    async fn new(populate: impl FnOnce(&Path)) -> Pair {
+impl Cluster {
+    /// Machine 0 creates the volume from `populate`; the others attach.
+    async fn new(n: usize, populate: impl FnOnce(&Path)) -> Cluster {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
-        fs::create_dir(&src).unwrap();
-        populate(&src);
-        let w = config(1, Role::Writer);
-        let mut f = config(2, Role::Follower);
-        f.volume = w.volume.clone();
-        let s = store(&w.volume).await;
-        let (writer, _) = Replica::init(&src, w, s.clone()).await.unwrap();
-        let (follower, _) = Replica::attach(&dst, f, s).await.unwrap();
-        assert_same(&src, &dst);
-        Pair {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = root_store(&format!("rustfuse-tests/{nanos}")).await;
+        let volume = "vol";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = HubSpec {
+            addr: listener.local_addr().unwrap().to_string(),
+            token: "t0ken".into(),
+        };
+        tokio::spawn(rustfuse_hub::Hub::new(root.clone(), hub.token.clone()).serve(listener));
+
+        let mut c = Cluster {
             _tmp: tmp,
-            src,
-            dst,
-            writer,
-            follower,
+            dirs: Vec::new(),
+            replicas: Vec::new(),
+            offline: Vec::new(),
+            hub,
+        };
+        let mut populate = Some(populate);
+        for i in 0..n {
+            let dir = c._tmp.path().join(format!("m{i}"));
+            let offline = Arc::new(AtomicBool::new(false));
+            let store: Arc<dyn ObjectStore> = Arc::new(Flaky {
+                inner: Arc::new(PrefixStore::new(root.clone(), &format!("volumes/{volume}"))),
+                offline: offline.clone(),
+            });
+            let mut cfg = config(volume, i as u64 + 1);
+            cfg.hub = Some(c.hub.addr.clone());
+            let r = if i == 0 {
+                fs::create_dir(&dir).unwrap();
+                populate.take().unwrap()(&dir);
+                let (mut r, _) = Replica::init(&dir, cfg, store).await.unwrap();
+                r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+                r
+            } else {
+                Replica::attach(&dir, cfg, store).await.unwrap()
+            };
+            c.dirs.push(dir);
+            c.replicas.push(r);
+            c.offline.push(offline);
+        }
+        for i in 1..n {
+            c.assert_same(0, i);
+        }
+        c
+    }
+
+    fn dir(&self, i: usize) -> &Path {
+        &self.dirs[i]
+    }
+
+    /// One sync round on machine `i`; returns (sent, received).
+    async fn sync(&mut self, i: usize) -> (usize, usize) {
+        let s = self.replicas[i].sync_once(&self.hub, TIMEOUT).await.unwrap();
+        (s.pushed, s.received)
+    }
+
+    /// Syncs everyone until nothing moves, then checks all trees match.
+    async fn settle(&mut self) {
+        for round in 0.. {
+            let mut moved = false;
+            for i in 0..self.replicas.len() {
+                let (sent, received) = self.sync(i).await;
+                moved |= sent > 0 || received > 0;
+            }
+            if !moved {
+                break;
+            }
+            assert!(round < 10, "machines did not converge");
+        }
+        for i in 1..self.replicas.len() {
+            self.assert_same(0, i);
         }
     }
 
-    async fn sync(&mut self) -> bool {
-        let pushed = self.writer.push(None).await.unwrap().is_some();
-        self.follower.pull().await.unwrap();
-        assert_same(&self.src, &self.dst);
-        pushed
+    fn assert_same(&self, a: usize, b: usize) {
+        assert_same(&self.dirs[a], &self.dirs[b]);
     }
+
+    fn set_offline(&self, i: usize, off: bool) {
+        self.offline[i].store(off, Ordering::SeqCst);
+    }
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != STATE_DIR)
+        .collect();
+    v.sort();
+    v
 }
 
 fn sample_tree(root: &Path) {
@@ -185,106 +312,6 @@ fn sample_tree(root: &Path) {
     fs::create_dir_all(root.join("tests/target")).unwrap();
     fs::write(root.join("tests/target/mod.rs"), "// fixture").unwrap();
     symlink("src/main.rs", root.join("link")).unwrap();
-}
-
-#[tokio::test]
-async fn initial_sync_and_exclusions() {
-    let p = Pair::new(sample_tree).await;
-    assert!(!p.dst.join("target").exists(), "gitignored build dir was synced");
-    assert!(
-        p.dst.join("tests/target/mod.rs").exists(),
-        "tracked dir named target was skipped"
-    );
-    assert!(p.dst.join("empty").is_dir());
-    assert_eq!(
-        fs::read_link(p.dst.join("link")).unwrap(),
-        PathBuf::from("src/main.rs")
-    );
-}
-
-#[tokio::test]
-async fn edits_moves_and_deletes() {
-    let mut p = Pair::new(sample_tree).await;
-    assert!(!p.sync().await, "no-op push produced a changeset");
-
-    // Edit in place, append to a large file, chmod.
-    fs::write(p.src.join("README.md"), "hello world\n").unwrap();
-    let mut big = fs::read(p.src.join("src/nested/deep/big.bin")).unwrap();
-    big.extend_from_slice(b"appended");
-    fs::write(p.src.join("src/nested/deep/big.bin"), &big).unwrap();
-    fs::set_permissions(p.src.join("src/main.rs"), fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(p.sync().await);
-
-    // Rename a file, move a directory, delete a file and a directory.
-    fs::rename(p.src.join("README.md"), p.src.join("README.txt")).unwrap();
-    fs::rename(p.src.join("src/nested"), p.src.join("moved")).unwrap();
-    fs::remove_file(p.src.join("run.sh")).unwrap();
-    fs::remove_dir(p.src.join("empty")).unwrap();
-    assert!(p.sync().await);
-
-    // Swap two names through a temp name, and move a file into a new dir.
-    fs::write(p.src.join("a"), "A").unwrap();
-    fs::write(p.src.join("b"), "B").unwrap();
-    assert!(p.sync().await);
-    fs::rename(p.src.join("a"), p.src.join("tmp")).unwrap();
-    fs::rename(p.src.join("b"), p.src.join("a")).unwrap();
-    fs::rename(p.src.join("tmp"), p.src.join("b")).unwrap();
-    fs::create_dir(p.src.join("fresh")).unwrap();
-    fs::rename(p.src.join("README.txt"), p.src.join("fresh/README.txt")).unwrap();
-    assert!(p.sync().await);
-
-    // Replace a directory with a file of the same name, and a file with a symlink.
-    fs::remove_dir_all(p.src.join("moved")).unwrap();
-    fs::write(p.src.join("moved"), "now a file").unwrap();
-    fs::remove_file(p.src.join("a")).unwrap();
-    symlink("b", p.src.join("a")).unwrap();
-    assert!(p.sync().await);
-}
-
-#[tokio::test]
-async fn moves_do_not_reupload() {
-    let mut p = Pair::new(sample_tree).await;
-    fs::rename(p.src.join("src"), p.src.join("source")).unwrap();
-    let stats = p.writer.push(None).await.unwrap().unwrap();
-    assert_eq!(stats.files_read, 0, "moved files were re-read");
-    assert_eq!(stats.bytes_uploaded, 0);
-    p.follower.pull().await.unwrap();
-    assert_same(&p.src, &p.dst);
-}
-
-#[tokio::test]
-async fn partial_scan_from_watch_paths() {
-    let mut p = Pair::new(sample_tree).await;
-    fs::write(p.src.join("src/nested/new.txt"), "new").unwrap();
-    fs::remove_file(p.src.join("src/main.rs")).unwrap();
-    let dirs = vec![PathBuf::from("src/nested/new.txt"), PathBuf::from("src/main.rs")];
-    let stats = p.writer.push(Some(dirs)).await.unwrap().unwrap();
-    assert_eq!(stats.ops, 2);
-    p.follower.pull().await.unwrap();
-    assert_same(&p.src, &p.dst);
-}
-
-#[tokio::test]
-async fn reopen_and_follower_cannot_push() {
-    let mut p = Pair::new(sample_tree).await;
-    let store = p.writer_store();
-    drop(p.writer);
-    let mut writer = Replica::open(&p.src, store.clone()).unwrap();
-    assert!(writer.push(None).await.unwrap().is_none());
-    fs::write(p.src.join("x"), "x").unwrap();
-    assert!(writer.push(None).await.unwrap().is_some());
-    assert!(matches!(
-        p.follower.push(None).await,
-        Err(rustfuse_sync::Error::NotWriter)
-    ));
-    p.follower.pull().await.unwrap();
-    assert_same(&p.src, &p.dst);
-}
-
-impl Pair {
-    fn writer_store(&self) -> Arc<dyn ObjectStore> {
-        self.writer.store().clone()
-    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -306,63 +333,429 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test]
+async fn initial_sync_and_exclusions() {
+    let c = Cluster::new(2, sample_tree).await;
+    let dst = c.dir(1);
+    assert!(!dst.join("target").exists(), "gitignored build dir was synced");
+    assert!(
+        dst.join("tests/target/mod.rs").exists(),
+        "tracked dir named target was skipped"
+    );
+    assert!(dst.join("empty").is_dir());
+    assert_eq!(
+        fs::read_link(dst.join("link")).unwrap(),
+        PathBuf::from("src/main.rs")
+    );
+}
+
+#[tokio::test]
+async fn edits_moves_and_deletes() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    assert_eq!(c.sync(0).await, (0, 0), "no-op sync sent something");
+    let src = c.dir(0).to_path_buf();
+
+    // Edit in place, append to a large file, chmod.
+    fs::write(src.join("README.md"), "hello world\n").unwrap();
+    let mut big = fs::read(src.join("src/nested/deep/big.bin")).unwrap();
+    big.extend_from_slice(b"appended");
+    fs::write(src.join("src/nested/deep/big.bin"), &big).unwrap();
+    fs::set_permissions(src.join("src/main.rs"), fs::Permissions::from_mode(0o600)).unwrap();
+    c.settle().await;
+
+    // Rename a file, move a directory, delete a file and a directory.
+    fs::rename(src.join("README.md"), src.join("README.txt")).unwrap();
+    fs::rename(src.join("src/nested"), src.join("moved")).unwrap();
+    fs::remove_file(src.join("run.sh")).unwrap();
+    fs::remove_dir(src.join("empty")).unwrap();
+    c.settle().await;
+
+    // Swap two names through a temp name, and move a file into a new dir.
+    fs::write(src.join("a"), "A").unwrap();
+    fs::write(src.join("b"), "B").unwrap();
+    c.settle().await;
+    fs::rename(src.join("a"), src.join("tmp")).unwrap();
+    fs::rename(src.join("b"), src.join("a")).unwrap();
+    fs::rename(src.join("tmp"), src.join("b")).unwrap();
+    fs::create_dir(src.join("fresh")).unwrap();
+    fs::rename(src.join("README.txt"), src.join("fresh/README.txt")).unwrap();
+    c.settle().await;
+
+    // Replace a directory with a file of the same name, and a file with a symlink.
+    fs::remove_dir_all(src.join("moved")).unwrap();
+    fs::write(src.join("moved"), "now a file").unwrap();
+    fs::remove_file(src.join("a")).unwrap();
+    symlink("b", src.join("a")).unwrap();
+    c.settle().await;
+
+    // And the other way round: the second machine edits too.
+    fs::write(c.dir(1).join("from-b.txt"), "b").unwrap();
+    fs::remove_file(c.dir(1).join("moved")).unwrap();
+    c.settle().await;
+    assert!(src.join("from-b.txt").exists());
+}
+
+#[tokio::test]
+async fn moves_do_not_reupload() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::rename(c.dir(0).join("src"), c.dir(0).join("source")).unwrap();
+    let stats = c.replicas[0].capture(None).await.unwrap().unwrap();
+    assert_eq!(stats.files_read, 0, "moved files were re-read");
+    assert_eq!(stats.bytes_uploaded, 0);
+    c.settle().await;
+}
+
+#[tokio::test]
+async fn partial_scan_from_watch_paths() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("src/nested/new.txt"), "new").unwrap();
+    fs::remove_file(c.dir(0).join("src/main.rs")).unwrap();
+    let paths = vec![PathBuf::from("src/nested/new.txt"), PathBuf::from("src/main.rs")];
+    let stats = c.replicas[0].capture(Some(paths)).await.unwrap().unwrap();
+    assert_eq!(stats.ops, 2);
+    c.settle().await;
+}
+
+#[tokio::test]
+async fn reopen_keeps_state() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("x"), "x").unwrap();
+    c.replicas[0].capture(None).await.unwrap().unwrap();
+    // Restart before sending: the outbox survives.
+    let store = c.replicas[0].store().clone();
+    drop(c.replicas.remove(0));
+    c.replicas
+        .insert(0, Replica::open(c.dir(0), store.clone()).unwrap());
+    assert_eq!(c.replicas[0].outbox_len(), 1);
+    c.settle().await;
+    assert_eq!(fs::read(c.dir(1).join("x")).unwrap(), b"x");
+    assert_eq!(c.sync(1).await, (0, 0));
+    // New packs written after a restart must not replace earlier ones: a
+    // fresh machine still gets every file intact.
+    fs::write(c.dir(0).join("after-restart.bin"), pseudo_random(2 << 20, 11)).unwrap();
+    c.settle().await;
+    let fresh = c._tmp.path().join("fresh");
+    Replica::attach(&fresh, config("vol", 9), store).await.unwrap();
+    assert_same(c.dir(0), &fresh);
+}
+
+#[tokio::test]
+async fn concurrent_edits_to_different_files_merge() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("README.md"), "from a\n").unwrap();
+    fs::write(c.dir(1).join("src/main.rs"), "fn main() { /* b */ }\n").unwrap();
+    fs::rename(c.dir(1).join("run.sh"), c.dir(1).join("src/run.sh")).unwrap();
+    c.sync(0).await;
+    c.sync(1).await;
+    c.settle().await;
+    assert_eq!(
+        fs::read_to_string(c.dir(1).join("README.md")).unwrap(),
+        "from a\n"
+    );
+    assert!(c.dir(0).join("src/run.sh").exists());
+}
+
+#[tokio::test]
+async fn same_file_edited_on_two_machines_keeps_both() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("README.md"), "version a\n").unwrap();
+    fs::write(c.dir(1).join("README.md"), "version b\n").unwrap();
+    // b captures later, so its version is newer and keeps the name.
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    let root = names(c.dir(0));
+    let copy = root
+        .iter()
+        .find(|n| n.starts_with("README.conflict-"))
+        .expect("no conflict copy");
+    assert!(copy.ends_with(".md"));
+    assert_eq!(
+        fs::read_to_string(c.dir(0).join("README.md")).unwrap(),
+        "version b\n"
+    );
+    assert_eq!(fs::read_to_string(c.dir(0).join(copy)).unwrap(), "version a\n");
+}
+
+#[tokio::test]
+async fn edit_beats_delete() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("src/main.rs"), "kept\n").unwrap();
+    fs::remove_file(c.dir(1).join("src/main.rs")).unwrap();
+    fs::remove_dir_all(c.dir(1).join("src/nested")).unwrap();
+    fs::write(c.dir(0).join("src/nested/added.txt"), "new").unwrap();
+    c.sync(1).await;
+    c.settle().await;
+    assert_eq!(
+        fs::read_to_string(c.dir(1).join("src/main.rs")).unwrap(),
+        "kept\n"
+    );
+    // The deleted directory survives with what was added to it, nothing else.
+    assert_eq!(names(&c.dir(1).join("src/nested")), ["added.txt"]);
+}
+
+#[tokio::test]
+async fn same_directory_created_on_two_machines_merges() {
+    let mut c = Cluster::new(2, |_| {}).await;
+    for (i, name) in [(0, "a.txt"), (1, "b.txt")] {
+        fs::create_dir_all(c.dir(i).join("new/sub")).unwrap();
+        fs::write(c.dir(i).join("new/sub").join(name), name).unwrap();
+        fs::write(c.dir(i).join("new/same.txt"), "identical").unwrap();
+    }
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    assert_eq!(names(&c.dir(0).join("new")), ["same.txt", "sub"]);
+    assert_eq!(names(&c.dir(0).join("new/sub")), ["a.txt", "b.txt"]);
+}
+
+#[tokio::test]
+async fn offline_work_syncs_later() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    // Machine 1 loses the network, keeps working, including new large
+    // content that cannot be uploaded yet.
+    c.set_offline(1, true);
+    let dead_hub = HubSpec {
+        addr: "127.0.0.1:9".into(),
+        token: "x".into(),
+    };
+    fs::write(c.dir(1).join("offline.bin"), pseudo_random(1 << 20, 9)).unwrap();
+    fs::write(c.dir(1).join("README.md"), "edited offline\n").unwrap();
+    let stats = c.replicas[1].capture(None).await.unwrap().unwrap();
+    assert!(stats.packs_spooled > 0, "content was not spooled");
+    assert!(c.replicas[1].sync_once(&dead_hub, TIMEOUT).await.is_err());
+    // Meanwhile machine 0 carries on.
+    fs::write(c.dir(0).join("online.txt"), "online").unwrap();
+    c.sync(0).await;
+    // Back online: everything flows both ways.
+    c.set_offline(1, false);
+    c.settle().await;
+    assert!(c.dir(0).join("offline.bin").exists());
+    assert!(c.dir(1).join("online.txt").exists());
+}
+
+#[tokio::test]
+async fn local_edit_is_not_overwritten_by_remote_change() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("README.md"), "remote\n").unwrap();
+    c.sync(0).await;
+    // Machine 1 edits the same file without capturing; applying the remote
+    // change must capture it first and keep both.
+    fs::write(c.dir(1).join("README.md"), "local, unsaved\n").unwrap();
+    c.settle().await;
+    let all = names(c.dir(1));
+    let texts: Vec<String> = all
+        .iter()
+        .filter(|n| n.starts_with("README"))
+        .map(|n| fs::read_to_string(c.dir(1).join(n)).unwrap())
+        .collect();
+    assert!(texts.contains(&"remote\n".to_string()), "{texts:?}");
+    assert!(texts.contains(&"local, unsaved\n".to_string()), "{texts:?}");
+}
+
+#[tokio::test]
+async fn random_concurrent_changes_converge() {
+    // RUSTFUSE_FUZZ=<seeds> runs a longer search locally.
+    let seeds: u64 = std::env::var("RUSTFUSE_FUZZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let steps = if seeds > 3 { 150 } else { 60 };
+    let only: Option<u64> = std::env::var("RUSTFUSE_FUZZ_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    for seed in (0..seeds)
+        .map(|i| i * 7919 + 1)
+        .filter(|s| only.is_none_or(|o| o == *s))
+    {
+        eprintln!("seed {seed}");
+        let mut c = Cluster::new(3, |root| {
+            fs::create_dir_all(root.join("d0")).unwrap();
+            fs::write(root.join("d0/f0"), "start").unwrap();
+        })
+        .await;
+        let mut rng = seed;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for step in 0..steps {
+            let m = next(3) as usize;
+            let root = c.dir(m).to_path_buf();
+            let dir = root.join(format!("d{}", next(3)));
+            let file = dir.join(format!("f{}", next(4)));
+            let action = next(9);
+            if std::env::var("RUSTFUSE_FUZZ_TRACE").is_ok() {
+                eprintln!(
+                    "step {step}: m{m} action {action} {}",
+                    file.strip_prefix(&root).unwrap().display()
+                );
+            }
+            match action {
+                0 | 1 => {
+                    let _ = fs::create_dir_all(&dir);
+                    let len = if next(4) == 0 { 10_000 } else { 20 };
+                    if fs::symlink_metadata(&file).is_ok_and(|m| !m.is_file()) {
+                        continue;
+                    }
+                    fs::write(&file, pseudo_random(len, step + seed)).unwrap();
+                }
+                2 => {
+                    let _ = fs::remove_file(&file);
+                }
+                3 => {
+                    let to = root.join(format!("d{}", next(3))).join(format!("f{}", next(4)));
+                    if to.parent().unwrap().is_dir() {
+                        let _ = fs::rename(&file, &to);
+                    }
+                }
+                4 => {
+                    let _ = fs::remove_dir(&dir);
+                }
+                5 => {
+                    let _ = fs::create_dir_all(dir.join("sub"));
+                }
+                6 => {
+                    // Rename a whole directory (into a fresh name only).
+                    let to = root.join(format!("d{}", next(5)));
+                    if !to.exists() {
+                        let _ = fs::rename(&dir, &to);
+                    }
+                }
+                7 => {
+                    if fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+                        let mode = if next(2) == 0 { 0o755 } else { 0o644 };
+                        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+                    }
+                }
+                _ => {
+                    if dir.is_dir() && fs::symlink_metadata(&file).is_err() {
+                        symlink(format!("f{}", next(4)), &file).unwrap();
+                    }
+                }
+            }
+            let then = next(4);
+            if std::env::var("RUSTFUSE_FUZZ_TRACE").is_ok() && then < 2 {
+                eprintln!("  {} m{m}", if then == 0 { "capture" } else { "sync" });
+            }
+            match then {
+                0 => {
+                    c.replicas[m].capture(None).await.unwrap();
+                }
+                1 => {
+                    c.sync(m).await;
+                }
+                _ => {}
+            }
+        }
+        c.settle().await;
+    }
+}
+
+#[tokio::test]
 async fn git_repository_with_worktree() {
-    let mut p = Pair::new(|root| {
+    let mut c = Cluster::new(2, |root| {
         git(root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), "one\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", "first"]);
     })
     .await;
-    assert_eq!(git(&p.dst, &["log", "--format=%s"]), "first\n");
+    let (src, dst) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    assert_eq!(git(&dst, &["log", "--format=%s"]), "first\n");
 
     // Commits, branches, a worktree inside the volume and a gc (packs refs
     // and objects) all replicate into a repository git considers healthy.
     for i in 0..5 {
-        fs::write(p.src.join("a.txt"), format!("change {i}\n")).unwrap();
-        git(&p.src, &["commit", "-q", "-am", &format!("change {i}")]);
+        fs::write(src.join("a.txt"), format!("change {i}\n")).unwrap();
+        git(&src, &["commit", "-q", "-am", &format!("change {i}")]);
     }
-    git(&p.src, &["branch", "feature"]);
-    git(&p.src, &["worktree", "add", "-q", "wt", "feature"]);
-    fs::write(p.src.join("wt/b.txt"), "on feature\n").unwrap();
-    git(&p.src.join("wt"), &["add", "b.txt"]);
-    git(&p.src.join("wt"), &["commit", "-q", "-m", "feature work"]);
-    p.sync().await;
-    git(&p.src, &["gc", "-q"]);
-    p.sync().await;
+    git(&src, &["branch", "feature"]);
+    git(&src, &["worktree", "add", "-q", "wt", "feature"]);
+    fs::write(src.join("wt/b.txt"), "on feature\n").unwrap();
+    git(&src.join("wt"), &["add", "b.txt"]);
+    git(&src.join("wt"), &["commit", "-q", "-m", "feature work"]);
+    c.settle().await;
+    git(&src, &["gc", "-q"]);
+    c.settle().await;
 
-    git(&p.dst, &["fsck", "--strict"]);
+    git(&dst, &["fsck", "--strict"]);
     assert_eq!(
-        git(&p.dst, &["log", "--format=%s", "feature"]),
-        git(&p.src, &["log", "--format=%s", "feature"])
+        git(&dst, &["log", "--format=%s", "feature"]),
+        git(&src, &["log", "--format=%s", "feature"])
     );
-    assert_eq!(git(&p.dst.join("wt"), &["status", "--porcelain"]), "");
-    assert_eq!(
-        git(&p.dst, &["worktree", "list", "--porcelain"]).lines().count(),
-        git(&p.src, &["worktree", "list", "--porcelain"]).lines().count()
-    );
+    assert_eq!(git(&dst.join("wt"), &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
+async fn git_commits_on_two_machines_offline() {
+    let mut c = Cluster::new(2, |root| {
+        git(root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "first"]);
+    })
+    .await;
+    let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    // Both commit to main, and each starts its own branch, without syncing.
+    fs::write(a.join("a.txt"), "from a\n").unwrap();
+    git(&a, &["commit", "-q", "-am", "commit on a"]);
+    git(&a, &["branch", "topic-a"]);
+    fs::write(b.join("b.txt"), "from b\n").unwrap();
+    git(&b, &["add", "b.txt"]);
+    git(&b, &["commit", "-q", "-m", "commit on b"]);
+    git(&b, &["branch", "topic-b"]);
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+
+    for dir in [&a, &b] {
+        git(dir, &["fsck", "--strict"]);
+        // Both lines of work are reachable: the losing main is kept as a
+        // conflict branch until Phase 3 merges refs by ancestry.
+        let all = git(dir, &["log", "--all", "--format=%s"]);
+        assert!(
+            all.contains("commit on a") && all.contains("commit on b"),
+            "{all}"
+        );
+        let branches = git(dir, &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches.contains("topic-a") && branches.contains("topic-b"),
+            "{branches}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_pushes_changes() {
-    let mut p = Pair::new(sample_tree).await;
-    let src = p.src.clone();
-    let editor = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        fs::write(src.join("src/watched.txt"), "seen by the watcher").unwrap();
-        fs::rename(src.join("README.md"), src.join("src/README.md")).unwrap();
-    });
-    let watch = p.writer.watch_push(
-        std::time::Duration::from_millis(100),
-        std::time::Duration::from_secs(3600),
-    );
-    // The watcher runs until cancelled; give it time to see the edits.
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), watch).await;
-    editor.await.unwrap();
-    p.follower.pull().await.unwrap();
-    assert!(
-        p.dst.join("src/watched.txt").exists(),
-        "watcher did not push the new file"
-    );
-    assert_same(&p.src, &p.dst);
+async fn running_daemons_propagate_changes() {
+    let c = Cluster::new(2, sample_tree).await;
+    let Cluster {
+        _tmp,
+        dirs,
+        replicas,
+        hub,
+        ..
+    } = c;
+    let mut tasks = Vec::new();
+    for mut r in replicas {
+        let hub = hub.clone();
+        tasks.push(tokio::spawn(async move {
+            r.run(&hub, Duration::from_millis(50), Duration::from_secs(3600))
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fs::write(dirs[0].join("src/live.txt"), "seen live").unwrap();
+    fs::write(dirs[1].join("from-b.txt"), "b").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !(dirs[1].join("src/live.txt").exists() && dirs[0].join("from-b.txt").exists()) {
+        assert!(std::time::Instant::now() < deadline, "changes did not propagate");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for t in &tasks {
+        t.abort();
+    }
+    assert_same(&dirs[0], &dirs[1]);
 }

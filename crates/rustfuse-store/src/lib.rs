@@ -12,9 +12,11 @@ use bytes::Bytes;
 
 pub mod conformance;
 mod memory;
+mod prefix;
 mod s3;
 
 pub use memory::MemoryStore;
+pub use prefix::PrefixStore;
 pub use s3::{S3Config, S3Store};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

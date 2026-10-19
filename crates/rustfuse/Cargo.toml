@@ -14,9 +14,10 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 getrandom = "0.4.3"
+rustfuse-hub = { version = "0.1.0", path = "../rustfuse-hub" }
 rustfuse-store = { version = "0.1.0", path = "../rustfuse-store" }
 rustfuse-sync = { version = "0.1.0", path = "../rustfuse-sync" }
 rustfuse-types = { version = "0.1.0", path = "../rustfuse-types" }
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

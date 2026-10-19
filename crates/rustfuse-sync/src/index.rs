@@ -1,32 +1,33 @@
 //! Persistent local state of one synced directory, in `.rustfuse/index.redb`
 //! (`docs/design.md` §5.4).
+//!
+//! Holds two trees: the volume as the log describes it (through `applied`)
+//! and what is on this machine's disk, which is the log plus local
+//! changesets not yet accepted (the outbox). `pending` lists nodes where
+//! the disk may still lag behind, so an interrupted apply resumes.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use rustfuse_types::{ChunkRef, Entry, NodeId, ReplicaId};
+use rustfuse_types::{Changeset, ChunkRef, Hlc, Node, NodeId, ReplicaId};
 use serde::{Deserialize, Serialize};
 
-use crate::tree::{NodeChange, Tree};
+use crate::tree::Tree;
 use crate::{Error, Result};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
-const NODES: TableDefinition<u128, &[u8]> = TableDefinition::new("nodes");
+const LOG_NODES: TableDefinition<u128, &[u8]> = TableDefinition::new("log_nodes");
+const LOG_REMOVED: TableDefinition<u128, &[u8]> = TableDefinition::new("log_removed");
+const DISK_NODES: TableDefinition<u128, &[u8]> = TableDefinition::new("disk_nodes");
+const DISK_REMOVED: TableDefinition<u128, &[u8]> = TableDefinition::new("disk_removed");
+const PENDING: TableDefinition<u128, ()> = TableDefinition::new("pending");
+const OUTBOX: TableDefinition<u64, &[u8]> = TableDefinition::new("outbox");
 const STATS: TableDefinition<u128, &[u8]> = TableDefinition::new("stats");
 const CHUNKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    /// Created the volume and pushes changes.
-    Writer,
-    /// Applies changes from the volume.
-    Follower,
-}
-
-/// Settings of one synced directory. Credentials are not stored; they come
-/// from the environment (`RUSTFUSE_ACCESS_KEY` / `RUSTFUSE_SECRET_KEY`) or
-/// the standard AWS provider chain.
+/// Settings of one synced directory. Credentials and the hub token are not
+/// stored; they come from the environment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub volume: String,
@@ -36,10 +37,11 @@ pub struct Config {
     /// Bucket prefix under which volumes live.
     pub prefix: String,
     pub path_style: bool,
+    /// Hub address (`host:port`).
+    pub hub: Option<String>,
     pub replica: ReplicaId,
     /// Unique seed for this replica's pack ids.
     pub seed: [u8; 16],
-    pub role: Role,
 }
 
 impl Config {
@@ -94,18 +96,41 @@ impl StatKey {
     }
 }
 
-pub struct State {
-    pub config: Config,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counters {
+    /// Last log sequence applied.
     pub applied: u64,
+    /// Next node counter.
     pub counter: u64,
+    /// Last clock reading.
+    pub clock: Hlc,
+    /// Next outbox number.
+    pub next_local: u64,
 }
 
-/// Changes to persist atomically after a push or pull.
+pub struct Loaded {
+    pub config: Config,
+    pub counters: Counters,
+    pub log: Tree,
+    pub disk: Tree,
+    pub outbox: Vec<Changeset>,
+    pub pending: Vec<NodeId>,
+    pub stats: HashMap<NodeId, StatKey>,
+    pub chunks: Vec<ChunkRef>,
+}
+
+/// Changes to persist atomically.
 #[derive(Default)]
 pub struct Commit<'a> {
-    pub applied: u64,
-    pub counter: u64,
-    pub changes: &'a [NodeChange],
+    pub counters: Option<Counters>,
+    /// Nodes to write from the log tree.
+    pub log: Option<(&'a Tree, Vec<NodeId>)>,
+    /// Nodes to write from the disk tree.
+    pub disk: Option<(&'a Tree, Vec<NodeId>)>,
+    pub outbox_put: Vec<&'a Changeset>,
+    pub outbox_remove: Vec<u64>,
+    pub pending_add: Vec<NodeId>,
+    pub pending_clear: bool,
     pub stats: Vec<(NodeId, Option<StatKey>)>,
     pub chunks: Vec<ChunkRef>,
 }
@@ -134,11 +159,18 @@ impl Index {
             let mut s = tx.open_table(STATE).map_err(db_err)?;
             s.insert("config", serde_json::to_vec(config).unwrap().as_slice())
                 .map_err(db_err)?;
-            s.insert("applied", 0u64.to_le_bytes().as_slice())
-                .map_err(db_err)?;
-            s.insert("counter", 1u64.to_le_bytes().as_slice())
-                .map_err(db_err)?;
-            tx.open_table(NODES).map_err(db_err)?;
+            let c = Counters {
+                counter: 1,
+                next_local: 1,
+                ..Counters::default()
+            };
+            s.insert("counters", enc(&c).as_slice()).map_err(db_err)?;
+            tx.open_table(LOG_NODES).map_err(db_err)?;
+            tx.open_table(LOG_REMOVED).map_err(db_err)?;
+            tx.open_table(DISK_NODES).map_err(db_err)?;
+            tx.open_table(DISK_REMOVED).map_err(db_err)?;
+            tx.open_table(PENDING).map_err(db_err)?;
+            tx.open_table(OUTBOX).map_err(db_err)?;
             tx.open_table(STATS).map_err(db_err)?;
             tx.open_table(CHUNKS).map_err(db_err)?;
         }
@@ -147,87 +179,132 @@ impl Index {
     }
 
     pub fn open(path: &Path) -> Result<Index> {
-        Ok(Index {
-            db: Database::open(path).map_err(db_err)?,
+        let db = Database::open(path).map_err(|e| match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => Error::Index(
+                "another rustfuse process (probably `rustfuse sync`) is using this directory".into(),
+            ),
+            other => db_err(other),
+        })?;
+        Ok(Index { db })
+    }
+
+    pub fn config(&self) -> Result<Config> {
+        let tx = self.db.begin_read().map_err(db_err)?;
+        let s = tx.open_table(STATE).map_err(|e| {
+            Error::Index(format!(
+                "{e} (directories from older rustfuse versions must be re-attached)"
+            ))
+        })?;
+        let raw = s
+            .get("config")
+            .map_err(db_err)?
+            .ok_or_else(|| Error::Index("missing config".into()))?;
+        serde_json::from_slice(raw.value()).map_err(|e| {
+            Error::Index(format!(
+                "{e} (directories from older rustfuse versions must be re-attached)"
+            ))
         })
     }
 
-    pub fn state(&self) -> Result<State> {
+    pub fn load(&self) -> Result<Loaded> {
+        let config = self.config()?;
         let tx = self.db.begin_read().map_err(db_err)?;
         let s = tx.open_table(STATE).map_err(db_err)?;
-        let get = |k: &str| -> Result<Vec<u8>> {
-            Ok(s.get(k)
-                .map_err(db_err)?
-                .ok_or_else(|| Error::Index(format!("missing {k}")))?
-                .value()
-                .to_vec())
+        let counters: Counters = dec(s
+            .get("counters")
+            .map_err(db_err)?
+            .ok_or_else(|| Error::Index("missing counters".into()))?
+            .value())?;
+
+        let nodes = |def: TableDefinition<u128, &[u8]>| -> Result<Vec<(NodeId, Node)>> {
+            let t = tx.open_table(def).map_err(db_err)?;
+            let mut out = Vec::new();
+            for item in t.iter().map_err(db_err)? {
+                let (k, v) = item.map_err(db_err)?;
+                out.push((NodeId(k.value()), dec(v.value())?));
+            }
+            Ok(out)
         };
-        let u64_of = |b: Vec<u8>| -> Result<u64> {
-            Ok(u64::from_le_bytes(
-                b.try_into().map_err(|_| Error::Index("bad counter".into()))?,
-            ))
-        };
-        Ok(State {
-            config: serde_json::from_slice(&get("config")?).map_err(db_err)?,
-            applied: u64_of(get("applied")?)?,
-            counter: u64_of(get("counter")?)?,
+        let log = Tree::from_parts(nodes(LOG_NODES)?, nodes(LOG_REMOVED)?);
+        let disk = Tree::from_parts(nodes(DISK_NODES)?, nodes(DISK_REMOVED)?);
+
+        let mut outbox = Vec::new();
+        for item in tx.open_table(OUTBOX).map_err(db_err)?.iter().map_err(db_err)? {
+            outbox.push(dec(item.map_err(db_err)?.1.value())?);
+        }
+        let mut pending = Vec::new();
+        for item in tx.open_table(PENDING).map_err(db_err)?.iter().map_err(db_err)? {
+            pending.push(NodeId(item.map_err(db_err)?.0.value()));
+        }
+        let mut stats = HashMap::new();
+        for item in tx.open_table(STATS).map_err(db_err)?.iter().map_err(db_err)? {
+            let (k, v) = item.map_err(db_err)?;
+            stats.insert(NodeId(k.value()), dec(v.value())?);
+        }
+        let mut chunks = Vec::new();
+        for item in tx.open_table(CHUNKS).map_err(db_err)?.iter().map_err(db_err)? {
+            chunks.push(dec(item.map_err(db_err)?.1.value())?);
+        }
+        Ok(Loaded {
+            config,
+            counters,
+            log,
+            disk,
+            outbox,
+            pending,
+            stats,
+            chunks,
         })
-    }
-
-    pub fn tree(&self) -> Result<Tree> {
-        let tx = self.db.begin_read().map_err(db_err)?;
-        let t = tx.open_table(NODES).map_err(db_err)?;
-        let mut entries = Vec::new();
-        for item in t.iter().map_err(db_err)? {
-            let (k, v) = item.map_err(db_err)?;
-            entries.push((NodeId(k.value()), dec::<Entry>(v.value())?));
-        }
-        Ok(Tree::from_entries(entries))
-    }
-
-    pub fn stats(&self) -> Result<HashMap<NodeId, StatKey>> {
-        let tx = self.db.begin_read().map_err(db_err)?;
-        let t = tx.open_table(STATS).map_err(db_err)?;
-        let mut out = HashMap::new();
-        for item in t.iter().map_err(db_err)? {
-            let (k, v) = item.map_err(db_err)?;
-            out.insert(NodeId(k.value()), dec(v.value())?);
-        }
-        Ok(out)
-    }
-
-    pub fn chunks(&self) -> Result<Vec<ChunkRef>> {
-        let tx = self.db.begin_read().map_err(db_err)?;
-        let t = tx.open_table(CHUNKS).map_err(db_err)?;
-        let mut out = Vec::new();
-        for item in t.iter().map_err(db_err)? {
-            out.push(dec(item.map_err(db_err)?.1.value())?);
-        }
-        Ok(out)
     }
 
     pub fn commit(&self, c: Commit<'_>) -> Result<()> {
         let mut tx = self.db.begin_write().map_err(db_err)?;
         tx.set_durability(Durability::Immediate).map_err(db_err)?;
         {
-            let mut s = tx.open_table(STATE).map_err(db_err)?;
-            s.insert("applied", c.applied.to_le_bytes().as_slice())
-                .map_err(db_err)?;
-            s.insert("counter", c.counter.to_le_bytes().as_slice())
-                .map_err(db_err)?;
-            let mut nodes = tx.open_table(NODES).map_err(db_err)?;
-            let mut stats = tx.open_table(STATS).map_err(db_err)?;
-            for ch in c.changes {
-                match &ch.new {
-                    Some(e) => {
-                        nodes.insert(ch.node.0, enc(e).as_slice()).map_err(db_err)?;
-                    }
-                    None => {
-                        nodes.remove(ch.node.0).map_err(db_err)?;
-                        stats.remove(ch.node.0).map_err(db_err)?;
-                    }
-                }
+            if let Some(counters) = &c.counters {
+                let mut s = tx.open_table(STATE).map_err(db_err)?;
+                s.insert("counters", enc(counters).as_slice()).map_err(db_err)?;
             }
+            let write_tree = |tree: &Tree,
+                              ids: &[NodeId],
+                              nodes: TableDefinition<u128, &[u8]>,
+                              removed: TableDefinition<u128, &[u8]>|
+             -> Result<()> {
+                let mut n = tx.open_table(nodes).map_err(db_err)?;
+                let mut r = tx.open_table(removed).map_err(db_err)?;
+                for id in ids {
+                    match tree.node(*id) {
+                        Some(node) => n.insert(id.0, enc(node).as_slice()).map_err(db_err)?,
+                        None => n.remove(id.0).map_err(db_err)?,
+                    };
+                    match tree.removed(*id) {
+                        Some(node) => r.insert(id.0, enc(node).as_slice()).map_err(db_err)?,
+                        None => r.remove(id.0).map_err(db_err)?,
+                    };
+                }
+                Ok(())
+            };
+            if let Some((tree, ids)) = &c.log {
+                write_tree(tree, ids, LOG_NODES, LOG_REMOVED)?;
+            }
+            if let Some((tree, ids)) = &c.disk {
+                write_tree(tree, ids, DISK_NODES, DISK_REMOVED)?;
+            }
+            let mut outbox = tx.open_table(OUTBOX).map_err(db_err)?;
+            for cs in &c.outbox_put {
+                outbox.insert(cs.local, enc(cs).as_slice()).map_err(db_err)?;
+            }
+            for local in &c.outbox_remove {
+                outbox.remove(local).map_err(db_err)?;
+            }
+            let mut pending = tx.open_table(PENDING).map_err(db_err)?;
+            if c.pending_clear {
+                pending.retain(|_, _| false).map_err(db_err)?;
+            }
+            for id in &c.pending_add {
+                pending.insert(id.0, ()).map_err(db_err)?;
+            }
+            let mut stats = tx.open_table(STATS).map_err(db_err)?;
             for (id, st) in &c.stats {
                 match st {
                     Some(st) => stats.insert(id.0, enc(st).as_slice()).map_err(db_err)?,

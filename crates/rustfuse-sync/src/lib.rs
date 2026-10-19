@@ -1,14 +1,13 @@
 //! The sync engine: keeps a plain local directory and a volume in the
 //! bucket in step (`docs/design.md` §4–§6).
 //!
-//! Phase 1 supports one writer per volume (`push`) and any number of
-//! followers (`pull`). Concurrent writers and conflict resolution arrive
-//! with the hub in Phase 2.
+//! Any number of machines can change the same volume, online or offline;
+//! the hub orders their changes and every machine resolves conflicts the
+//! same way (`docs/design.md` §7).
 
 mod apply;
 mod ignore;
 mod index;
-mod remote;
 mod replica;
 mod scan;
 mod tree;
@@ -16,11 +15,11 @@ mod tree;
 use std::path::PathBuf;
 
 pub use ignore::Ignore;
-pub use index::{Config, Role};
-pub use remote::Volume;
-pub use replica::{PushStats, Replica};
+pub use index::Config;
+pub use replica::{CaptureStats, HubSpec, Replica, SyncStats};
+pub use rustfuse_hub::Volume;
 pub use scan::Change;
-pub use tree::Tree;
+pub use tree::{Tree, conflict_name};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -28,6 +27,8 @@ pub enum Error {
     Store(#[from] rustfuse_store::Error),
     #[error(transparent)]
     Chunk(#[from] rustfuse_chunk::Error),
+    #[error(transparent)]
+    Hub(rustfuse_hub::Error),
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -42,18 +43,30 @@ pub enum Error {
     VolumeExists,
     #[error("no volume found at this location")]
     NoVolume,
-    #[error("changeset {0} was already written by another machine")]
-    Conflict(u64),
-    #[error("this directory follows the volume; only the machine that ran `init` can push (until Phase 2)")]
-    NotWriter,
+    #[error("timed out waiting for the hub")]
+    Timeout,
+    #[error("the hub closed the connection")]
+    Disconnected,
+    #[error("local changes in the way: {0:?}")]
+    LocalChanges(Vec<PathBuf>),
     #[error("{0} is already a rustfuse directory")]
     AlreadyInitialized(PathBuf),
     #[error("{0} is not a rustfuse directory (run `rustfuse init` or `rustfuse attach`)")]
     NotInitialized(PathBuf),
     #[error("{0} must be empty to attach a volume")]
     NotEmpty(PathBuf),
-    #[error("another machine is pushing to this volume (changeset {0}); Phase 1 supports one writer")]
-    ForeignWriter(u64),
+}
+
+impl From<rustfuse_hub::Error> for Error {
+    fn from(e: rustfuse_hub::Error) -> Self {
+        match e {
+            rustfuse_hub::Error::Store(e) => Error::Store(e),
+            rustfuse_hub::Error::Corrupt(m) => Error::Corrupt(m),
+            rustfuse_hub::Error::VolumeExists => Error::VolumeExists,
+            rustfuse_hub::Error::NoVolume => Error::NoVolume,
+            other => Error::Hub(other),
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

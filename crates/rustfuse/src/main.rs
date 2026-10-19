@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use rustfuse_store::{ObjectStore, S3Config, S3Store};
-use rustfuse_sync::{Config, Replica, Role};
+use rustfuse_sync::{Config, HubSpec, Replica};
 use rustfuse_types::ReplicaId;
 
 mod bench;
@@ -22,12 +22,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the hub that orders changes for every volume in a bucket.
+    Hub {
+        /// Address to listen on.
+        #[arg(long, default_value_t = format!("0.0.0.0:{}", rustfuse_hub::DEFAULT_PORT))]
+        listen: String,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+        #[command(flatten)]
+        token: Token,
+    },
     /// Create a volume from an existing directory and upload it.
     Init {
         dir: PathBuf,
         /// Volume name, unique within the bucket and prefix.
         #[arg(long)]
         volume: String,
+        #[command(flatten)]
+        hub: HubArgs,
         #[command(flatten)]
         store: StoreArgs,
         #[command(flatten)]
@@ -39,38 +53,34 @@ enum Command {
         #[arg(long)]
         volume: String,
         #[command(flatten)]
+        hub: HubArgs,
+        #[command(flatten)]
         store: StoreArgs,
         #[command(flatten)]
         creds: Credentials,
     },
-    /// Upload local changes (on the machine that ran `init`).
-    Push {
+    /// Keep a directory in sync: send local changes and apply everyone
+    /// else's as they happen. Keeps working offline.
+    Sync {
         dir: PathBuf,
-        /// Keep running and push changes as they happen.
+        /// Sync once and exit instead of running continuously.
         #[arg(long)]
-        watch: bool,
-        /// Quiet period before pushing a burst of changes.
+        once: bool,
+        /// Quiet period before capturing a burst of changes.
         #[arg(long, default_value_t = 200)]
         debounce_ms: u64,
-        /// Full rescan interval while watching, to catch missed events.
+        /// Full rescan interval, to catch missed file events.
         #[arg(long, default_value_t = 600)]
         full_scan_secs: u64,
         #[command(flatten)]
         creds: Credentials,
-    },
-    /// Apply changes from the volume.
-    Pull {
-        dir: PathBuf,
-        /// Keep running and apply changes as they arrive.
-        #[arg(long)]
-        follow: bool,
-        #[arg(long, default_value_t = 1000)]
-        interval_ms: u64,
         #[command(flatten)]
-        creds: Credentials,
+        token: Token,
     },
-    /// Show the volume, role, and local changes not yet pushed.
+    /// Show the volume, sync position and local changes not yet captured.
     Status { dir: PathBuf },
+    /// List conflict copies kept next to the files they conflicted with.
+    Conflicts { dir: PathBuf },
     /// Measure raw object-store throughput and latency.
     Bench(bench::BenchArgs),
 }
@@ -103,6 +113,51 @@ struct Credentials {
     secret_key: Option<String>,
 }
 
+/// Shared secret between the hub and machines; never written to disk.
+#[derive(Args)]
+struct Token {
+    #[arg(long = "hub-token", env = "RUSTFUSE_HUB_TOKEN", hide_env_values = true)]
+    hub_token: Option<String>,
+}
+
+impl Token {
+    fn get(&self) -> Result<String> {
+        match &self.hub_token {
+            Some(t) if !t.is_empty() => Ok(t.clone()),
+            _ => bail!("set the hub token with --hub-token or RUSTFUSE_HUB_TOKEN"),
+        }
+    }
+}
+
+#[derive(Args)]
+struct HubArgs {
+    /// Hub address, host:port.
+    #[arg(long, env = "RUSTFUSE_HUB")]
+    hub: String,
+    #[command(flatten)]
+    token: Token,
+}
+
+impl HubArgs {
+    fn spec(&self) -> Result<HubSpec> {
+        Ok(HubSpec {
+            addr: with_port(&self.hub),
+            token: self.token.get()?,
+        })
+    }
+}
+
+fn with_port(addr: &str) -> String {
+    if addr
+        .rsplit_once(':')
+        .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
+    {
+        addr.to_owned()
+    } else {
+        format!("{addr}:{}", rustfuse_hub::DEFAULT_PORT)
+    }
+}
+
 impl StoreArgs {
     async fn connect(&self, creds: &Credentials, prefix: &str) -> Result<S3Store> {
         connect(
@@ -116,7 +171,10 @@ impl StoreArgs {
         .await
     }
 
-    fn config(&self, volume: String, role: Role) -> Result<Config> {
+    fn config(&self, volume: String, hub: &HubArgs) -> Result<Config> {
+        if !rustfuse_hub::valid_volume_name(&volume) {
+            bail!("volume names may only use letters, digits, '-', '_' and '.'");
+        }
         let mut seed = [0u8; 16];
         getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
         Ok(Config {
@@ -126,9 +184,9 @@ impl StoreArgs {
             region: self.region.clone(),
             prefix: self.prefix.clone(),
             path_style: !self.virtual_hosted,
+            hub: Some(with_port(&hub.hub)),
             replica: ReplicaId(getrandom::u64().map_err(|e| anyhow::anyhow!("no randomness: {e}"))?),
             seed,
-            role,
         })
     }
 }
@@ -164,14 +222,40 @@ async fn volume_store(config: &Config, creds: &Credentials) -> Result<Arc<dyn Ob
     Ok(Arc::new(s))
 }
 
-async fn open(dir: &Path, creds: &Credentials) -> Result<Replica> {
-    let config = Replica::config_of(dir)?;
-    let store = volume_store(&config, creds).await?;
-    Ok(Replica::open(dir, store)?)
-}
-
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
+}
+
+const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One sync round after init/attach; failing it is not fatal, since `sync`
+/// catches up later.
+async fn first_sync(r: &mut Replica, hub: &HubSpec) {
+    match r.sync_once(hub, SYNC_TIMEOUT).await {
+        Ok(_) => println!("In sync at changeset {}.", r.applied()),
+        Err(e) => println!("Could not reach the hub ({e}); run `rustfuse sync` to send changes later."),
+    }
+}
+
+fn describe_changes(dir: &Path, r: &Replica) -> Result<()> {
+    let pending = r.pending_changes()?;
+    if pending.is_empty() && r.outbox_len() == 0 {
+        println!("Everything is synced.");
+        return Ok(());
+    }
+    if r.outbox_len() > 0 {
+        println!("{} changesets waiting to be sent to the hub.", r.outbox_len());
+    }
+    if !pending.is_empty() {
+        println!("{} changes in {} not yet captured:", pending.len(), dir.display());
+        for c in pending.iter().take(50) {
+            println!("  {}", c.path().display());
+        }
+        if pending.len() > 50 {
+            println!("  ...");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -183,16 +267,35 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Hub {
+            listen,
+            store,
+            creds,
+            token,
+        } => {
+            let root: Arc<dyn ObjectStore> = Arc::new(store.connect(&creds, &store.prefix).await?);
+            let listener = tokio::net::TcpListener::bind(&listen)
+                .await
+                .with_context(|| format!("listen on {listen}"))?;
+            println!("Hub listening on {}.", listener.local_addr()?);
+            let hub = rustfuse_hub::Hub::new(root, token.get()?);
+            tokio::select! {
+                res = hub.serve(listener) => res?,
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
         Command::Init {
             dir,
             volume,
+            hub,
             store,
             creds,
         } => {
-            let config = store.config(volume, Role::Writer)?;
+            let spec = hub.spec()?;
+            let config = store.config(volume, &hub)?;
             let s = volume_store(&config, &creds).await?;
             let dir = dir.canonicalize().with_context(|| format!("{}", dir.display()))?;
-            let (r, stats) = Replica::init(&dir, config, s).await?;
+            let (mut r, stats) = Replica::init(&dir, config, s).await?;
             println!(
                 "Created volume {}: {} entries, {} read, {} uploaded in {} packs.",
                 r.config().volume,
@@ -201,67 +304,58 @@ async fn main() -> Result<()> {
                 mib(stats.bytes_uploaded),
                 stats.packs
             );
+            first_sync(&mut r, &spec).await;
         }
         Command::Attach {
             dir,
             volume,
+            hub,
             store,
             creds,
         } => {
-            let config = store.config(volume, Role::Follower)?;
+            let spec = hub.spec()?;
+            let config = store.config(volume, &hub)?;
             let s = volume_store(&config, &creds).await?;
-            let (r, _) = Replica::attach(&dir, config, s).await?;
+            let mut r = Replica::attach(&dir, config, s).await?;
             println!(
-                "Attached volume {} at {} ({} entries, changeset {}).",
+                "Attached volume {} at {} ({} entries).",
                 r.config().volume,
                 dir.display(),
                 r.tree().len(),
-                r.applied()
             );
+            first_sync(&mut r, &spec).await;
         }
-        Command::Push {
+        Command::Sync {
             dir,
-            watch,
+            once,
             debounce_ms,
             full_scan_secs,
             creds,
+            token,
         } => {
-            let mut r = open(&dir, &creds).await?;
-            if watch {
-                println!("Watching {} (Ctrl-C to stop)...", dir.display());
+            let config = Replica::config_of(&dir)?;
+            let Some(addr) = config.hub.clone() else {
+                bail!("{} has no hub configured", dir.display());
+            };
+            let spec = HubSpec {
+                addr,
+                token: token.get()?,
+            };
+            let mut r = Replica::open(&dir, volume_store(&config, &creds).await?)?;
+            if once {
+                let s = r.sync_once(&spec, SYNC_TIMEOUT).await?;
+                println!(
+                    "Sent {} changesets, applied {}; now at changeset {}.",
+                    s.pushed,
+                    s.received,
+                    r.applied()
+                );
+            } else {
+                println!("Syncing {} with {} (Ctrl-C to stop)...", dir.display(), spec.addr);
                 tokio::select! {
-                    res = r.watch_push(Duration::from_millis(debounce_ms), Duration::from_secs(full_scan_secs)) => res?,
+                    res = r.run(&spec, Duration::from_millis(debounce_ms), Duration::from_secs(full_scan_secs)) => res?,
                     _ = tokio::signal::ctrl_c() => {}
                 }
-            } else {
-                match r.push(None).await? {
-                    Some(s) => println!(
-                        "Pushed changeset {}: {} changes, {} files read, {} uploaded.",
-                        s.seq,
-                        s.ops,
-                        s.files_read,
-                        mib(s.bytes_uploaded)
-                    ),
-                    None => println!("Nothing to push."),
-                }
-            }
-        }
-        Command::Pull {
-            dir,
-            follow,
-            interval_ms,
-            creds,
-        } => {
-            let mut r = open(&dir, &creds).await?;
-            if follow {
-                println!("Following {} (Ctrl-C to stop)...", r.config().volume);
-                tokio::select! {
-                    res = r.follow(Duration::from_millis(interval_ms)) => res?,
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            } else {
-                let n = r.pull().await?;
-                println!("Applied {n} changesets; now at {}.", r.applied());
             }
         }
         Command::Status { dir } => {
@@ -269,23 +363,28 @@ async fn main() -> Result<()> {
             // Status only reads local state; no store access needed.
             let r = Replica::open(&dir, Arc::new(rustfuse_store::MemoryStore::new()))?;
             println!(
-                "Volume {} ({:?}) at changeset {}, {} entries.",
+                "Volume {} via hub {}, at changeset {}, {} entries.",
                 config.volume,
-                config.role,
+                config.hub.as_deref().unwrap_or("(none)"),
                 r.applied(),
                 r.tree().len()
             );
-            let pending = r.pending()?;
-            if pending.is_empty() {
-                println!("No local changes.");
-            } else {
-                println!("{} local changes not pushed:", pending.len());
-                for c in pending.iter().take(50) {
-                    println!("  {}", c.path().display());
-                }
-                if pending.len() > 50 {
-                    println!("  ...");
-                }
+            describe_changes(&dir, &r)?;
+        }
+        Command::Conflicts { dir } => {
+            let r = Replica::open(&dir, Arc::new(rustfuse_store::MemoryStore::new()))?;
+            let mut found: Vec<PathBuf> = r
+                .tree()
+                .iter()
+                .filter(|(_, n)| n.entry.name.windows(10).any(|w| w == b".conflict-"))
+                .filter_map(|(id, _)| r.tree().path(*id))
+                .collect();
+            found.sort();
+            if found.is_empty() {
+                println!("No conflict copies.");
+            }
+            for p in found {
+                println!("{}", p.display());
             }
         }
         Command::Bench(args) => bench::bench(args).await?,

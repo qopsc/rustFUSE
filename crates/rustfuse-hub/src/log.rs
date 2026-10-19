@@ -7,17 +7,17 @@
 //! - `snap/{seq:020}`: one [`Snapshot`] taken after applying `seq`
 //! - `pack/..`: content packs
 //!
-//! Phase 1 has a single writer per volume. Phase 2 replaces the writer side
-//! of the log with the hub, which orders concurrent writers.
+//! Only the hub appends to the log; machines read snapshots and log
+//! entries directly to catch up.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use rustfuse_store::ObjectStore;
 use rustfuse_types::{Changeset, FORMAT_VERSION, Snapshot};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, codec};
 
 const VOLUME_KEY: &str = "volume.json";
 
@@ -37,16 +37,6 @@ fn snap_key(seq: u64) -> String {
 
 fn seq_of(key: &str) -> Option<u64> {
     key.rsplit('/').next()?.parse().ok()
-}
-
-fn encode<T: Serialize>(v: &T) -> Bytes {
-    let raw = postcard::to_allocvec(v).expect("serialization cannot fail");
-    Bytes::from(zstd::bulk::compress(&raw, 3).expect("zstd compression cannot fail"))
-}
-
-fn decode<T: DeserializeOwned>(key: &str, data: &[u8]) -> Result<T> {
-    let raw = zstd::stream::decode_all(data).map_err(|e| Error::Corrupt(format!("{key}: {e}")))?;
-    postcard::from_bytes(&raw).map_err(|e| Error::Corrupt(format!("{key}: {e}")))
 }
 
 #[derive(Clone)]
@@ -106,13 +96,13 @@ impl Volume {
         if self.store.head(&key).await?.is_some() {
             return Err(Error::Conflict(cs.seq));
         }
-        self.store.put(&key, encode(cs)).await?;
+        self.store.put(&key, codec::encode(cs)).await?;
         Ok(())
     }
 
     pub async fn get_changeset(&self, seq: u64) -> Result<Changeset> {
         let key = log_key(seq);
-        let cs: Changeset = decode(&key, &self.store.get(&key).await?)?;
+        let cs: Changeset = codec::decode(&key, &self.store.get(&key).await?)?;
         if cs.format != FORMAT_VERSION || cs.seq != seq {
             return Err(Error::Corrupt(format!("{key}: unexpected format or sequence")));
         }
@@ -124,8 +114,13 @@ impl Volume {
         self.list_seqs("log/", Some(log_key(after))).await
     }
 
+    /// Sequence number of the last changeset (0 for an empty log).
+    pub async fn head(&self) -> Result<u64> {
+        Ok(self.changesets_after(0).await?.last().copied().unwrap_or(0))
+    }
+
     pub async fn put_snapshot(&self, snap: &Snapshot) -> Result<()> {
-        self.store.put(&snap_key(snap.seq), encode(snap)).await?;
+        self.store.put(&snap_key(snap.seq), codec::encode(snap)).await?;
         Ok(())
     }
 
@@ -134,7 +129,13 @@ impl Volume {
             return Ok(None);
         };
         let key = snap_key(seq);
-        let snap: Snapshot = decode(&key, &self.store.get(&key).await?)?;
+        let snap: Snapshot = codec::decode(&key, &self.store.get(&key).await?)?;
+        if snap.format != FORMAT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "{key}: unsupported format {}",
+                snap.format
+            )));
+        }
         Ok(Some(snap))
     }
 
@@ -158,14 +159,13 @@ impl Volume {
 mod tests {
     use super::*;
     use rustfuse_store::MemoryStore;
-    use rustfuse_types::{ReplicaId, Timestamp};
 
     fn cs(seq: u64) -> Changeset {
         Changeset {
             format: FORMAT_VERSION,
             seq,
-            replica: ReplicaId(1),
-            time: Timestamp(0),
+            version: Default::default(),
+            local: seq,
             ops: vec![],
         }
     }
@@ -183,6 +183,7 @@ mod tests {
         }
         assert!(matches!(v.put_changeset(&cs(3)).await, Err(Error::Conflict(3))));
         assert_eq!(v.changesets_after(9).await.unwrap(), vec![10, 11, 12]);
+        assert_eq!(v.head().await.unwrap(), 12);
         assert_eq!(v.changesets_after(0).await.unwrap().len(), 12);
         assert_eq!(v.get_changeset(4).await.unwrap(), cs(4));
 
@@ -192,6 +193,7 @@ mod tests {
                 format: FORMAT_VERSION,
                 seq,
                 nodes: vec![],
+                removed: vec![],
             })
             .await
             .unwrap();
