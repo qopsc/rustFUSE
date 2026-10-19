@@ -10,7 +10,7 @@ env:
 
 jobs:
   lint:
-    runs-on: namespace-profile-rustfuse-linux
+    runs-on: namespace-profile-rustfuse-linux-amd64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [linux, macos]
+        os: [linux-amd64, linux-arm64, macos-arm64]
     runs-on: namespace-profile-rustfuse-${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +37,7 @@ jobs:
       - run: cargo test --all-targets
 
   integration:
-    runs-on: namespace-profile-rustfuse-linux
+    runs-on: namespace-profile-rustfuse-linux-amd64
     services:
       rustfs:
         image: rustfs/rustfs:latest
