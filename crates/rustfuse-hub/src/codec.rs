@@ -30,6 +30,34 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T
 
 /// Reads one frame; `None` on a clean end of stream. Not cancel-safe.
 pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
+    let Some(buf) = read_raw(r).await? else {
+        return Ok(None);
+    };
+    decode("frame", &buf)
+        .map(Some)
+        .map_err(|e| Error::Protocol(e.to_string()))
+}
+
+/// A whole frame (length included) of plain postcard, for messages that
+/// carry already-compressed data. Write it with `write_all`.
+pub fn encode_plain<T: Serialize>(v: &T) -> Bytes {
+    let mut out = postcard::to_extend(v, vec![0u8; 4]).expect("serialization cannot fail");
+    let len = (out.len() - 4) as u32;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    Bytes::from(out)
+}
+
+/// Reads one plain postcard frame (see [`encode_plain`]).
+pub async fn read_plain<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
+    let Some(buf) = read_raw(r).await? else {
+        return Ok(None);
+    };
+    postcard::from_bytes(&buf)
+        .map(Some)
+        .map_err(|e| Error::Protocol(format!("frame: {e}")))
+}
+
+async fn read_raw<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
     let len = match r.read_u32().await {
         Ok(n) => n as usize,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -40,7 +68,5 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) ->
     }
     let mut buf = vec![0; len];
     r.read_exact(&mut buf).await?;
-    decode("frame", &buf)
-        .map(Some)
-        .map_err(|e| Error::Protocol(e.to_string()))
+    Ok(Some(buf))
 }

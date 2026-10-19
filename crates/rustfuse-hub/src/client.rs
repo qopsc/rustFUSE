@@ -1,12 +1,39 @@
 use std::sync::Arc;
 
 use rustfuse_types::Changeset;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::codec::{read_frame, write_frame};
 use crate::{Error, Request, Response, Result};
+
+pub(crate) type Reader = Box<dyn AsyncRead + Send + Unpin>;
+pub(crate) type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// Opens a connection to the hub, over TLS when `tls` is given.
+pub(crate) async fn connect_stream(
+    addr: &str,
+    tls: Option<&Arc<rustls::ClientConfig>>,
+) -> Result<(Reader, Writer)> {
+    let stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    Ok(match tls {
+        Some(config) => {
+            let name = crate::tls::server_name(addr)?;
+            let stream = tokio_rustls::TlsConnector::from(config.clone())
+                .connect(name, stream)
+                .await
+                .map_err(|e| crate::Error::Tls(format!("{addr}: {e}")))?;
+            let (r, w) = tokio::io::split(stream);
+            (Box::new(r), Box::new(w))
+        }
+        None => {
+            let (r, w) = stream.into_split();
+            (Box::new(r), Box::new(w))
+        }
+    })
+}
 
 /// Something the hub sent.
 #[derive(Debug)]
@@ -19,7 +46,7 @@ pub enum Event {
 
 /// A connection to the hub for one volume.
 pub struct HubClient {
-    wr: Box<dyn AsyncWrite + Send + Unpin>,
+    wr: Writer,
     events: mpsc::UnboundedReceiver<Result<Event>>,
     head: u64,
 }
@@ -38,26 +65,7 @@ impl HubClient {
         token: &str,
         after: u64,
     ) -> Result<HubClient> {
-        let stream = TcpStream::connect(addr).await?;
-        let _ = stream.set_nodelay(true);
-        let (mut rd, mut wr): (
-            Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-            Box<dyn AsyncWrite + Send + Unpin>,
-        ) = match tls {
-            Some(config) => {
-                let name = crate::tls::server_name(addr)?;
-                let stream = tokio_rustls::TlsConnector::from(config.clone())
-                    .connect(name, stream)
-                    .await
-                    .map_err(|e| crate::Error::Tls(format!("{addr}: {e}")))?;
-                let (r, w) = tokio::io::split(stream);
-                (Box::new(r), Box::new(w))
-            }
-            None => {
-                let (r, w) = stream.into_split();
-                (Box::new(r), Box::new(w))
-            }
-        };
+        let (mut rd, mut wr) = connect_stream(addr, tls).await?;
         write_frame(
             &mut wr,
             &Request::Hello {
@@ -80,7 +88,7 @@ impl HubClient {
                     Ok(Some(Response::Changeset(cs))) => Ok(Event::Changeset(cs)),
                     Ok(Some(Response::Pushed { local, seq })) => Ok(Event::Pushed { local, seq }),
                     Ok(Some(Response::Error(e))) => Err(Error::Refused(e)),
-                    Ok(Some(Response::Welcome { .. })) => Err(Error::Protocol("unexpected welcome".into())),
+                    Ok(Some(other)) => Err(Error::Protocol(format!("unexpected {other:?}"))),
                     Ok(None) => return,
                     Err(e) => Err(e),
                 };

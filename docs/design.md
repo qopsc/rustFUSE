@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–4 implemented** · 2026-10-19
+Status: **Phases 0–4 implemented, Phase 5 in progress** · 2026-10-19
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -102,7 +102,9 @@ full local copy that B's lazy loading would save. B stays on the roadmap
   A new machine clones from snapshot + log tail.
 
 Remote machines (R4) need the hub and the bucket reachable, directly or
-through the hub acting as an S3 proxy (Phase 5).
+through the hub acting as a storage proxy (§9): a machine set up without a
+bucket sends its object reads and writes to the hub, which holds the S3
+credentials.
 
 ## 5. Data model
 
@@ -336,8 +338,18 @@ nothing here), then later ones take 0.06–0.1 s.
   snapshot plus the log tail, straight from the bucket.
 - Protocol: TCP, length-prefixed zstd + postcard frames. `Hello{volume,
   token, after}` subscribes from a position; `Push(changeset)` appends.
-- Auth: one shared token per hub, from `RUSTFUSE_HUB_TOKEN`. Per-machine
-  keys may come with Phase 5.
+- Storage proxy (Phase 5): a connection that opens with `Store{volume,
+  token}` instead carries object calls (get, ranged get, put, head,
+  delete, list) for that volume's keys, many in flight at once, each
+  answered by id. These frames are plain postcard (the chunks are already
+  zstd-compressed). `rustfuse init/attach` without `--bucket` set this up
+  and remember it (`via_hub` in the config), so such a machine needs only
+  the hub address and token. On the 4.6 GB repository (§8.1), attaching
+  through the hub took 12.4 s against 10.9 s direct, with 190 MB peak on
+  the hub.
+- Auth: one shared token per hub, from `RUSTFUSE_HUB_TOKEN`; it also grants
+  storage access to every volume behind the hub. Per-machine keys may come
+  later in Phase 5.
 - TLS (Phase 4): `rustfuse hub --tls-cert hub.pem --tls-key hub.key`;
   machines use `--hub tls://host[:port]`. They trust the system's roots, or
   the certificates in `--hub-ca` (kept in the machine's config). A
@@ -389,7 +401,7 @@ crates/
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
-| **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
+| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
 ## 13. Decisions and open questions

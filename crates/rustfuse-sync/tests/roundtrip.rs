@@ -49,6 +49,7 @@ fn config(volume: &str, replica: u64) -> Config {
         path_style: true,
         hub: None,
         hub_ca: None,
+        via_hub: false,
         replica: ReplicaId(replica),
         seed: [replica as u8; 16],
     }
@@ -234,11 +235,24 @@ impl Cluster {
         for i in 0..n {
             let dir = c._tmp.path().join(format!("m{i}"));
             let offline = Arc::new(AtomicBool::new(false));
+            // Odd machines reach the bucket through the hub, like remote
+            // ones; every test runs both ways.
+            let via_hub = i % 2 == 1;
+            let inner: Arc<dyn ObjectStore> = if via_hub {
+                Arc::new(
+                    rustfuse_hub::HubStore::connect(&c.hub.addr, None, volume, &c.hub.token)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                Arc::new(PrefixStore::new(root.clone(), &format!("volumes/{volume}")))
+            };
             let store: Arc<dyn ObjectStore> = Arc::new(Flaky {
-                inner: Arc::new(PrefixStore::new(root.clone(), &format!("volumes/{volume}"))),
+                inner,
                 offline: offline.clone(),
             });
             let mut cfg = config(volume, i as u64 + 1);
+            cfg.via_hub = via_hub;
             cfg.hub = Some(c.hub.addr.clone());
             let r = if i == 0 {
                 fs::create_dir(&dir).unwrap();
