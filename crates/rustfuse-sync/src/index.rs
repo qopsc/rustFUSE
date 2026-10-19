@@ -297,10 +297,11 @@ impl Index {
             for local in &c.outbox_remove {
                 outbox.remove(local).map_err(db_err)?;
             }
-            let mut pending = tx.open_table(PENDING).map_err(db_err)?;
             if c.pending_clear {
-                pending.retain(|_, _| false).map_err(db_err)?;
+                // Dropping the table is far cheaper than deleting each row.
+                tx.delete_table(PENDING).map_err(db_err)?;
             }
+            let mut pending = tx.open_table(PENDING).map_err(db_err)?;
             for id in &c.pending_add {
                 pending.insert(id.0, ()).map_err(db_err)?;
             }

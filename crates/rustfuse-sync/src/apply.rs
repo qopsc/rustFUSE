@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use rayon::prelude::*;
 use rustfuse_store::ObjectStore;
 use rustfuse_types::{ChunkHash, ChunkRef, Content, Entry, NodeId};
 
@@ -108,11 +109,12 @@ impl Applier<'_> {
             }
         }
 
-        // 3. Place nodes top-down. Directories, symlinks, inline files and
-        //    pure moves first; chunked file content afterwards in batches.
+        // 3. Directories top-down and parked nodes back into place, in
+        //    order; then everything else in parallel.
         let mut placing: Vec<&NodeChange> = changes.iter().filter(|c| c.new.is_some()).collect();
         placing.sort_by_key(|c| c.new_path.as_ref().map_or(0, |p| p.components().count()));
-        let mut to_fetch: Vec<(&NodeChange, PathBuf)> = Vec::new();
+        let mut dirs: Vec<(&NodeChange, PathBuf)> = Vec::new();
+        let mut files: Vec<(&NodeChange, PathBuf)> = Vec::new();
         for c in placing {
             let entry = c.new.as_ref().unwrap();
             let Some(rel) = &c.new_path else { continue };
@@ -124,42 +126,32 @@ impl Applier<'_> {
                 }
                 fs::rename(&from, &target).at(&target)?;
             }
-            let content_changed = match &c.old {
-                Some(old) => !old.content.same_data(&entry.content),
-                None => true,
-            } || !kind_matches(&target, &entry.content);
-
-            match &entry.content {
-                Content::Dir => {
-                    if !kind_matches(&target, &entry.content) {
-                        remove_any(&target).at(&target)?;
-                        fs::create_dir(&target).at(&target)?;
-                    }
-                    set_mode(&target, entry.mode).at(&target)?;
+            if entry.content.is_dir() {
+                if !kind_matches(&target, &entry.content) {
+                    remove_any(&target).at(&target)?;
+                    fs::create_dir(&target).at(&target)?;
                 }
-                Content::Symlink(dest) => {
-                    if content_changed {
-                        remove_any(&target).at(&target)?;
-                        std::os::unix::fs::symlink(os_str(dest), &target).at(&target)?;
-                    }
-                }
-                Content::Inline(data) => {
-                    if content_changed {
-                        self.write_file(&target, c.node, entry, |f| f.write_all(data))?;
-                    } else {
-                        finish_meta(&target, entry)?;
-                    }
-                }
-                Content::File { .. } => {
-                    if content_changed {
-                        to_fetch.push((c, target));
-                        continue;
-                    }
-                    finish_meta(&target, entry)?;
-                }
+                dirs.push((c, target));
+            } else {
+                files.push((c, target));
             }
-            stats.push((c.node, stat_of(&target)));
         }
+        let placed: Vec<Result<Placed>> = files
+            .into_par_iter()
+            .map(|(c, target)| self.place(c, target))
+            .collect();
+        let mut to_fetch: Vec<(&NodeChange, PathBuf)> = Vec::new();
+        for p in placed {
+            match p? {
+                Placed::Done(node, st) => stats.push((node, st)),
+                Placed::Fetch(c, target) => to_fetch.push((c, target)),
+            }
+        }
+        tracing::debug!(
+            placed = stats.len(),
+            fetch = to_fetch.len(),
+            "apply: placed entries"
+        );
 
         // 4. Fetch and write chunked files, bounding memory per batch.
         let mut batch: Vec<(&NodeChange, PathBuf)> = Vec::new();
@@ -179,7 +171,47 @@ impl Applier<'_> {
         if !batch.is_empty() {
             stats.extend(self.write_batch(batch).await?);
         }
+
+        // 5. Directory permissions last, deepest first, so a read-only
+        //    directory does not block writing its children.
+        for (c, target) in dirs.iter().rev() {
+            set_mode(target, c.new.as_ref().unwrap().mode).at(target)?;
+            stats.push((c.node, stat_of(target)));
+        }
         Ok(stats)
+    }
+
+    /// Writes one non-directory entry whose content is at hand (symlink,
+    /// inline data, or only metadata changed), or says it needs fetching.
+    fn place<'c>(&self, c: &'c NodeChange, target: PathBuf) -> Result<Placed<'c>> {
+        let entry = c.new.as_ref().unwrap();
+        let content_changed = match &c.old {
+            Some(old) => !old.content.same_data(&entry.content),
+            None => true,
+        } || !kind_matches(&target, &entry.content);
+        match &entry.content {
+            Content::Dir => unreachable!("directories are placed in order"),
+            Content::Symlink(dest) => {
+                if content_changed {
+                    remove_any(&target).at(&target)?;
+                    std::os::unix::fs::symlink(os_str(dest), &target).at(&target)?;
+                }
+            }
+            Content::Inline(data) => {
+                if content_changed {
+                    self.write_file(&target, c.node, entry, |f| f.write_all(data))?;
+                } else {
+                    finish_meta(&target, entry)?;
+                }
+            }
+            Content::File { .. } => {
+                if content_changed {
+                    return Ok(Placed::Fetch(c, target));
+                }
+                finish_meta(&target, entry)?;
+            }
+        }
+        Ok(Placed::Done(c.node, stat_of(&target)))
     }
 
     async fn write_batch(
@@ -193,22 +225,29 @@ impl Applier<'_> {
                 _ => Vec::new(),
             })
             .collect();
+        let t0 = std::time::Instant::now();
         let data: HashMap<ChunkHash, Bytes> = rustfuse_chunk::fetch(self.store.clone(), &refs).await?;
-        let mut stats = Vec::new();
-        for (c, target) in batch {
-            let entry = c.new.as_ref().unwrap();
-            let Content::File { chunks, .. } = &entry.content else {
-                continue;
-            };
-            self.write_file(&target, c.node, entry, |f| {
-                for r in chunks {
-                    f.write_all(&data[&r.hash])?;
-                }
-                Ok(())
-            })?;
-            stats.push((c.node, stat_of(&target)));
-        }
-        Ok(stats)
+        tracing::debug!(
+            chunks = refs.len(),
+            ms = t0.elapsed().as_millis() as u64,
+            "apply: fetched"
+        );
+        batch
+            .into_par_iter()
+            .filter_map(|(c, target)| {
+                let entry = c.new.as_ref().unwrap();
+                let Content::File { chunks, .. } = &entry.content else {
+                    return None;
+                };
+                let written = self.write_file(&target, c.node, entry, |f| {
+                    for r in chunks {
+                        f.write_all(&data[&r.hash])?;
+                    }
+                    Ok(())
+                });
+                Some(written.map(|()| (c.node, stat_of(&target))))
+            })
+            .collect()
     }
 
     fn write_file(
@@ -231,6 +270,11 @@ impl Applier<'_> {
         fs::rename(&tmp, target).at(target)?;
         Ok(())
     }
+}
+
+enum Placed<'c> {
+    Done(NodeId, Option<StatKey>),
+    Fetch(&'c NodeChange, PathBuf),
 }
 
 fn finish_meta(target: &Path, entry: &Entry) -> Result<()> {

@@ -287,6 +287,8 @@ impl Replica {
     }
 
     async fn apply_log(&mut self, batch: Vec<Changeset>) -> Result<()> {
+        let t0 = Instant::now();
+        let n = batch.len();
         let mut log_ids = Vec::new();
         let mut accepted = Vec::new();
         let mut chunks = Vec::new();
@@ -336,6 +338,11 @@ impl Replica {
             chunks,
             ..Commit::default()
         })?;
+        debug!(
+            changesets = n,
+            ms = t0.elapsed().as_millis() as u64,
+            "applied changesets to the log"
+        );
         Ok(())
     }
 
@@ -375,8 +382,14 @@ impl Replica {
             Some(t)
         };
         let target = replayed.as_ref().unwrap_or(&self.log);
+        let t0 = Instant::now();
         let changes = self.tree.diff(target, self.pending.iter().copied());
         let dirty = self.precheck(&changes);
+        debug!(
+            changes = changes.len(),
+            ms = t0.elapsed().as_millis() as u64,
+            "reconcile: diff + precheck"
+        );
         if !dirty.is_empty() {
             return Err(Error::LocalChanges(dirty));
         }
@@ -384,21 +397,36 @@ impl Replica {
             root: &self.root,
             store: self.volume.store().clone(),
         };
+        let t0 = Instant::now();
         let stats = applier.apply(&changes).await?;
-        self.tree.copy_from(target, &self.pending);
+        debug!(ms = t0.elapsed().as_millis() as u64, "reconcile: apply to disk");
+        let t0 = Instant::now();
+        // Only nodes that really differ need rewriting in the index; after
+        // a large catch-up most pending nodes already match.
+        let differ: HashSet<NodeId> = self
+            .pending
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.tree.node(id) != target.node(id) || self.tree.removed(id) != target.removed(id)
+            })
+            .collect();
+        self.tree.copy_from(target, &differ);
+        let ids: Vec<NodeId> = differ.into_iter().collect();
         for (id, st) in &stats {
             match st {
                 Some(st) => self.stats.insert(*id, *st),
                 None => self.stats.remove(id),
             };
         }
-        let ids: Vec<NodeId> = self.pending.drain().collect();
+        self.pending.clear();
         self.index.commit(Commit {
             disk: Some((&self.tree, ids)),
             pending_clear: true,
             stats,
             ..Commit::default()
         })?;
+        debug!(ms = t0.elapsed().as_millis() as u64, "reconcile: index commit");
         if !changes.is_empty() {
             info!(
                 applied = self.counters.applied,
@@ -470,6 +498,7 @@ impl Replica {
             Some(paths) => self.scan_roots(paths),
         };
         let mut counter = self.counters.counter;
+        let t0 = Instant::now();
         let changes = Scanner {
             root: &self.root,
             tree: &self.tree,
@@ -500,7 +529,15 @@ impl Replica {
             files_read: reads.len(),
             ..Default::default()
         };
+        debug!(
+            changes = changes.len(),
+            ms = t0.elapsed().as_millis() as u64,
+            "capture: scanned"
+        );
+        let t0 = Instant::now();
         let (contents, uploaded) = self.read_contents(reads).await?;
+        debug!(ms = t0.elapsed().as_millis() as u64, "capture: read and uploaded");
+        let t0 = Instant::now();
         stats.packs = uploaded.packs;
         stats.bytes_uploaded = uploaded.bytes;
         stats.packs_spooled = uploaded.spooled;
@@ -606,6 +643,10 @@ impl Replica {
             ..Commit::default()
         })?;
         self.outbox.extend(new_changesets);
+        debug!(
+            ms = t0.elapsed().as_millis() as u64,
+            "capture: ops and index commit"
+        );
         if stats.ops == 0 {
             return Ok(None);
         }

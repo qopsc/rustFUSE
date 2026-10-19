@@ -79,7 +79,7 @@ pub struct Plan {
     /// conflict copies inside it (relative to the git dir).
     repos: BTreeMap<PathBuf, Vec<PathBuf>>,
     /// `.git` files of linked worktrees and their content.
-    pointers: Vec<(PathBuf, Vec<u8>)>,
+    pointers: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl Plan {
@@ -97,7 +97,13 @@ impl Plan {
                     }
                     Content::Inline(data) if data.starts_with(b"gitdir: ") => {
                         if let Some(p) = tree.path(id) {
-                            plan.pointers.push((p, data.clone()));
+                            plan.pointers.push((p, Some(data.clone())));
+                        }
+                    }
+                    // A long path does not fit inline; read it from disk.
+                    Content::File { size, .. } if *size < 4096 => {
+                        if let Some(p) = tree.path(id) {
+                            plan.pointers.push((p, None));
                         }
                     }
                     _ => {}
@@ -181,7 +187,14 @@ impl GitTidy {
         }
         let mut changed = false;
         for (file, data) in &plan.pointers {
-            changed |= self.link_worktree(file, data);
+            let data = match data {
+                Some(d) => d.clone(),
+                None => match fs::read(self.root.join(file)) {
+                    Ok(d) if d.starts_with(b"gitdir: ") => d,
+                    _ => continue,
+                },
+            };
+            changed |= self.link_worktree(file, &data);
         }
         let mut live = BTreeSet::new();
         for (gitdir, copies) in &plan.repos {

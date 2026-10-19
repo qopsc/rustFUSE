@@ -357,6 +357,24 @@ async fn initial_sync_and_exclusions() {
 }
 
 #[tokio::test]
+async fn read_only_directory_keeps_its_contents() {
+    let c = Cluster::new(2, |root: &Path| {
+        fs::create_dir_all(root.join("ro/sub")).unwrap();
+        fs::write(root.join("ro/small"), "tiny").unwrap();
+        fs::write(root.join("ro/sub/big"), pseudo_random(200_000, 7)).unwrap();
+        fs::set_permissions(root.join("ro/sub"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    })
+    .await;
+    assert_same(c.dir(0), c.dir(1));
+    for i in 0..2 {
+        for d in ["ro", "ro/sub"] {
+            fs::set_permissions(c.dir(i).join(d), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn edits_moves_and_deletes() {
     let mut c = Cluster::new(2, sample_tree).await;
     assert_eq!(c.sync(0).await, (0, 0), "no-op sync sent something");

@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 pub const FORMAT_VERSION: u32 = 2;
 
 /// Files up to this size are stored inside the operation, not in packs.
-pub const INLINE_MAX: u64 = 4096;
+/// Kept small: inline content lives in every tree, index and snapshot, so
+/// a large threshold costs memory on trees with many small files.
+pub const INLINE_MAX: u64 = 256;
 
 /// Identifies one machine's replica of a volume.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
