@@ -43,6 +43,11 @@ stay local; add a `.rustfuseignore` (gitignore syntax) for anything else.
   branch and the other appears as `<branch>.conflict-<machine>-<time>`;
   merge it and it disappears. The worktree is put back to match the
   branch, so `git status` is clean.
+- `rustfuse git-fsmonitor <repo>` makes `git status` ask the running
+  `rustfuse sync` what changed instead of checking every file (0.06 s
+  instead of 0.4 s on a 300k-file repository). It needs `rustfuse` on the
+  `PATH` of every machine using the repository; without a running sync,
+  git checks every file as before.
 - rustfuse sets `core.checkStat=minimal` and `core.trustctime=false` in
   each repository so an index written on one machine stays valid on the
   others.

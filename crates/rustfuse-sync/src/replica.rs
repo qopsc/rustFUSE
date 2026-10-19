@@ -882,13 +882,18 @@ impl Replica {
     pub async fn run(&mut self, hub: &HubSpec, debounce: Duration, full_scan_every: Duration) -> Result<()> {
         use notify::{RecursiveMode, Watcher};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let journal = crate::fsmonitor::Journal::new();
+        let (j, root) = (journal.clone(), self.root.clone());
         let mut watcher = notify::recommended_watcher(move |res| {
+            j.record(&root, &res);
             let _ = tx.send(res);
         })
         .map_err(|e| Error::Corrupt(format!("cannot watch: {e}")))?;
         watcher
             .watch(&self.root, RecursiveMode::Recursive)
             .map_err(|e| Error::Corrupt(format!("cannot watch {}: {e}", self.root.display())))?;
+
+        let _fsmonitor = AbortOnDrop(tokio::spawn(crate::fsmonitor::serve(self.root.clone(), journal)));
 
         report(self.capture(None).await?);
         self.reconcile_with_capture().await?;
@@ -1067,6 +1072,14 @@ impl Replica {
             relevant = true;
         }
         relevant
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

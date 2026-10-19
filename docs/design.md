@@ -280,7 +280,7 @@ before you commit over a concurrent session.
 |---|---|
 | git on the tree | Native FS, no overhead (§2) |
 | Change detection on 500k-file trees | Event-driven; verification scans are parallel `stat` walks comparing (mtime, ctime, size, inode) and only hash changed files |
-| `git status` | Optional **fsmonitor** integration: the daemon already knows what changed, so it answers git's `core.fsmonitor` hook (v2 protocol). On Linux, where git has no built-in fsmonitor daemon, this is a large win |
+| `git status` | **fsmonitor hook** (`rustfuse git-fsmonitor <repo>`): the daemon journals every changed path from its watcher and answers git's `core.fsmonitor` hook (protocol v2) over a socket in `.rustfuse/`. Before answering it writes a cookie file and waits for its event, so every change made before the query is included. Tokens name the daemon run; a token from another run or another machine's index, a dropped event or a trimmed journal answers "everything changed" and git scans as usual. Paths inside `.git` are left out, so a `git status` that changed nothing returns the same token and does not rewrite (and re-sync) the index. On Linux, where git has no built-in fsmonitor, this is a large win |
 | Initial clone of 25 GB | Parallel pack downloads (bounded concurrency, ranged GETs), chunk dedupe, write files in parallel, set mtimes, then hand off to the watcher |
 | Upload | Chunk + hash in parallel (rayon), batch into packs, many concurrent PUTs |
 | Remote links | Packs compress well; ops are tiny; resumable transfers |
@@ -301,11 +301,16 @@ commit), two machines on one host against rustFS in docker:
 | Daemon memory (RSS) | ~2 GB | ~0.7 GB |
 | Hub memory | 516 MB | 127 MB |
 | Local index (`.rustfuse/`) | 0.9–1.3 GB | 210–270 MB |
+| `git status`, repeated | 0.33–0.5 s | 0.06 s (fsmonitor hook) |
 
 What changed: inline threshold 4 KiB → 256 bytes; files are written in
 parallel on apply (directories first, permissions last); the index rewrites
 only nodes that actually changed after a catch-up instead of every pending
 node, and clears the pending table by dropping it.
+
+With the fsmonitor hook, the first `git status` after the index arrived
+from another machine still checks every file (that machine's token means
+nothing here), then later ones take 0.06–0.1 s.
 
 ## 9. Hub
 
@@ -365,7 +370,7 @@ crates/
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
-| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply and leaner index (**done**). Next: fsmonitor hook, batched git cleanup, compression, encryption, 25 GB repos |
+| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook (**done**). Next: batched git cleanup, compression, encryption, 25 GB repos |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 

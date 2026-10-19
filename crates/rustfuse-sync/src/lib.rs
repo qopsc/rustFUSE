@@ -6,6 +6,7 @@
 //! same way (`docs/design.md` §7).
 
 mod apply;
+pub mod fsmonitor;
 mod git;
 mod ignore;
 mod index;

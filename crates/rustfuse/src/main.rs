@@ -84,6 +84,23 @@ enum Command {
     Conflicts { dir: PathBuf },
     /// Measure raw object-store throughput and latency.
     Bench(bench::BenchArgs),
+    /// Make `git status` in a repository inside a synced directory ask the
+    /// running `rustfuse sync` what changed instead of checking every file.
+    /// Needs `rustfuse` on the PATH of every machine that uses the repo.
+    GitFsmonitor {
+        /// The repository (or one of its linked worktrees).
+        repo: PathBuf,
+        /// Turn it off again.
+        #[arg(long)]
+        off: bool,
+    },
+    /// The hook git runs (`core.fsmonitor`); not meant to be run by hand.
+    #[command(hide = true)]
+    Fsmonitor {
+        version: u32,
+        #[arg(default_value = "")]
+        token: String,
+    },
 }
 
 #[derive(Args)]
@@ -287,15 +304,67 @@ fn find_conflicts(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// git's fsmonitor hook value; the config syncs to every machine, so it
+/// names the binary rather than a machine-specific path.
+const FSMONITOR_HOOK: &str = "rustfuse fsmonitor";
+
+fn git_fsmonitor(repo: &Path, off: bool) -> Result<()> {
+    let settings: &[(&str, &str)] = &[
+        ("core.fsmonitor", FSMONITOR_HOOK),
+        ("core.fsmonitorHookVersion", "2"),
+        ("core.untrackedCache", "true"),
+    ];
+    for (key, value) in settings {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo).arg("config");
+        if off {
+            cmd.args(["--unset", key]);
+        } else {
+            cmd.args([key, value]);
+        }
+        let out = cmd.output().context("running git")?;
+        // Exit code 5 from --unset: the key was not set.
+        if !out.status.success() && !(off && out.status.code() == Some(5)) {
+            bail!(
+                "git config {key}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    if off {
+        println!("git status in {} checks every file again.", repo.display());
+    } else {
+        println!(
+            "git status in {} now asks `rustfuse sync` what changed; without a running sync it checks every file as before.",
+            repo.display()
+        );
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // The hook runs on every `git status`: answer without starting a runtime.
+    if let Command::Fsmonitor { version, token } = &cli.command {
+        let cwd = std::env::current_dir()?;
+        let out = rustfuse_sync::fsmonitor::hook(*version, token, &cwd);
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &out)?;
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    match Cli::parse().command {
+    match cli.command {
         Command::Hub {
             listen,
             store,
@@ -434,6 +503,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Bench(args) => bench::bench(args).await?,
+        Command::GitFsmonitor { repo, off } => git_fsmonitor(&repo, off)?,
+        Command::Fsmonitor { .. } => unreachable!("handled before the runtime starts"),
     }
     Ok(())
 }
