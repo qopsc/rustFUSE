@@ -9,3 +9,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }

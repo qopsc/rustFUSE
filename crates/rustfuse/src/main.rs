@@ -1,15 +1,20 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::Result;
-use bytes::Bytes;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use futures::{StreamExt, stream};
 use rustfuse_store::{ObjectStore, S3Config, S3Store};
-use rustfuse_types::{DEFAULT_BLOCK_SIZE, SliceId, blocks_of_slice};
+use rustfuse_sync::{Config, Replica, Role};
+use rustfuse_types::ReplicaId;
+
+mod bench;
 
 #[derive(Parser)]
-#[command(version, about = "Mount S3-compatible object storage as a filesystem")]
+#[command(
+    version,
+    about = "Keep a directory in sync across machines through S3-compatible storage"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -17,8 +22,57 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Measure raw object-store throughput and latency with block-sized objects.
-    Bench(BenchArgs),
+    /// Create a volume from an existing directory and upload it.
+    Init {
+        dir: PathBuf,
+        /// Volume name, unique within the bucket and prefix.
+        #[arg(long)]
+        volume: String,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+    },
+    /// Download a volume into a new, empty directory.
+    Attach {
+        dir: PathBuf,
+        #[arg(long)]
+        volume: String,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+    },
+    /// Upload local changes (on the machine that ran `init`).
+    Push {
+        dir: PathBuf,
+        /// Keep running and push changes as they happen.
+        #[arg(long)]
+        watch: bool,
+        /// Quiet period before pushing a burst of changes.
+        #[arg(long, default_value_t = 200)]
+        debounce_ms: u64,
+        /// Full rescan interval while watching, to catch missed events.
+        #[arg(long, default_value_t = 600)]
+        full_scan_secs: u64,
+        #[command(flatten)]
+        creds: Credentials,
+    },
+    /// Apply changes from the volume.
+    Pull {
+        dir: PathBuf,
+        /// Keep running and apply changes as they arrive.
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        #[command(flatten)]
+        creds: Credentials,
+    },
+    /// Show the volume, role, and local changes not yet pushed.
+    Status { dir: PathBuf },
+    /// Measure raw object-store throughput and latency.
+    Bench(bench::BenchArgs),
 }
 
 #[derive(Args)]
@@ -34,153 +88,207 @@ struct StoreArgs {
     /// Key prefix inside the bucket.
     #[arg(long, env = "RUSTFUSE_PREFIX", default_value = "")]
     prefix: String,
-    #[arg(long, env = "RUSTFUSE_ACCESS_KEY")]
-    access_key: Option<String>,
-    #[arg(long, env = "RUSTFUSE_SECRET_KEY", hide_env_values = true)]
-    secret_key: Option<String>,
     /// Use virtual-hosted-style addressing instead of path-style.
     #[arg(long)]
     virtual_hosted: bool,
 }
 
+/// Credentials are never written to disk; pass them each time (or via the
+/// environment, or the standard AWS provider chain).
+#[derive(Args)]
+struct Credentials {
+    #[arg(long, env = "RUSTFUSE_ACCESS_KEY")]
+    access_key: Option<String>,
+    #[arg(long, env = "RUSTFUSE_SECRET_KEY", hide_env_values = true)]
+    secret_key: Option<String>,
+}
+
 impl StoreArgs {
-    async fn connect(&self) -> Result<S3Store> {
-        let mut cfg = S3Config::new(&self.bucket);
-        cfg.endpoint = self.endpoint.clone();
-        cfg.region = self.region.clone();
-        cfg.prefix = self.prefix.clone();
-        cfg.access_key = self.access_key.clone();
-        cfg.secret_key = self.secret_key.clone();
-        cfg.path_style = !self.virtual_hosted;
-        Ok(S3Store::connect(cfg).await?)
+    async fn connect(&self, creds: &Credentials, prefix: &str) -> Result<S3Store> {
+        connect(
+            &self.bucket,
+            self.endpoint.clone(),
+            &self.region,
+            prefix,
+            !self.virtual_hosted,
+            creds,
+        )
+        .await
+    }
+
+    fn config(&self, volume: String, role: Role) -> Result<Config> {
+        let mut seed = [0u8; 16];
+        getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
+        Ok(Config {
+            volume,
+            bucket: self.bucket.clone(),
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
+            prefix: self.prefix.clone(),
+            path_style: !self.virtual_hosted,
+            replica: ReplicaId(getrandom::u64().map_err(|e| anyhow::anyhow!("no randomness: {e}"))?),
+            seed,
+            role,
+        })
     }
 }
 
-#[derive(Args)]
-struct BenchArgs {
-    #[command(flatten)]
-    store: StoreArgs,
-    /// Total bytes to write and read back (MiB).
-    #[arg(long, default_value_t = 256)]
-    size_mib: u64,
-    /// Object (block) size in KiB.
-    #[arg(long, default_value_t = DEFAULT_BLOCK_SIZE / 1024)]
-    block_kib: u32,
-    /// Concurrent requests in flight.
-    #[arg(long, default_value_t = 32)]
-    concurrency: usize,
-    /// Leave the benchmark objects in the bucket.
-    #[arg(long)]
-    keep: bool,
+async fn connect(
+    bucket: &str,
+    endpoint: Option<String>,
+    region: &str,
+    prefix: &str,
+    path_style: bool,
+    creds: &Credentials,
+) -> Result<S3Store> {
+    let mut cfg = S3Config::new(bucket);
+    cfg.endpoint = endpoint;
+    cfg.region = region.to_owned();
+    cfg.prefix = prefix.to_owned();
+    cfg.path_style = path_style;
+    cfg.access_key = creds.access_key.clone();
+    cfg.secret_key = creds.secret_key.clone();
+    Ok(S3Store::connect(cfg).await?)
+}
+
+async fn volume_store(config: &Config, creds: &Credentials) -> Result<Arc<dyn ObjectStore>> {
+    let s = connect(
+        &config.bucket,
+        config.endpoint.clone(),
+        &config.region,
+        &config.volume_prefix(),
+        config.path_style,
+        creds,
+    )
+    .await?;
+    Ok(Arc::new(s))
+}
+
+async fn open(dir: &Path, creds: &Credentials) -> Result<Replica> {
+    let config = Replica::config_of(dir)?;
+    let store = volume_store(&config, creds).await?;
+    Ok(Replica::open(dir, store)?)
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     match Cli::parse().command {
-        Command::Bench(args) => bench(args).await,
-    }
-}
-
-async fn bench(args: BenchArgs) -> Result<()> {
-    let store: Arc<dyn ObjectStore> = Arc::new(args.store.connect().await?);
-    let block_size = args.block_kib * 1024;
-    // A synthetic slice id far from anything a real filesystem would allocate.
-    let slice = SliceId(u64::MAX - u64::from(std::process::id()));
-    let blocks = blocks_of_slice(slice, args.size_mib << 20, block_size);
-    let keys: Vec<String> = blocks
-        .iter()
-        .map(|b| format!("bench/{}", b.object_key()))
-        .collect();
-    let payload = Bytes::from(vec![0xa5u8; block_size as usize]);
-    let total_bytes: u64 = blocks.iter().map(|b| u64::from(b.len)).sum();
-
-    println!(
-        "{} objects of {} KiB, concurrency {}",
-        keys.len(),
-        args.block_kib,
-        args.concurrency
-    );
-
-    let put = run_phase(&keys, args.concurrency, |key| {
-        let store = store.clone();
-        let data = payload.clone();
-        async move { store.put(&key, data).await.map(|_| ()) }
-    })
-    .await?;
-    put.report("PUT", total_bytes);
-
-    let get = run_phase(&keys, args.concurrency, |key| {
-        let store = store.clone();
-        async move { store.get(&key).await.map(|_| ()) }
-    })
-    .await?;
-    get.report("GET", total_bytes);
-
-    let ranged = run_phase(&keys, args.concurrency, |key| {
-        let store = store.clone();
-        async move { store.get_range(&key, 0..4096).await.map(|_| ()) }
-    })
-    .await?;
-    ranged.report("GET 4 KiB range", 4096 * keys.len() as u64);
-
-    if !args.keep {
-        run_phase(&keys, args.concurrency, |key| {
-            let store = store.clone();
-            async move { store.delete(&key).await }
-        })
-        .await?;
+        Command::Init {
+            dir,
+            volume,
+            store,
+            creds,
+        } => {
+            let config = store.config(volume, Role::Writer)?;
+            let s = volume_store(&config, &creds).await?;
+            let dir = dir.canonicalize().with_context(|| format!("{}", dir.display()))?;
+            let (r, stats) = Replica::init(&dir, config, s).await?;
+            println!(
+                "Created volume {}: {} entries, {} read, {} uploaded in {} packs.",
+                r.config().volume,
+                r.tree().len(),
+                mib(stats.bytes_read),
+                mib(stats.bytes_uploaded),
+                stats.packs
+            );
+        }
+        Command::Attach {
+            dir,
+            volume,
+            store,
+            creds,
+        } => {
+            let config = store.config(volume, Role::Follower)?;
+            let s = volume_store(&config, &creds).await?;
+            let (r, _) = Replica::attach(&dir, config, s).await?;
+            println!(
+                "Attached volume {} at {} ({} entries, changeset {}).",
+                r.config().volume,
+                dir.display(),
+                r.tree().len(),
+                r.applied()
+            );
+        }
+        Command::Push {
+            dir,
+            watch,
+            debounce_ms,
+            full_scan_secs,
+            creds,
+        } => {
+            let mut r = open(&dir, &creds).await?;
+            if watch {
+                println!("Watching {} (Ctrl-C to stop)...", dir.display());
+                tokio::select! {
+                    res = r.watch_push(Duration::from_millis(debounce_ms), Duration::from_secs(full_scan_secs)) => res?,
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            } else {
+                match r.push(None).await? {
+                    Some(s) => println!(
+                        "Pushed changeset {}: {} changes, {} files read, {} uploaded.",
+                        s.seq,
+                        s.ops,
+                        s.files_read,
+                        mib(s.bytes_uploaded)
+                    ),
+                    None => println!("Nothing to push."),
+                }
+            }
+        }
+        Command::Pull {
+            dir,
+            follow,
+            interval_ms,
+            creds,
+        } => {
+            let mut r = open(&dir, &creds).await?;
+            if follow {
+                println!("Following {} (Ctrl-C to stop)...", r.config().volume);
+                tokio::select! {
+                    res = r.follow(Duration::from_millis(interval_ms)) => res?,
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            } else {
+                let n = r.pull().await?;
+                println!("Applied {n} changesets; now at {}.", r.applied());
+            }
+        }
+        Command::Status { dir } => {
+            let config = Replica::config_of(&dir)?;
+            // Status only reads local state; no store access needed.
+            let r = Replica::open(&dir, Arc::new(rustfuse_store::MemoryStore::new()))?;
+            println!(
+                "Volume {} ({:?}) at changeset {}, {} entries.",
+                config.volume,
+                config.role,
+                r.applied(),
+                r.tree().len()
+            );
+            let pending = r.pending()?;
+            if pending.is_empty() {
+                println!("No local changes.");
+            } else {
+                println!("{} local changes not pushed:", pending.len());
+                for c in pending.iter().take(50) {
+                    println!("  {}", c.path().display());
+                }
+                if pending.len() > 50 {
+                    println!("  ...");
+                }
+            }
+        }
+        Command::Bench(args) => bench::bench(args).await?,
     }
     Ok(())
-}
-
-struct PhaseStats {
-    elapsed: Duration,
-    latencies: Vec<Duration>,
-}
-
-impl PhaseStats {
-    fn report(&self, name: &str, bytes: u64) {
-        let secs = self.elapsed.as_secs_f64();
-        let pct = |p: f64| {
-            let i = ((self.latencies.len() as f64 - 1.0) * p).round() as usize;
-            self.latencies[i].as_secs_f64() * 1e3
-        };
-        println!(
-            "{name:<16} {:>9.1} MiB/s {:>8.0} ops/s   p50 {:>7.2} ms  p99 {:>7.2} ms  max {:>7.2} ms",
-            bytes as f64 / (1 << 20) as f64 / secs,
-            self.latencies.len() as f64 / secs,
-            pct(0.50),
-            pct(0.99),
-            pct(1.0),
-        );
-    }
-}
-
-async fn run_phase<F, Fut>(keys: &[String], concurrency: usize, op: F) -> Result<PhaseStats>
-where
-    F: Fn(String) -> Fut,
-    Fut: Future<Output = rustfuse_store::Result<()>>,
-{
-    let start = Instant::now();
-    let mut latencies: Vec<Duration> = stream::iter(keys.iter().cloned())
-        .map(|key| {
-            let fut = op(key);
-            async move {
-                let t = Instant::now();
-                fut.await.map(|_| t.elapsed())
-            }
-        })
-        .buffer_unordered(concurrency.max(1))
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?;
-    latencies.sort();
-    Ok(PhaseStats {
-        elapsed: start.elapsed(),
-        latencies,
-    })
 }
