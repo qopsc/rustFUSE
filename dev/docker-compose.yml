@@ -1,0 +1,17 @@
+# Local object store for development and integration tests.
+#   docker compose -f dev/docker-compose.yml up -d
+#   RUSTFUSE_TEST_S3_ENDPOINT=http://localhost:9000 cargo test
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    volumes:
+      - rustfs-data:/data
+
+volumes:
+  rustfs-data:
