@@ -24,6 +24,10 @@ use crate::{IoContext, Result, STATE_DIR};
 
 /// Chunk data fetched per batch while writing files.
 const FETCH_BATCH_BYTES: u64 = 256 << 20;
+/// Files at least this large are written one at a time, a window of chunks
+/// at a time, reusing chunks the file already holds on disk.
+const LARGE_FILE: u64 = 64 << 20;
+const WINDOW_BYTES: u64 = 64 << 20;
 
 pub struct Applier<'a> {
     pub root: &'a Path,
@@ -161,6 +165,10 @@ impl Applier<'_> {
                 Content::File { size, .. } => *size,
                 _ => 0,
             };
+            if size >= LARGE_FILE {
+                stats.push(self.write_large(item.0, &item.1).await?);
+                continue;
+            }
             if !batch.is_empty() && batch_bytes + size > FETCH_BATCH_BYTES {
                 stats.extend(self.write_batch(std::mem::take(&mut batch)).await?);
                 batch_bytes = 0;
@@ -248,6 +256,89 @@ impl Applier<'_> {
                 Some(written.map(|()| (c.node, stat_of(&target))))
             })
             .collect()
+    }
+
+    /// Writes a large file a window of chunks at a time, so memory stays
+    /// bounded, taking chunks the file on disk already holds (checked by
+    /// hash) instead of downloading them: an edit in the middle of a
+    /// multi-gigabyte file only fetches the chunks around it.
+    async fn write_large(&self, c: &NodeChange, target: &Path) -> Result<(NodeId, Option<StatKey>)> {
+        use std::os::unix::fs::FileExt;
+        let entry = c.new.as_ref().unwrap();
+        let Content::File { chunks, .. } = &entry.content else {
+            unreachable!("only chunked files are fetched");
+        };
+        // The file at `target` holds the old content: local edits were
+        // captured before applying, and moved nodes are back in place.
+        let mut local: HashMap<ChunkHash, (u64, u32)> = HashMap::new();
+        if let Some(Content::File { chunks: old, .. }) = c.old.as_ref().map(|o| &o.content) {
+            let mut offset = 0u64;
+            for r in old {
+                local.entry(r.hash).or_insert((offset, r.len));
+                offset += u64::from(r.len);
+            }
+        }
+        let old_file = if local.is_empty() || !kind_matches(target, &entry.content) {
+            None
+        } else {
+            fs::File::open(target).ok()
+        };
+        let dir = target.parent().unwrap_or(self.root);
+        let tmp = temp_path(dir, c.node);
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&tmp).at(&tmp)?);
+        let (mut reused, mut fetched) = (0u64, 0u64);
+        let mut start = 0;
+        while start < chunks.len() {
+            let mut end = start;
+            let mut bytes = 0u64;
+            while end < chunks.len() && (end == start || bytes + u64::from(chunks[end].len) <= WINDOW_BYTES) {
+                bytes += u64::from(chunks[end].len);
+                end += 1;
+            }
+            let window = &chunks[start..end];
+            let mut have: HashMap<ChunkHash, Bytes> = HashMap::new();
+            if let Some(f) = &old_file {
+                for r in window {
+                    let Some(&(offset, len)) = local.get(&r.hash) else {
+                        continue;
+                    };
+                    if have.contains_key(&r.hash) {
+                        continue;
+                    }
+                    let mut buf = vec![0; len as usize];
+                    if f.read_exact_at(&mut buf, offset).is_ok() && rustfuse_chunk::hash(&buf) == r.hash {
+                        have.insert(r.hash, Bytes::from(buf));
+                    }
+                }
+            }
+            let missing: Vec<ChunkRef> = window
+                .iter()
+                .filter(|r| !have.contains_key(&r.hash))
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                have.extend(rustfuse_chunk::fetch(self.store.clone(), &missing).await?);
+            }
+            for r in window {
+                out.write_all(&have[&r.hash]).at(&tmp)?;
+                if missing.iter().any(|m| m.hash == r.hash) {
+                    fetched += u64::from(r.len);
+                } else {
+                    reused += u64::from(r.len);
+                }
+            }
+            start = end;
+        }
+        let f = out.into_inner().map_err(|e| e.into_error()).at(&tmp)?;
+        tracing::debug!(path = %target.display(), reused, fetched, "apply: wrote large file");
+        f.set_modified(entry.mtime.into()).at(&tmp)?;
+        drop(f);
+        set_mode(&tmp, entry.mode).at(&tmp)?;
+        if fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+            fs::remove_dir_all(target).at(target)?;
+        }
+        fs::rename(&tmp, target).at(target)?;
+        Ok((c.node, stat_of(target)))
     }
 
     fn write_file(
