@@ -327,9 +327,17 @@ nothing here), then later ones take 0.06–0.1 s.
   snapshot plus the log tail, straight from the bucket.
 - Protocol: TCP, length-prefixed zstd + postcard frames. `Hello{volume,
   token, after}` subscribes from a position; `Push(changeset)` appends.
-- Auth (Phase 2): one shared token per hub, from `RUSTFUSE_HUB_TOKEN`.
-  **No TLS yet**: run it on a trusted network or a tunnel. Per-machine keys
-  and TLS come with remote access in Phase 5.
+- Auth: one shared token per hub, from `RUSTFUSE_HUB_TOKEN`. Per-machine
+  keys may come with Phase 5.
+- TLS (Phase 4): `rustfuse hub --tls-cert hub.pem --tls-key hub.key`;
+  machines use `--hub tls://host[:port]`. They trust the system's roots, or
+  the certificates in `--hub-ca` (kept in the machine's config). A
+  certificate in `--hub-ca` is also accepted as the exact certificate the
+  hub presents, like a pinned SSH host key, so the self-signed certificate
+  `openssl req -x509` makes works as is; through a CA, the certificate must
+  name the host. rustls with the aws-lc-rs provider, already used by the
+  S3 client. Without a certificate the hub speaks plain TCP: keep it on a
+  trusted network or a tunnel.
 - HA is optional; if the hub is down, every machine keeps working offline,
   and content waits in a local spool if the bucket is unreachable too.
 
@@ -371,7 +379,7 @@ crates/
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
-| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup (**done**). Next: compression, encryption, 25 GB repos |
+| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS (**done**); chunks are zstd-compressed since Phase 1. Next: client-side encryption (key handling to decide), 25 GB repos |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 

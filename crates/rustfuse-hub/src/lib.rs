@@ -9,13 +9,15 @@
 //!
 //! Wire protocol: TCP, each frame a big-endian `u32` length followed by a
 //! zstd-compressed postcard message ([`Request`] / [`Response`]). Clients
-//! authenticate with a shared token. There is no TLS yet; run the hub on a
-//! trusted network or behind a tunnel until Phase 5.
+//! authenticate with a shared token. With a certificate, the hub speaks TLS
+//! and machines reach it as `tls://host[:port]` ([`tls`]); without one,
+//! run it on a trusted network or behind a tunnel.
 
 mod client;
 pub mod codec;
 mod log;
 mod server;
+pub mod tls;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +48,8 @@ pub enum Error {
     Protocol(String),
     #[error("hub refused: {0}")]
     Refused(String),
+    #[error("hub TLS: {0}")]
+    Tls(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

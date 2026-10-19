@@ -7,7 +7,7 @@
 //! the disk may still lag behind, so an interrupted apply resumes.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use rustfuse_types::{Changeset, ChunkRef, Hlc, Node, NodeId, ReplicaId};
@@ -37,8 +37,12 @@ pub struct Config {
     /// Bucket prefix under which volumes live.
     pub prefix: String,
     pub path_style: bool,
-    /// Hub address (`host:port`).
+    /// Hub address: `host:port`, or `tls://host:port` for TLS.
     pub hub: Option<String>,
+    /// CA certificates (PEM) to trust for the hub's TLS certificate
+    /// instead of the system's roots.
+    #[serde(default)]
+    pub hub_ca: Option<PathBuf>,
     pub replica: ReplicaId,
     /// Unique seed for this replica's pack ids.
     pub seed: [u8; 16],

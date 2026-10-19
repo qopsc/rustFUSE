@@ -48,6 +48,7 @@ fn config(volume: &str, replica: u64) -> Config {
         prefix: String::new(),
         path_style: true,
         hub: None,
+        hub_ca: None,
         replica: ReplicaId(replica),
         seed: [replica as u8; 16],
     }
@@ -218,6 +219,7 @@ impl Cluster {
         let hub = HubSpec {
             addr: listener.local_addr().unwrap().to_string(),
             token: "t0ken".into(),
+            tls: None,
         };
         tokio::spawn(rustfuse_hub::Hub::new(root.clone(), hub.token.clone()).serve(listener));
 
@@ -543,6 +545,7 @@ async fn offline_work_syncs_later() {
     let dead_hub = HubSpec {
         addr: "127.0.0.1:9".into(),
         token: "x".into(),
+        tls: None,
     };
     fs::write(c.dir(1).join("offline.bin"), pseudo_random(1 << 20, 9)).unwrap();
     fs::write(c.dir(1).join("README.md"), "edited offline\n").unwrap();

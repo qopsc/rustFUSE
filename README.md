@@ -26,6 +26,14 @@ rustfuse init ~/src/project --volume project --hub rustfs-host
 # Other machines: download it into an empty directory.
 rustfuse attach ~/src/project --volume project --hub rustfs-host
 
+# Over the internet, give the hub a certificate and use tls://. A
+# self-signed certificate works if each machine gets a copy as --hub-ca:
+#   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+#     -keyout hub.key -out hub.pem -days 825 -subj /CN=rustfs-host \
+#     -addext subjectAltName=DNS:rustfs-host
+rustfuse hub --tls-cert hub.pem --tls-key hub.key
+rustfuse attach ~/src/project --volume project --hub tls://rustfs-host --hub-ca hub.pem
+
 # On every machine, keep it in sync (works offline, catches up later):
 rustfuse sync ~/src/project
 rustfuse status ~/src/project
