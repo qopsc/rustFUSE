@@ -9,7 +9,10 @@
 //!
 //! Wire protocol: TCP, each frame a big-endian `u32` length followed by a
 //! zstd-compressed postcard message ([`Request`] / [`Response`]). Clients
-//! authenticate with a shared token. With a certificate, the hub speaks TLS
+//! authenticate with a shared token. A connection that opens with
+//! [`Request::Store`] instead reads and writes the volume's objects through
+//! the hub ([`HubStore`]), so remote machines need neither S3 credentials
+//! nor a route to the bucket. With a certificate, the hub speaks TLS
 //! and machines reach it as `tls://host[:port]` ([`tls`]); without one,
 //! run it on a trusted network or behind a tunnel.
 
@@ -17,13 +20,16 @@ mod client;
 pub mod codec;
 mod log;
 mod server;
+mod store;
 pub mod tls;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub use client::{Event, HubClient};
 pub use log::Volume;
 pub use server::Hub;
+pub use store::HubStore;
 
 use rustfuse_types::Changeset;
 
@@ -66,6 +72,72 @@ pub enum Request {
     },
     /// Append a changeset (its `seq` is ignored).
     Push(Changeset),
+    /// First message of a storage connection: read and write the objects
+    /// of `volume` through the hub. Answered with [`Response::StoreReady`];
+    /// after that both sides exchange [`ObjectRequest`] and
+    /// [`ObjectResponse`] frames without zstd (the data is already
+    /// compressed), any number in flight.
+    Store { volume: String, token: String },
+}
+
+/// One object-store call over a storage connection; keys are relative to
+/// the volume.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ObjectRequest {
+    pub id: u64,
+    pub op: ObjectOp,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ObjectOp {
+    Get {
+        key: String,
+    },
+    GetRange {
+        key: String,
+        start: u64,
+        end: u64,
+    },
+    Put {
+        key: String,
+        data: Bytes,
+    },
+    Head {
+        key: String,
+    },
+    Delete {
+        key: String,
+    },
+    List {
+        prefix: String,
+        start_after: Option<String>,
+        limit: u32,
+    },
+}
+
+/// The answer to the [`ObjectRequest`] with the same `id`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ObjectResponse {
+    pub id: u64,
+    pub result: Result<ObjectReply, ObjectError>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ObjectReply {
+    Data(Bytes),
+    Done,
+    /// Size of the object, if it exists.
+    Head(Option<u64>),
+    List {
+        objects: Vec<(String, u64)>,
+        next_start_after: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ObjectError {
+    NotFound(String),
+    Other(String),
 }
 
 /// Hub to client.
@@ -79,6 +151,8 @@ pub enum Response {
     Changeset(Changeset),
     /// Fatal for this connection.
     Error(String),
+    /// A storage connection is open.
+    StoreReady,
 }
 
 /// Volume names become bucket key segments, so keep them plain.

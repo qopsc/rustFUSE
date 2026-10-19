@@ -35,6 +35,12 @@ rustfuse attach ~/src/project --volume project --hub rustfs-host
 rustfuse hub --tls-cert hub.pem --tls-key hub.key
 rustfuse attach ~/src/project --volume project --hub tls://rustfs-host --hub-ca hub.pem
 
+# A machine that cannot reach rustFS, or should not hold its keys: leave out
+# the bucket and the S3 settings, and it reads and writes through the hub
+# with only the hub token.
+env -u RUSTFUSE_BUCKET -u RUSTFUSE_ACCESS_KEY -u RUSTFUSE_SECRET_KEY \
+  rustfuse attach ~/src/project --volume project --hub tls://rustfs-host --hub-ca hub.pem
+
 # On every machine, keep it in sync (works offline, catches up later):
 rustfuse sync ~/src/project
 rustfuse status ~/src/project

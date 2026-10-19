@@ -43,6 +43,10 @@ pub struct Config {
     /// instead of the system's roots.
     #[serde(default)]
     pub hub_ca: Option<PathBuf>,
+    /// Reach the bucket through the hub instead of directly; `bucket`,
+    /// `endpoint`, `region` and `prefix` are then the hub's business.
+    #[serde(default)]
+    pub via_hub: bool,
     pub replica: ReplicaId,
     /// Unique seed for this replica's pack ids.
     pub seed: [u8; 16],

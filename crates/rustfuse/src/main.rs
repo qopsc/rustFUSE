@@ -112,9 +112,11 @@ enum Command {
 
 #[derive(Args)]
 struct StoreArgs {
-    /// Bucket name.
+    /// Bucket name. Leave it out on a machine to read and write the bucket
+    /// through the hub, which then needs no S3 credentials or route to the
+    /// bucket here.
     #[arg(long, env = "RUSTFUSE_BUCKET")]
-    bucket: String,
+    bucket: Option<String>,
     /// S3 endpoint, e.g. http://localhost:9000. Defaults to AWS.
     #[arg(long, env = "RUSTFUSE_ENDPOINT")]
     endpoint: Option<String>,
@@ -216,8 +218,11 @@ fn with_port(addr: &str) -> String {
 
 impl StoreArgs {
     async fn connect(&self, creds: &Credentials, prefix: &str) -> Result<S3Store> {
+        let Some(bucket) = &self.bucket else {
+            bail!("set the bucket with --bucket or RUSTFUSE_BUCKET");
+        };
         connect(
-            &self.bucket,
+            bucket,
             self.endpoint.clone(),
             &self.region,
             prefix,
@@ -233,15 +238,21 @@ impl StoreArgs {
         }
         let mut seed = [0u8; 16];
         getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
+        let via_hub = self.bucket.is_none();
         Ok(Config {
             volume,
-            bucket: self.bucket.clone(),
-            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone().unwrap_or_default(),
+            endpoint: if via_hub { None } else { self.endpoint.clone() },
             region: self.region.clone(),
-            prefix: self.prefix.clone(),
+            prefix: if via_hub {
+                String::new()
+            } else {
+                self.prefix.clone()
+            },
             path_style: !self.virtual_hosted,
             hub: Some(with_port(&hub.hub)),
             hub_ca: hub.ca()?,
+            via_hub,
             replica: ReplicaId(getrandom::u64().map_err(|e| anyhow::anyhow!("no randomness: {e}"))?),
             seed,
         })
@@ -266,7 +277,14 @@ async fn connect(
     Ok(S3Store::connect(cfg).await?)
 }
 
-async fn volume_store(config: &Config, creds: &Credentials) -> Result<Arc<dyn ObjectStore>> {
+/// The volume's objects: straight from the bucket, or through the hub.
+async fn volume_store(config: &Config, creds: &Credentials, hub: &HubSpec) -> Result<Arc<dyn ObjectStore>> {
+    if config.via_hub {
+        let s = rustfuse_hub::HubStore::connect(&hub.addr, hub.tls.clone(), &config.volume, &hub.token)
+            .await
+            .with_context(|| format!("open storage through the hub at {}", hub.addr))?;
+        return Ok(Arc::new(s));
+    }
     let s = connect(
         &config.bucket,
         config.endpoint.clone(),
@@ -440,7 +458,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let spec = hub.spec()?;
             let config = store.config(volume, &hub)?;
-            let s = volume_store(&config, &creds).await?;
+            let s = volume_store(&config, &creds, &spec).await?;
             let dir = dir.canonicalize().with_context(|| format!("{}", dir.display()))?;
             let (mut r, stats) = Replica::init(&dir, config, s).await?;
             println!(
@@ -462,7 +480,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let spec = hub.spec()?;
             let config = store.config(volume, &hub)?;
-            let s = volume_store(&config, &creds).await?;
+            let s = volume_store(&config, &creds, &spec).await?;
             let mut r = Replica::attach(&dir, config, s).await?;
             println!(
                 "Attached volume {} at {} ({} entries).",
@@ -485,7 +503,7 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("{} has no hub configured", dir.display());
             };
             let spec = hub_spec(&addr, config.hub_ca.as_deref(), token.get()?)?;
-            let mut r = Replica::open(&dir, volume_store(&config, &creds).await?)?;
+            let mut r = Replica::open(&dir, volume_store(&config, &creds, &spec).await?)?;
             if once {
                 let s = r.sync_once(&spec, SYNC_TIMEOUT).await?;
                 println!(

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rustfuse_hub::{Event, Hub, HubClient, Volume, tls};
+use rustfuse_hub::{Event, Hub, HubClient, HubStore, Volume, tls};
 use rustfuse_store::{MemoryStore, ObjectStore, PrefixStore};
 use rustfuse_types::{Changeset, FORMAT_VERSION, Hlc, ReplicaId, Version};
 
@@ -163,4 +163,69 @@ async fn tls_connections() {
     b.push(&cs(2, 1)).await.unwrap();
     assert_eq!(next_changeset(&mut b).await.seq, 1);
     assert!(tls_client(&format!("localhost:{port}"), &ca_pem).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_through_the_hub() {
+    let root: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let addr = start(root.clone()).await;
+
+    assert!(HubStore::connect(&addr, None, "v", "wrong").await.is_err());
+    assert!(HubStore::connect(&addr, None, "../x", "secret").await.is_err());
+
+    // Works before the volume exists, and stays inside it.
+    let store = HubStore::connect(&addr, None, "v", "secret").await.unwrap();
+    rustfuse_store::conformance::run(&store, "t").await;
+    store.put("x", bytes::Bytes::from_static(b"v")).await.unwrap();
+    assert_eq!(
+        root.get("volumes/v/x").await.unwrap(),
+        bytes::Bytes::from_static(b"v")
+    );
+
+    assert!(store.get("../w/x").await.is_err());
+    assert!(store.list("a/../../", None, 10).await.is_err());
+
+    // Many calls in flight on the one connection, large ones included.
+    let big = bytes::Bytes::from(vec![7u8; 20 << 20]);
+    let store = Arc::new(store);
+    let mut tasks = Vec::new();
+    for i in 0..32 {
+        let (store, big) = (store.clone(), big.clone());
+        tasks.push(tokio::spawn(async move {
+            let key = format!("p/{i}");
+            store.put(&key, big.slice(..(i << 16) + 1)).await.unwrap();
+            let got = store.get_range(&key, 1..(i << 16) as u64 + 1).await.unwrap();
+            assert_eq!(got.len(), i << 16);
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    store.put("big", big.clone()).await.unwrap();
+    assert_eq!(store.get("big").await.unwrap(), big);
+
+    // A dropped connection is reopened on the next call.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap().to_string();
+    let target = addr.clone();
+    let cut = Arc::new(tokio::sync::Notify::new());
+    let cut2 = cut.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut a, _) = listener.accept().await.unwrap();
+            let mut b = tokio::net::TcpStream::connect(&target).await.unwrap();
+            let cut = cut2.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut a, &mut b) => {}
+                    _ = cut.notified() => {}
+                }
+            });
+        }
+    });
+    let s = HubStore::connect(&proxy, None, "v", "secret").await.unwrap();
+    assert_eq!(s.get("x").await.unwrap(), bytes::Bytes::from_static(b"v"));
+    cut.notify_waiters();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(s.get("x").await.unwrap(), bytes::Bytes::from_static(b"v"));
 }

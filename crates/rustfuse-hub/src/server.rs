@@ -145,8 +145,10 @@ impl Hub {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let (mut rd, mut wr) = tokio::io::split(stream);
-        let Some(Request::Hello { volume, token, after }) = read_frame(&mut rd).await? else {
-            return Err(Error::Protocol("expected hello".into()));
+        let (volume, token, after) = match read_frame(&mut rd).await? {
+            Some(Request::Hello { volume, token, after }) => (volume, token, Some(after)),
+            Some(Request::Store { volume, token }) => (volume, token, None),
+            _ => return Err(Error::Protocol("expected hello".into())),
         };
         if !constant_time_eq(token.as_bytes(), self.token.as_bytes()) {
             write_frame(&mut wr, &Response::Error("invalid token".into())).await?;
@@ -156,6 +158,12 @@ impl Hub {
             write_frame(&mut wr, &Response::Error("invalid volume name".into())).await?;
             return Err(Error::Refused("invalid volume name".into()));
         }
+        let Some(after) = after else {
+            // Storage works before the volume exists: `init` creates it.
+            let store = Arc::new(PrefixStore::new(self.root.clone(), &format!("volumes/{volume}")));
+            debug!(volume, "storage connection");
+            return crate::store::serve(store, rd, wr).await;
+        };
         let log = match self.log(&volume).await {
             Ok(l) => l,
             Err(e) => {
@@ -216,7 +224,7 @@ impl Hub {
                             }
                         }
                     }
-                    Some(Ok(Request::Hello { .. })) => {
+                    Some(Ok(Request::Hello { .. } | Request::Store { .. })) => {
                         return Err(Error::Protocol("unexpected hello".into()));
                     }
                 },
