@@ -49,8 +49,11 @@ const RECONCILE_ATTEMPTS: usize = 5;
 /// Where the hub is and how to authenticate.
 #[derive(Clone, Debug)]
 pub struct HubSpec {
+    /// `host:port`, without any scheme.
     pub addr: String,
     pub token: String,
+    /// Connect over TLS with these settings.
+    pub tls: Option<Arc<rustfuse_hub::tls::ClientConfig>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -780,7 +783,14 @@ impl Replica {
     // ---- talking to the hub --------------------------------------------------
 
     async fn connect(&self, hub: &HubSpec) -> Result<HubClient> {
-        Ok(HubClient::connect(&hub.addr, &self.config.volume, &hub.token, self.counters.applied).await?)
+        Ok(HubClient::connect_with(
+            &hub.addr,
+            hub.tls.as_ref(),
+            &self.config.volume,
+            &hub.token,
+            self.counters.applied,
+        )
+        .await?)
     }
 
     /// Sends outbox changesets not already sent on this connection.

@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use rustfuse_types::Changeset;
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
 
 use crate::codec::{read_frame, write_frame};
@@ -17,7 +19,7 @@ pub enum Event {
 
 /// A connection to the hub for one volume.
 pub struct HubClient {
-    wr: OwnedWriteHalf,
+    wr: Box<dyn AsyncWrite + Send + Unpin>,
     events: mpsc::UnboundedReceiver<Result<Event>>,
     head: u64,
 }
@@ -25,9 +27,37 @@ pub struct HubClient {
 impl HubClient {
     /// Connects, authenticates and subscribes to changesets after `after`.
     pub async fn connect(addr: &str, volume: &str, token: &str, after: u64) -> Result<HubClient> {
+        Self::connect_with(addr, None, volume, token, after).await
+    }
+
+    /// Like [`connect`](Self::connect), over TLS when `tls` is given.
+    pub async fn connect_with(
+        addr: &str,
+        tls: Option<&Arc<rustls::ClientConfig>>,
+        volume: &str,
+        token: &str,
+        after: u64,
+    ) -> Result<HubClient> {
         let stream = TcpStream::connect(addr).await?;
         let _ = stream.set_nodelay(true);
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr): (
+            Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            Box<dyn AsyncWrite + Send + Unpin>,
+        ) = match tls {
+            Some(config) => {
+                let name = crate::tls::server_name(addr)?;
+                let stream = tokio_rustls::TlsConnector::from(config.clone())
+                    .connect(name, stream)
+                    .await
+                    .map_err(|e| crate::Error::Tls(format!("{addr}: {e}")))?;
+                let (r, w) = tokio::io::split(stream);
+                (Box::new(r), Box::new(w))
+            }
+            None => {
+                let (r, w) = stream.into_split();
+                (Box::new(r), Box::new(w))
+            }
+        };
         write_frame(
             &mut wr,
             &Request::Hello {

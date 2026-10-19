@@ -33,6 +33,13 @@ enum Command {
         creds: Credentials,
         #[command(flatten)]
         token: Token,
+        /// Serve TLS with this certificate chain (PEM); machines then use
+        /// `--hub tls://host`.
+        #[arg(long, env = "RUSTFUSE_HUB_TLS_CERT", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// Private key (PEM) for `--tls-cert`.
+        #[arg(long, env = "RUSTFUSE_HUB_TLS_KEY", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
     },
     /// Create a volume from an existing directory and upload it.
     Init {
@@ -149,23 +156,54 @@ impl Token {
 
 #[derive(Args)]
 struct HubArgs {
-    /// Hub address, host:port.
+    /// Hub address: host[:port], or tls://host[:port] if the hub has a
+    /// certificate.
     #[arg(long, env = "RUSTFUSE_HUB")]
     hub: String,
+    /// CA certificates (PEM) to trust for the hub instead of the system's;
+    /// remembered for later syncs.
+    #[arg(long, env = "RUSTFUSE_HUB_CA")]
+    hub_ca: Option<PathBuf>,
     #[command(flatten)]
     token: Token,
 }
 
 impl HubArgs {
     fn spec(&self) -> Result<HubSpec> {
-        Ok(HubSpec {
-            addr: with_port(&self.hub),
-            token: self.token.get()?,
-        })
+        hub_spec(&with_port(&self.hub), self.ca()?.as_deref(), self.token.get()?)
+    }
+
+    /// The CA path, made absolute so later syncs from anywhere find it.
+    fn ca(&self) -> Result<Option<PathBuf>> {
+        self.hub_ca
+            .as_ref()
+            .map(|p| p.canonicalize().with_context(|| format!("{}", p.display())))
+            .transpose()
     }
 }
 
+/// Connection settings for a hub address as stored in the config.
+fn hub_spec(hub: &str, ca: Option<&Path>, token: String) -> Result<HubSpec> {
+    let (addr, tls) = match hub.strip_prefix(rustfuse_hub::tls::SCHEME) {
+        Some(addr) => (addr, Some(rustfuse_hub::tls::client_config(ca)?)),
+        None => {
+            if ca.is_some() {
+                bail!("--hub-ca needs a tls:// hub address");
+            }
+            (hub, None)
+        }
+    };
+    Ok(HubSpec {
+        addr: addr.to_owned(),
+        token,
+        tls,
+    })
+}
+
 fn with_port(addr: &str) -> String {
+    if let Some(rest) = addr.strip_prefix(rustfuse_hub::tls::SCHEME) {
+        return format!("{}{}", rustfuse_hub::tls::SCHEME, with_port(rest));
+    }
     if addr
         .rsplit_once(':')
         .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
@@ -203,6 +241,7 @@ impl StoreArgs {
             prefix: self.prefix.clone(),
             path_style: !self.virtual_hosted,
             hub: Some(with_port(&hub.hub)),
+            hub_ca: hub.ca()?,
             replica: ReplicaId(getrandom::u64().map_err(|e| anyhow::anyhow!("no randomness: {e}"))?),
             seed,
         })
@@ -370,15 +409,25 @@ async fn run(cli: Cli) -> Result<()> {
             store,
             creds,
             token,
+            tls_cert,
+            tls_key,
         } => {
+            let tls = match (&tls_cert, &tls_key) {
+                (Some(cert), Some(key)) => Some(rustfuse_hub::tls::server_config(cert, key)?),
+                _ => None,
+            };
             let root: Arc<dyn ObjectStore> = Arc::new(store.connect(&creds, &store.prefix).await?);
             let listener = tokio::net::TcpListener::bind(&listen)
                 .await
                 .with_context(|| format!("listen on {listen}"))?;
-            println!("Hub listening on {}.", listener.local_addr()?);
+            println!(
+                "Hub listening on {}{}.",
+                listener.local_addr()?,
+                if tls.is_some() { " with TLS" } else { "" }
+            );
             let hub = rustfuse_hub::Hub::new(root, token.get()?);
             tokio::select! {
-                res = hub.serve(listener) => res?,
+                res = hub.serve_with(listener, tls) => res?,
                 _ = tokio::signal::ctrl_c() => {}
             }
         }
@@ -435,10 +484,7 @@ async fn run(cli: Cli) -> Result<()> {
             let Some(addr) = config.hub.clone() else {
                 bail!("{} has no hub configured", dir.display());
             };
-            let spec = HubSpec {
-                addr,
-                token: token.get()?,
-            };
+            let spec = hub_spec(&addr, config.hub_ca.as_deref(), token.get()?)?;
             let mut r = Replica::open(&dir, volume_store(&config, &creds).await?)?;
             if once {
                 let s = r.sync_once(&spec, SYNC_TIMEOUT).await?;

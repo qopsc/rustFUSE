@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rustfuse_store::{ObjectStore, PrefixStore};
 use rustfuse_types::{Changeset, FORMAT_VERSION};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -84,15 +84,34 @@ impl Hub {
         })
     }
 
-    /// Accepts connections until the listener fails.
+    /// Accepts plain TCP connections until the listener fails.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+        self.serve_with(listener, None).await
+    }
+
+    /// Accepts connections until the listener fails, over TLS when `tls`
+    /// is given.
+    pub async fn serve_with(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<()> {
+        let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
         loop {
             let (stream, peer) = listener.accept().await?;
             let _ = stream.set_nodelay(true);
             let hub = self.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 debug!(%peer, "connected");
-                if let Err(e) = hub.handle(stream).await {
+                let res = match acceptor {
+                    Some(a) => match a.accept(stream).await {
+                        Ok(s) => hub.handle(s).await,
+                        Err(e) => Err(Error::Tls(e.to_string())),
+                    },
+                    None => hub.handle(stream).await,
+                };
+                if let Err(e) = res {
                     debug!(%peer, "connection ended: {e}");
                 }
             });
@@ -121,8 +140,11 @@ impl Hub {
         Ok(log)
     }
 
-    async fn handle(&self, stream: TcpStream) -> Result<()> {
-        let (mut rd, mut wr) = stream.into_split();
+    async fn handle<S>(&self, stream: S) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut rd, mut wr) = tokio::io::split(stream);
         let Some(Request::Hello { volume, token, after }) = read_frame(&mut rd).await? else {
             return Err(Error::Protocol("expected hello".into()));
         };
