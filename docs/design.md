@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–3 implemented, Phase 4 in progress** · 2026-10-19
+Status: **Phases 0–4 implemented** · 2026-10-19
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -309,6 +309,15 @@ parallel on apply (directories first, permissions last); the index rewrites
 only nodes that actually changed after a catch-up instead of every pending
 node, and clears the pending table by dropping it.
 
+A larger repository (4.6 GB: a 2.3 GB pack, a 1 GB binary, 11k files):
+`init` 15 s (peak 0.7 GB RAM), `attach` 16 s (peak 0.4 GB; it was 2.4 GB
+before large files were streamed), no-op sync 0.2 s. A 1 MiB edit in the
+middle of the 1 GB file makes the other machine fetch 1.4 MB, not 1 GB:
+files of 64 MiB or more are written a 64 MiB window at a time, and chunks
+the old copy on disk already holds are read from it (checked by hash)
+instead of downloaded. 25 GB was not tried: the test machine's disk holds
+about two copies of 5 GB plus the bucket.
+
 With the fsmonitor hook, the first `git status` after the index arrived
 from another machine still checks every file (that machine's token means
 nothing here), then later ones take 0.06–0.1 s.
@@ -379,7 +388,7 @@ crates/
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
-| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS (**done**); chunks are zstd-compressed since Phase 1. Next: client-side encryption (key handling to decide), 25 GB repos |
+| **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 

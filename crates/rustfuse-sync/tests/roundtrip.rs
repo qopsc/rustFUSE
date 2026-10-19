@@ -1046,3 +1046,28 @@ async fn git_cleanup_handles_odd_names_and_deletes() {
         assert_eq!(copies, Vec::<String>::new(), "leftover conflict copies");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_files_stream_and_reuse_local_chunks() {
+    let size = 80 << 20;
+    let mut c = Cluster::new(2, |root: &Path| {
+        fs::write(root.join("huge.bin"), pseudo_random(size, 11)).unwrap();
+    })
+    .await;
+    let src = c.dir(0).to_path_buf();
+    // Overwrite a stretch in the middle: the other machine rebuilds the
+    // file from its own copy plus the changed chunks.
+    let mut data = fs::read(src.join("huge.bin")).unwrap();
+    data[40 << 20..(40 << 20) + (1 << 20)].copy_from_slice(&pseudo_random(1 << 20, 12));
+    fs::write(src.join("huge.bin"), &data).unwrap();
+    c.settle().await;
+    // Moved and edited in the same round, and grown past a window.
+    fs::create_dir(src.join("sub")).unwrap();
+    fs::rename(src.join("huge.bin"), src.join("sub/huge.bin")).unwrap();
+    data.extend_from_slice(&pseudo_random(70 << 20, 13));
+    data[..4096].copy_from_slice(&[7; 4096]);
+    fs::write(src.join("sub/huge.bin"), &data).unwrap();
+    fs::set_permissions(src.join("sub/huge.bin"), fs::Permissions::from_mode(0o600)).unwrap();
+    c.settle().await;
+    assert_eq!(fs::read(c.dir(1).join("sub/huge.bin")).unwrap(), data);
+}

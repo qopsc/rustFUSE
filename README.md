@@ -6,9 +6,10 @@ machine works on a plain local folder at local speed, online or offline;
 a small hub next to the store orders changes, and every machine resolves
 conflicts the same way.
 
-**Status:** Phases 1–3 done (sync core, multi-machine hub, git-aware
-conflict handling); Phase 4 (scale and speed) in progress. A 300k-file
-repository uploads in about 15 s and downloads in about 35 s. See [docs/design.md](docs/design.md) for the
+**Status:** Phases 1–4 done (sync core, multi-machine hub, git-aware
+conflict handling, scale and speed). A 300k-file repository uploads in
+about 15 s and downloads in about 35 s; `git status` with the fsmonitor
+hook takes 0.06 s. See [docs/design.md](docs/design.md) for the
 architecture and roadmap.
 
 ## Usage
