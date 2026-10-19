@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–2 implemented** · 2026-10-19
+Status: **Phases 0–3 implemented** · 2026-10-19
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -187,12 +187,14 @@ watcher's bookmark (FSEvents event id / last scan).
   (after the objects they point to exist), so git never sees a ref to a
   missing object.
 
-**Exclusions (R6).** Built-in: `.rustfuse/`, `.DS_Store`, `.git/**/*.lock`,
-`.git/gc.pid`, `.git/fsmonitor--daemon/`. Then `.rustfuseignore` at the root
-(gitignore syntax, `!` re-includes). Then directories the repository's own
-`.gitignore` files and `.git/info/exclude` exclude, which is how `target/`,
-`node_modules/` and friends stay local without a hard-coded list. Files
-matched by `.gitignore` still sync, because repositories often track them
+**Exclusions (R6).** Built-in: `.rustfuse/`, `.DS_Store`, and in any
+repository's `.git/`: `**/*.lock`, `gc.pid`, `fsmonitor--daemon/` and
+`worktrees/*/gitdir` (each machine's own pointer to its copy of a linked
+worktree, §7.1). Then `.rustfuseignore` at the root (gitignore syntax, `!`
+re-includes). Then directories the repository's own `.gitignore` files and
+`.git/info/exclude` exclude, which is how `target/`, `node_modules/` and
+friends stay local without a hard-coded list. Files matched by
+`.gitignore` still sync, because repositories often track them
 (`Cargo.lock`). Excluded paths stay purely local.
 
 ## 7. Conflict resolution
@@ -202,14 +204,49 @@ replica converges. Rules, from most to least specific:
 
 ### 7.1 Git-aware rules (`.git/` and worktree gitdirs)
 
-| Path | Rule |
+The log applies the generic rules (§7.2) everywhere, so a conflict inside
+`.git/` first produces an ordinary conflict copy. After each sync round
+every machine runs a **git pass** (`rustfuse-sync/src/git.rs`) over its own
+disk that turns those copies into git-correct results. Each fix depends
+only on what the log produced, so machines doing it at the same time write
+the same bytes and their changes merge as "same content". It needs the
+`git` binary; without it the copies simply stay.
+
+| Path (in a git dir) | Rule |
 |---|---|
-| `objects/**` (loose + packs), `lfs/objects/**` | Content-addressed and immutable. Same name means same content, so take the **union**. Never a conflict. |
-| `refs/**`, `HEAD`, `packed-refs` (per ref line) | If one value is an **ancestor** of the other (checked against the local object graph), take the descendant (a fast-forward). Otherwise keep the later (HLC) value and record the other as `refs/rustfuse-conflicts/<machine>/<ref>` so `git log`/`git merge` can recover it. |
-| `logs/**` (reflogs) | Append-only, so merge by **union**, ordered by timestamp. |
-| `index` | A cache plus staged state. Keep the later version and save the other as `index.rustfuse-conflict-<machine>`; `rustfuse conflicts` explains how to restore staged changes. git rescans the worktree, so nothing in the worktree is lost. |
+| `objects/**` | Content-addressed: same name, same object. Copies (e.g. a loose object compressed differently, `commit-graph`) are dropped. |
+| `refs/**`, `HEAD`, `worktrees/*/HEAD` | If one commit is an **ancestor** of the other, the descendant wins (via `git update-ref` with the old value, so a concurrent local git command is never overwritten) and the copy is dropped. If they diverged, the later (HLC) value stays and the other remains as the branch `<name>.conflict-<machine>-<time>`; once it is merged into the branch, the copy is dropped. A HEAD moved to different branches keeps the later checkout. |
+| `packed-refs` | Merged per ref with the same ancestry rule; refs on only one side are kept; a diverged ref is written as a loose `<ref>.conflict-…`. Written under `packed-refs.lock` like git. |
+| `logs/**` (reflogs) | Union of both, ordered by timestamp. |
+| `index`, `worktrees/*/index` | Keep whichever version agrees with HEAD on more entries, so a `git status` refresh on one machine never undoes a commit, checkout or merge made on another. Nothing in the worktree is lost either way. |
+| `FETCH_HEAD`, `ORIG_HEAD`, `AUTO_MERGE`, `COMMIT_EDITMSG`, `gc.log` | Transient; copies dropped. |
 | `*.lock`, `gc.pid`, `fsmonitor--daemon/` | Never synced. |
-| `config`, `worktrees/*/` admin files, others | Generic rules (§7.2). |
+| `config`, hooks, others | Generic rules (§7.2). |
+
+**The worktree after a branch conflict.** Files a worktree holds follow
+their own last write, so after two machines committed to the same branch
+the worktree mixes both commits. When the checked-out branch is resolved
+in favour of commit T over commit X, the pass looks at the paths that
+differ between X and T and, for each, puts the file back to T's version
+only if it holds exactly X's committed version (and resets the index entry
+if only the index does). A conflict copy next to such a file that holds
+X's or T's committed version is removed, since git keeps it. Uncommitted
+edits are never touched, and nothing runs while a merge, rebase,
+cherry-pick or revert is in progress. Each diverged conflict is cleaned
+up once per machine (remembered in `.rustfuse/git-handled`); merging the
+conflict branch later never triggers it again.
+
+**Linked worktrees.** `git worktree add` writes absolute paths in two
+places. The worktree's `.git` file is rewritten to a relative path, which
+every git version follows, so it is correct on every machine. The back
+pointer `.git/worktrees/<id>/gitdir` is not synced; each machine writes its
+own, so `git worktree list` and `prune` see the right path everywhere.
+
+**Index settings.** Each repository gets `core.checkStat=minimal` and
+`core.trustctime=false` (only when unset). File mtimes and sizes sync
+exactly, but inode numbers and ctimes cannot, so without these an index
+written on one machine would make `git status` rehash every file on the
+next.
 
 ### 7.2 Generic rules (worktree files and everything else)
 
@@ -304,7 +341,7 @@ crates/
 | **0. Foundations** | Workspace, CI, rustFS harness, S3 layer (**done**) |
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
-| **3. Git awareness** | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, exclusions, `rustfuse conflicts`, git scenario tests |
+| **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** | 25 GB / 500k-file repos, parallel clone, fsmonitor hook, compression, encryption |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
@@ -322,11 +359,12 @@ Decided (2026-10-19):
 
 Open:
 
-- Known in Phase 2: in git, a ref changed on two machines keeps the later
-  value and the other as a branch named `<ref>.conflict-…`; worktree files
-  follow their own last write, so after such a conflict `git status` can
-  show changes until the branches are merged. Phase 3 merges refs by
-  ancestry and recovers the index.
-- `git status` on one machine rewrites `.git/index`, which then syncs. The
-  recommendation is `core.checkStat=minimal` and `core.trustctime=false`;
-  Phase 3 treats the index specially.
+- The git pass runs after a conflict arrives. Two people running git in
+  the **same worktree at the same instant** on two machines can still
+  interleave (§7.3); results stay recoverable from refs, reflogs and
+  conflict copies.
+- A 3-way text merge for ordinary files (instead of a conflict copy) is a
+  possible later addition.
+- Worktree cleanup and conflict handling call the `git` binary once per
+  path; very large diverged commits (thousands of files) are slow to
+  clean up. Batching is planned with Phase 4.

@@ -22,9 +22,11 @@ pub const DEFAULT_PATTERNS: &[&str] = &[
     "/.rustfuse/",
     ".rustfuse-tmp-*",
     ".DS_Store",
-    ".git/**/*.lock",
-    ".git/gc.pid",
-    ".git/fsmonitor--daemon/",
+    "**/.git/**/*.lock",
+    "**/.git/gc.pid",
+    "**/.git/fsmonitor--daemon/",
+    // Each machine points a linked worktree's admin dir at its own path.
+    "**/.git/worktrees/*/gitdir",
 ];
 
 /// Per-volume exclusion file in the synced directory's root.
@@ -101,7 +103,7 @@ impl Ignore {
         if let Some(d) = decide(self.own.matched_path_or_any_parents(rel, is_dir)) {
             return d;
         }
-        if rel.components().next() == Some(Component::Normal(".git".as_ref())) {
+        if rel.components().any(|c| c == Component::Normal(".git".as_ref())) {
             return false;
         }
         // Git's rules only exclude directories. Repositories commonly track
@@ -144,6 +146,9 @@ mod tests {
         assert!(ig.is_ignored(Path::new(".git/index.lock"), false));
         assert!(ig.is_ignored(Path::new(".git/refs/heads/main.lock"), false));
         assert!(ig.is_ignored(Path::new(".git/worktrees/wt/index.lock"), false));
+        assert!(ig.is_ignored(Path::new("repos/a/.git/index.lock"), false));
+        assert!(ig.is_ignored(Path::new(".git/worktrees/wt/gitdir"), false));
+        assert!(!ig.is_ignored(Path::new(".git/worktrees/wt/HEAD"), false));
         assert!(!ig.is_ignored(Path::new("Cargo.lock"), false));
         assert!(!ig.is_ignored(Path::new(".git/index"), false));
         // No hard-coded build dirs: a tracked `target` directory syncs.

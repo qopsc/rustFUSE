@@ -1,0 +1,1081 @@
+//! Git-aware tidying after conflicts (`docs/design.md` §7.1).
+//!
+//! The log resolves every conflict with the generic rules, which may leave
+//! conflict copies inside `.git/`. After each sync round every machine runs
+//! this pass on its own disk; each fix is a deterministic function of what
+//! the log produced, so machines doing it at the same time write the same
+//! bytes and their changes merge cleanly.
+//!
+//! - Object, index and other cache copies are dropped (objects are
+//!   content-addressed; the rest git rebuilds).
+//! - A ref and its conflict copy are merged by ancestry: if one commit
+//!   contains the other the descendant wins and the copy goes away;
+//!   otherwise the copy stays as a branch (`main.conflict-…`) to merge.
+//! - `packed-refs` is merged per ref with the same rule, reflogs by union.
+//! - When a checked-out branch was resolved, worktree files that still hold
+//!   the losing commit's version are brought back to the winner's, so
+//!   `git status` is clean. Only files exactly matching a commit are
+//!   touched, so no uncommitted work is lost.
+//! - Linked worktrees: the `.git` file in a worktree is made relative so it
+//!   works on every machine, and the per-machine back pointer
+//!   (`.git/worktrees/<id>/gitdir`, not synced) is written locally.
+//! - New repositories get `core.checkStat=minimal` and
+//!   `core.trustctime=false`, so an index synced from another machine stays
+//!   valid instead of making `git status` rehash every file.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+use rustfuse_types::Content;
+use tracing::{debug, info, warn};
+
+use crate::STATE_DIR;
+use crate::tree::Tree;
+
+const HANDLED_FILE: &str = "git-handled";
+
+/// Copies of these (relative to a git dir) are dropped: caches and
+/// transient files git rewrites on its own.
+const DISPOSABLE: &[&str] = &[
+    "FETCH_HEAD",
+    "ORIG_HEAD",
+    "AUTO_MERGE",
+    "COMMIT_EDITMSG",
+    "gc.log",
+];
+
+/// The original name of a conflict copy (`a.conflict-1a2b3c4d-20261019-155306.txt`
+/// → `a.txt`), or `None` if `name` is not one.
+pub fn original_name(name: &[u8]) -> Option<Vec<u8>> {
+    const TAG: &[u8] = b".conflict-";
+    // `.conflict-` + 8 hex + `-` + 8 digits + `-` + 6 digits
+    const LEN: usize = 10 + 8 + 1 + 8 + 1 + 6;
+    let start = name.windows(TAG.len()).rposition(|w| w == TAG)?;
+    let tag = name.get(start..start + LEN)?;
+    let rest = &tag[TAG.len()..];
+    let ok = rest[..8].iter().all(u8::is_ascii_hexdigit)
+        && rest[8] == b'-'
+        && rest[9..17].iter().all(u8::is_ascii_digit)
+        && rest[17] == b'-'
+        && rest[18..24].iter().all(u8::is_ascii_digit);
+    if !ok || start == 0 {
+        return None;
+    }
+    let mut out = name[..start].to_vec();
+    out.extend_from_slice(&name[start + LEN..]);
+    Some(out)
+}
+
+/// What the tidy pass looks at, taken from the tree so the pass itself can
+/// run on a blocking thread.
+#[derive(Debug, Default)]
+pub struct Plan {
+    /// Git dirs (`.git` directories), relative to the root, each with the
+    /// conflict copies inside it (relative to the git dir).
+    repos: BTreeMap<PathBuf, Vec<PathBuf>>,
+    /// `.git` files of linked worktrees and their content.
+    pointers: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl Plan {
+    pub fn from_tree(tree: &Tree) -> Plan {
+        let mut plan = Plan::default();
+        let mut copies = Vec::new();
+        for (&id, node) in tree.iter() {
+            let e = &node.entry;
+            if e.name == b".git" {
+                match &e.content {
+                    Content::Dir => {
+                        if let Some(p) = tree.path(id) {
+                            plan.repos.entry(p).or_default();
+                        }
+                    }
+                    Content::Inline(data) if data.starts_with(b"gitdir: ") => {
+                        if let Some(p) = tree.path(id) {
+                            plan.pointers.push((p, data.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            } else if original_name(&e.name).is_some()
+                && let Some(p) = tree.path(id)
+            {
+                copies.push(p);
+            }
+        }
+        for p in copies {
+            let comps: Vec<Component> = p.components().collect();
+            let Some(i) = comps.iter().rposition(|c| c.as_os_str() == ".git") else {
+                continue;
+            };
+            let gitdir: PathBuf = comps[..=i].iter().collect();
+            let inner: PathBuf = comps[i + 1..].iter().collect();
+            if let Some(list) = plan.repos.get_mut(&gitdir) {
+                list.push(inner);
+            }
+        }
+        plan.pointers.sort();
+        plan
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.repos.is_empty() && self.pointers.is_empty()
+    }
+}
+
+/// Per-machine state of the tidy pass.
+pub struct GitTidy {
+    root: PathBuf,
+    /// Diverged ref copies already handled (relative to the root): their
+    /// worktrees were cleaned once and are left alone from then on.
+    handled: BTreeSet<PathBuf>,
+    configured: HashSet<PathBuf>,
+    unavailable: bool,
+}
+
+/// A ref resolved in favour of `target` over `other`: worktrees on that
+/// ref may still hold files from `other`.
+struct Resolved {
+    gitdir: PathBuf,
+    /// `refs/heads/…`, or `None` for a worktree's own HEAD.
+    refname: Option<String>,
+    /// For a HEAD: the worktree's admin dir (the git dir itself for the
+    /// main worktree).
+    admin: PathBuf,
+    target: String,
+    other: String,
+}
+
+impl GitTidy {
+    pub fn load(root: &Path) -> GitTidy {
+        let handled = fs::read(root.join(STATE_DIR).join(HANDLED_FILE))
+            .map(|data| {
+                data.split(|&b| b == b'\n')
+                    .filter(|l| !l.is_empty())
+                    .map(|l| PathBuf::from(OsStr::from_bytes(l)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        GitTidy {
+            root: root.to_owned(),
+            handled,
+            configured: HashSet::new(),
+            unavailable: false,
+        }
+    }
+
+    /// Runs the pass. Returns whether anything on disk changed.
+    pub fn run(&mut self, plan: Plan) -> bool {
+        if self.unavailable || plan.is_empty() {
+            return false;
+        }
+        if Command::new("git").arg("--version").output().is_err() {
+            warn!("git is not installed; git-aware conflict handling is off");
+            self.unavailable = true;
+            return false;
+        }
+        let mut changed = false;
+        for (file, data) in &plan.pointers {
+            changed |= self.link_worktree(file, data);
+        }
+        let mut live = BTreeSet::new();
+        for (gitdir, copies) in &plan.repos {
+            let g = self.root.join(gitdir);
+            if !g.is_dir() {
+                continue;
+            }
+            changed |= self.configure(&g);
+            let mut resolved = Vec::new();
+            // Refs first: updating refs appends to reflogs, merged last.
+            let mut copies = copies.clone();
+            copies.sort_by_key(|c| c.starts_with("logs"));
+            for inner in copies {
+                let rel = gitdir.join(&inner);
+                let before = resolved.len();
+                match self.tidy_copy(&g, &inner, &mut resolved) {
+                    Ok(Outcome::Changed) => {
+                        changed = true;
+                        if self.handled.contains(&rel) {
+                            // A conflict branch the user has since merged:
+                            // the worktree is theirs, leave it alone.
+                            resolved.truncate(before);
+                        }
+                    }
+                    Ok(Outcome::Kept) => {
+                        live.insert(rel);
+                    }
+                    Ok(Outcome::Diverged) => {
+                        live.insert(rel.clone());
+                        if self.handled.insert(rel.clone()) {
+                            info!(
+                                branch = %rel.display(),
+                                "a branch moved on two machines at once; the other side is kept as a branch to merge"
+                            );
+                        } else {
+                            // Already cleaned up once; do not touch again.
+                            resolved.pop();
+                        }
+                    }
+                    Err(e) => {
+                        debug!(copy = %rel.display(), "git conflict not resolved yet: {e}");
+                        live.insert(rel);
+                    }
+                }
+            }
+            for r in resolved {
+                match self.clean_worktrees(&r) {
+                    Ok(c) => changed |= c,
+                    Err(e) => {
+                        warn!(gitdir = %r.gitdir.display(), "cleaning worktree after a ref conflict: {e}")
+                    }
+                }
+            }
+        }
+        let before = self.handled.len();
+        self.handled.retain(|p| live.contains(p));
+        if self.handled.len() != before || changed {
+            self.save_handled();
+        }
+        changed
+    }
+
+    fn save_handled(&self) {
+        let mut data = Vec::new();
+        for p in &self.handled {
+            data.extend_from_slice(p.as_os_str().as_bytes());
+            data.push(b'\n');
+        }
+        let path = self.root.join(STATE_DIR).join(HANDLED_FILE);
+        if let Err(e) = write_atomic(&path, &data) {
+            warn!("saving {}: {e}", path.display());
+        }
+    }
+
+    // ---- linked worktrees ----------------------------------------------------
+
+    /// Makes a worktree's `.git` file relative and writes this machine's
+    /// back pointer for it.
+    fn link_worktree(&self, file: &Path, data: &[u8]) -> bool {
+        let wt = self.root.join(file.parent().unwrap_or(Path::new("")));
+        let raw = data.strip_prefix(b"gitdir: ").unwrap_or(data);
+        let target = Path::new(OsStr::from_bytes(raw.trim_ascii_end()));
+        let mut changed = false;
+        let admin = if target.is_absolute() {
+            let Ok(inside) = target.strip_prefix(&self.root) else {
+                return false; // points outside the volume; nothing to do
+            };
+            let admin = self.root.join(inside);
+            let Some(rel) = relative(&wt, &admin) else {
+                return false;
+            };
+            let mut content = b"gitdir: ".to_vec();
+            content.extend_from_slice(rel.as_os_str().as_bytes());
+            content.push(b'\n');
+            match write_atomic(&wt.join(".git"), &content) {
+                Ok(()) => {
+                    info!(worktree = %wt.display(), "made worktree link relative");
+                    changed = true;
+                }
+                Err(e) => warn!("rewriting {}: {e}", wt.join(".git").display()),
+            }
+            admin
+        } else {
+            wt.join(target)
+        };
+        // Only linked worktrees have a back pointer (submodules do not).
+        if admin.parent().and_then(Path::file_name) != Some(OsStr::new("worktrees")) || !admin.is_dir() {
+            return changed;
+        }
+        let back = admin.join("gitdir");
+        let mut want = wt.join(".git").into_os_string().into_vec();
+        want.push(b'\n');
+        if fs::read(&back).ok().as_deref() != Some(&want[..]) {
+            match write_atomic(&back, &want) {
+                Ok(()) => debug!(worktree = %wt.display(), "wrote worktree back pointer"),
+                Err(e) => warn!("writing {}: {e}", back.display()),
+            }
+        }
+        changed
+    }
+
+    /// Sets the stat options that keep a synced index valid, once per
+    /// repository and only if the user has not chosen otherwise.
+    fn configure(&mut self, g: &Path) -> bool {
+        if !self.configured.insert(g.to_owned()) {
+            return false;
+        }
+        let mut changed = false;
+        for (key, value) in [("core.checkStat", "minimal"), ("core.trustctime", "false")] {
+            let got = git_in(At::GitDir(g), &["config", "--local", "--get", key]);
+            if matches!(&got, Ok(o) if o.status.code() == Some(1)) {
+                match git_ok(git_in(At::GitDir(g), &["config", "--local", key, value])) {
+                    Ok(_) => changed = true,
+                    Err(e) => warn!(gitdir = %g.display(), "setting {key}: {e}"),
+                }
+            }
+        }
+        if changed {
+            info!(gitdir = %g.display(), "set core.checkStat=minimal and core.trustctime=false so the index stays valid across machines");
+        }
+        changed
+    }
+
+    // ---- conflict copies -----------------------------------------------------
+
+    fn tidy_copy(&self, g: &Path, inner: &Path, resolved: &mut Vec<Resolved>) -> Result<Outcome, String> {
+        let name = inner.file_name().ok_or("no name")?;
+        let orig_name = original_name(name.as_bytes()).ok_or("not a conflict copy")?;
+        let orig = inner.with_file_name(OsStr::from_bytes(&orig_name));
+        let copy_path = g.join(inner);
+        let orig_path = g.join(&orig);
+        let first = inner.components().next().map(|c| c.as_os_str().to_owned());
+        let first = first.as_deref().and_then(OsStr::to_str).unwrap_or("");
+        let orig_str = orig.to_str().unwrap_or("");
+        let in_worktree_admin = first == "worktrees";
+
+        let base_name = orig.file_name().and_then(OsStr::to_str).unwrap_or("");
+        if base_name == "index"
+            && (orig.components().count() == 1 || (in_worktree_admin && orig.components().count() == 3))
+        {
+            return self.merge_index(g, &orig_path, &copy_path);
+        }
+        let disposable = first == "objects"
+            || DISPOSABLE.contains(&orig_str)
+            || (in_worktree_admin
+                && orig
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|n| DISPOSABLE.contains(&n)));
+        if disposable {
+            remove(&copy_path)?;
+            return Ok(Outcome::Changed);
+        }
+        if first == "logs"
+            || (in_worktree_admin && orig.components().nth(2).is_some_and(|c| c.as_os_str() == "logs"))
+        {
+            return self.merge_reflog(&orig_path, &copy_path);
+        }
+        if orig_str == "packed-refs" {
+            return self.merge_packed_refs(g, &copy_path, name.as_bytes());
+        }
+        let is_head = orig.file_name() == Some(OsStr::new("HEAD"))
+            && (orig.components().count() == 1 || (in_worktree_admin && orig.components().count() == 3));
+        if first == "refs" || is_head {
+            return self.merge_ref(g, &orig, &copy_path, is_head, resolved);
+        }
+        Ok(Outcome::Kept)
+    }
+
+    /// A loose ref (or a HEAD) and its conflict copy.
+    fn merge_ref(
+        &self,
+        g: &Path,
+        orig: &Path,
+        copy_path: &Path,
+        is_head: bool,
+        resolved: &mut Vec<Resolved>,
+    ) -> Result<Outcome, String> {
+        let orig_path = g.join(orig);
+        let Ok(w) = fs::read(&orig_path) else {
+            // The ref itself is gone; the copy lives on as a branch.
+            return Ok(Outcome::Kept);
+        };
+        let l = fs::read(copy_path).map_err(|e| e.to_string())?;
+        let (w, l) = (parse_ref(&w), parse_ref(&l));
+        if w == l {
+            remove(copy_path)?;
+            return Ok(Outcome::Changed);
+        }
+        // Commands for a linked worktree's HEAD run in its admin dir.
+        let admin = if is_head {
+            orig_path.parent().unwrap().to_owned()
+        } else {
+            g.to_owned()
+        };
+        let refname = (!is_head).then(|| path_to_ref(orig));
+        let resolve = |v: &RefValue| -> Result<String, String> {
+            let spec = match v {
+                RefValue::Oid(o) => o.clone(),
+                RefValue::Symbolic(s) => s.clone(),
+            };
+            rev_parse(At::GitDir(&admin), &format!("{spec}^{{commit}}"))
+                .ok_or_else(|| format!("cannot resolve {spec}"))
+        };
+        let (wc, lc) = (resolve(&w)?, resolve(&l)?);
+        let done = |target: String, other: String, resolved: &mut Vec<Resolved>| {
+            if target != other {
+                resolved.push(Resolved {
+                    gitdir: g.to_owned(),
+                    refname: refname.clone(),
+                    admin: admin.clone(),
+                    target,
+                    other,
+                });
+            }
+        };
+        match (&w, &l) {
+            (RefValue::Oid(_), RefValue::Oid(_)) => {
+                if is_ancestor(At::GitDir(&admin), &lc, &wc)? {
+                    remove(copy_path)?;
+                    done(wc, lc, resolved);
+                    Ok(Outcome::Changed)
+                } else if is_ancestor(At::GitDir(&admin), &wc, &lc)? {
+                    let name = refname.clone().unwrap_or_else(|| "HEAD".into());
+                    let mut args = vec!["update-ref", "-m", "rustfuse: fast-forward after a sync conflict"];
+                    if is_head {
+                        args.push("--no-deref");
+                    }
+                    args.extend([name.as_str(), lc.as_str(), wc.as_str()]);
+                    git_ok(git_in(At::GitDir(&admin), &args))?;
+                    remove(copy_path)?;
+                    info!(gitdir = %g.display(), r#ref = name, "fast-forwarded after a sync conflict");
+                    done(lc, wc, resolved);
+                    Ok(Outcome::Changed)
+                } else {
+                    done(wc, lc, resolved);
+                    Ok(Outcome::Diverged)
+                }
+            }
+            // HEAD moved to different branches: the later checkout stands.
+            _ => {
+                remove(copy_path)?;
+                done(wc, lc, resolved);
+                Ok(Outcome::Changed)
+            }
+        }
+    }
+
+    fn merge_packed_refs(&self, g: &Path, copy_path: &Path, copy_name: &[u8]) -> Result<Outcome, String> {
+        let orig_path = g.join("packed-refs");
+        let w = fs::read(&orig_path).map_err(|e| e.to_string())?;
+        let l = fs::read(copy_path).map_err(|e| e.to_string())?;
+        let (wh, mut wrefs) = parse_packed(&w);
+        let (lh, lrefs) = parse_packed(&l);
+        let tag = &copy_name[b"packed-refs".len()..];
+        let mut diverged = Vec::new();
+        for (name, lv) in lrefs {
+            match wrefs.get(&name) {
+                None => {
+                    wrefs.insert(name, lv);
+                }
+                Some(wv) if wv.oid == lv.oid => {}
+                Some(wv) => {
+                    if is_ancestor(At::GitDir(g), &lv.oid, &wv.oid)? {
+                    } else if is_ancestor(At::GitDir(g), &wv.oid, &lv.oid)? {
+                        wrefs.insert(name, lv);
+                    } else {
+                        diverged.push((name, lv.oid));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(h) = wh.or(lh) {
+            out.extend_from_slice(&h);
+            out.push(b'\n');
+        }
+        for (name, v) in &wrefs {
+            out.extend_from_slice(format!("{} {}\n", v.oid, name).as_bytes());
+            if let Some(p) = &v.peeled {
+                out.extend_from_slice(format!("^{p}\n").as_bytes());
+            }
+        }
+        // Same lock protocol as git.
+        let lock = g.join("packed-refs.lock");
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|e| format!("packed-refs is locked: {e}"))?;
+        let res = (|| {
+            f.write_all(&out)?;
+            f.sync_all()?;
+            if fs::read(&orig_path)? != w {
+                return Err(std::io::Error::other("packed-refs changed meanwhile"));
+            }
+            fs::rename(&lock, &orig_path)
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_file(&lock);
+            return Err(e.to_string());
+        }
+        for (name, oid) in diverged {
+            let mut path = g.join(&name).into_os_string().into_vec();
+            path.extend_from_slice(tag);
+            let path = PathBuf::from(OsString::from_vec(path));
+            if !path.exists() {
+                if let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                write_atomic(&path, format!("{oid}\n").as_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+        remove(copy_path)?;
+        info!(gitdir = %g.display(), "merged packed-refs from two machines");
+        Ok(Outcome::Changed)
+    }
+
+    /// Two machines rewrote the index, often just refreshing stat data
+    /// (`git status`). Keep the one that agrees with HEAD most, so a stale
+    /// refresh never undoes a commit, checkout or merge made elsewhere.
+    fn merge_index(&self, g: &Path, orig_path: &Path, copy_path: &Path) -> Result<Outcome, String> {
+        let admin = orig_path.parent().unwrap_or(g);
+        let wt = if admin == g {
+            g.parent().map(Path::to_owned)
+        } else {
+            fs::read(admin.join("gitdir")).ok().and_then(|b| {
+                Path::new(OsStr::from_bytes(b.trim_ascii_end()))
+                    .parent()
+                    .map(Path::to_owned)
+            })
+        };
+        if let Some(wt) = wt.filter(|w| w.is_dir())
+            && let Ok(head) = git_ok(git_in(
+                At::Worktree(&wt),
+                &["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+            ))
+        {
+            let head: HashSet<Vec<u8>> = head
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|l| !l.is_empty())
+                .map(|l| {
+                    // "mode type oid\tpath" -> "mode oid\tpath"
+                    let mut out = Vec::new();
+                    let mut it = l.splitn(3, |&b| b == b' ');
+                    out.extend_from_slice(it.next().unwrap_or_default());
+                    it.next();
+                    out.push(b' ');
+                    out.extend_from_slice(it.next().unwrap_or_default());
+                    out
+                })
+                .collect();
+            let distance = |index: &Path| -> usize {
+                let out = Command::new("git")
+                    .args(["ls-files", "-s", "-z"])
+                    .current_dir(&wt)
+                    .env("GIT_INDEX_FILE", index)
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .stdin(Stdio::null())
+                    .output();
+                let Ok(out) = out.map_err(|e| e.to_string()).and_then(|o| {
+                    if o.status.success() {
+                        Ok(o)
+                    } else {
+                        Err(String::new())
+                    }
+                }) else {
+                    return usize::MAX;
+                };
+                let entries: HashSet<Vec<u8>> = out
+                    .stdout
+                    .split(|&b| b == 0)
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        // "mode oid stage\tpath": unmerged entries never match.
+                        let tab = l.iter().position(|&b| b == b'\t').unwrap_or(l.len());
+                        let (meta, path) = l.split_at(tab);
+                        let mut parts = meta.split(|&b| b == b' ');
+                        let (mode, oid, stage) = (parts.next(), parts.next(), parts.next());
+                        let mut out = Vec::new();
+                        out.extend_from_slice(mode.unwrap_or_default());
+                        out.push(b' ');
+                        out.extend_from_slice(oid.unwrap_or_default());
+                        if stage != Some(b"0") {
+                            out.extend_from_slice(b" unmerged");
+                        }
+                        out.extend_from_slice(path);
+                        out
+                    })
+                    .collect();
+                entries.symmetric_difference(&head).count()
+            };
+            if distance(copy_path) < distance(orig_path) {
+                fs::rename(copy_path, orig_path).map_err(|e| e.to_string())?;
+                debug!(index = %orig_path.display(), "kept the other machine's index");
+                return Ok(Outcome::Changed);
+            }
+        }
+        remove(copy_path)?;
+        Ok(Outcome::Changed)
+    }
+
+    /// Reflogs only grow: keep every entry of both, in time order.
+    fn merge_reflog(&self, orig_path: &Path, copy_path: &Path) -> Result<Outcome, String> {
+        let l = fs::read(copy_path).map_err(|e| e.to_string())?;
+        let w = match fs::read(orig_path) {
+            Ok(w) => w,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut lines: Vec<(i64, &[u8])> = w
+            .split(|&b| b == b'\n')
+            .chain(l.split(|&b| b == b'\n'))
+            .filter(|l| !l.is_empty())
+            .map(|l| (reflog_time(l), l))
+            .collect();
+        lines.sort();
+        lines.dedup();
+        let mut out = Vec::new();
+        for (_, l) in lines {
+            out.extend_from_slice(l);
+            out.push(b'\n');
+        }
+        if out != w {
+            write_atomic(orig_path, &out).map_err(|e| e.to_string())?;
+        }
+        remove(copy_path)?;
+        Ok(Outcome::Changed)
+    }
+
+    // ---- worktrees after a ref conflict --------------------------------------
+
+    /// Worktrees (directory and admin dir) that have the resolved ref
+    /// checked out at its new value.
+    fn worktrees_of(&self, r: &Resolved) -> Vec<PathBuf> {
+        let mut admins = vec![r.gitdir.clone()];
+        if let Ok(rd) = fs::read_dir(r.gitdir.join("worktrees")) {
+            admins.extend(rd.flatten().map(|e| e.path()));
+        }
+        let mut out = Vec::new();
+        for admin in admins {
+            let on_ref = match &r.refname {
+                None => admin == r.admin,
+                Some(name) => fs::read(admin.join("HEAD"))
+                    .is_ok_and(|h| parse_ref(&h) == RefValue::Symbolic(name.clone())),
+            };
+            // Never in the middle of the user's merge, rebase or the like.
+            let busy = [
+                "MERGE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "rebase-merge",
+                "rebase-apply",
+            ]
+            .iter()
+            .any(|f| admin.join(f).exists());
+            if !on_ref || busy {
+                continue;
+            }
+            let wt = if admin == r.gitdir {
+                match r.gitdir.parent() {
+                    Some(p) => p.to_owned(),
+                    None => continue,
+                }
+            } else {
+                match fs::read(admin.join("gitdir")) {
+                    Ok(b) => match Path::new(OsStr::from_bytes(b.trim_ascii_end())).parent() {
+                        Some(p) => p.to_owned(),
+                        None => continue,
+                    },
+                    Err(_) => continue,
+                }
+            };
+            // Only if the worktree really is at the winning commit now.
+            if wt.starts_with(&self.root)
+                && rev_parse(At::Worktree(&wt), "HEAD").as_deref() == Some(&r.target)
+            {
+                out.push(wt);
+            }
+        }
+        out
+    }
+
+    /// Puts worktree files that hold `other`'s committed version back to
+    /// `target`'s, and drops conflict copies that only repeat a committed
+    /// version.
+    fn clean_worktrees(&self, r: &Resolved) -> Result<bool, String> {
+        let mut changed = false;
+        for wt in self.worktrees_of(r) {
+            let out = git_ok(git_in(
+                At::Worktree(&wt),
+                &[
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    &r.other,
+                    &r.target,
+                    "--",
+                ],
+            ))?;
+            let mut restored = 0usize;
+            for p in out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+                let p = OsStr::from_bytes(p);
+                let t = blob_at(&wt, &r.target, p);
+                let x = blob_at(&wt, &r.other, p);
+                let file = wt.join(p);
+                let w = worktree_blob(&wt, p);
+                if w == x && w != t {
+                    match &t {
+                        Some(_) => {
+                            git_ok(git_args(
+                                At::Worktree(&wt),
+                                [OsStr::new("checkout"), OsStr::new(&r.target), OsStr::new("--"), p],
+                            ))?;
+                        }
+                        None => {
+                            remove(&file)?;
+                            git_ok(git_args(
+                                At::Worktree(&wt),
+                                [
+                                    OsStr::new("rm"),
+                                    OsStr::new("--cached"),
+                                    OsStr::new("-q"),
+                                    OsStr::new("--ignore-unmatch"),
+                                    OsStr::new("--"),
+                                    p,
+                                ],
+                            ))?;
+                        }
+                    }
+                    restored += 1;
+                    changed = true;
+                } else if x != t && index_blob(&wt, p) == x {
+                    git_ok(git_args(
+                        At::Worktree(&wt),
+                        [
+                            OsStr::new("reset"),
+                            OsStr::new("-q"),
+                            OsStr::new(&r.target),
+                            OsStr::new("--"),
+                            p,
+                        ],
+                    ))?;
+                    changed = true;
+                }
+                changed |= drop_redundant_copies(&wt, p, &[t, x]);
+            }
+            if restored > 0 {
+                info!(
+                    worktree = %wt.display(),
+                    files = restored,
+                    "restored files to the winning commit after a sync conflict"
+                );
+            }
+        }
+        Ok(changed)
+    }
+}
+
+enum Outcome {
+    Changed,
+    Kept,
+    Diverged,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RefValue {
+    Oid(String),
+    Symbolic(String),
+}
+
+fn parse_ref(data: &[u8]) -> RefValue {
+    let s = String::from_utf8_lossy(data).trim().to_owned();
+    match s.strip_prefix("ref: ") {
+        Some(r) => RefValue::Symbolic(r.trim().to_owned()),
+        None => RefValue::Oid(s),
+    }
+}
+
+fn path_to_ref(p: &Path) -> String {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+struct Packed {
+    oid: String,
+    peeled: Option<String>,
+}
+
+/// The header line and the refs of a `packed-refs` file.
+fn parse_packed(data: &[u8]) -> (Option<Vec<u8>>, BTreeMap<String, Packed>) {
+    let mut header = None;
+    let mut refs: BTreeMap<String, Packed> = BTreeMap::new();
+    let mut last: Option<String> = None;
+    for line in data.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        if line.starts_with(b"#") {
+            header = Some(line.to_vec());
+        } else if let Some(p) = line.strip_prefix(b"^") {
+            if let Some(name) = &last
+                && let Some(r) = refs.get_mut(name)
+            {
+                r.peeled = Some(String::from_utf8_lossy(p).into_owned());
+            }
+        } else if let Some(sp) = line.iter().position(|&b| b == b' ') {
+            let name = String::from_utf8_lossy(&line[sp + 1..]).into_owned();
+            refs.insert(
+                name.clone(),
+                Packed {
+                    oid: String::from_utf8_lossy(&line[..sp]).into_owned(),
+                    peeled: None,
+                },
+            );
+            last = Some(name);
+        }
+    }
+    (header, refs)
+}
+
+/// Seconds since the epoch of a reflog entry
+/// (`old new Name <email> 1700000000 +0000\tmessage`).
+fn reflog_time(line: &[u8]) -> i64 {
+    let head = line.split(|&b| b == b'\t').next().unwrap_or(line);
+    let head = String::from_utf8_lossy(head);
+    let mut it = head.rsplit(' ');
+    it.next();
+    it.next().and_then(|t| t.parse().ok()).unwrap_or(0)
+}
+
+/// `to` relative to the directory `from`.
+fn relative(from: &Path, to: &Path) -> Option<PathBuf> {
+    let a: Vec<Component> = from.components().collect();
+    let b: Vec<Component> = to.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    if common == 0 {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..a.len() {
+        out.push("..");
+    }
+    for c in &b[common..] {
+        out.push(c);
+    }
+    Some(out)
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(".rustfuse-tmp-git-{}", std::process::id()));
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)
+}
+
+fn remove(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+// ---- running git ---------------------------------------------------------------
+
+/// Where a git command runs: on a git dir (or a worktree's admin dir), or
+/// in a worktree.
+#[derive(Clone, Copy)]
+enum At<'a> {
+    GitDir(&'a Path),
+    Worktree(&'a Path),
+}
+
+fn git_args<I, S>(at: At, args: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new("git");
+    match at {
+        At::GitDir(g) => {
+            let mut flag = OsString::from("--git-dir=");
+            flag.push(g);
+            cmd.arg(flag).current_dir(g);
+        }
+        At::Worktree(w) => {
+            cmd.current_dir(w);
+        }
+    }
+    cmd.args(args)
+        // Paths are file names, never patterns.
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .output()
+}
+
+fn git_in(at: At, args: &[&str]) -> std::io::Result<Output> {
+    git_args(at, args)
+}
+
+fn git_ok(out: std::io::Result<Output>) -> Result<Output, String> {
+    let out = out.map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+    }
+}
+
+fn rev_parse(at: At, spec: &str) -> Option<String> {
+    let out = git_ok(git_in(at, &["rev-parse", "-q", "--verify", spec])).ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Whether `a` is an ancestor of (or equal to) `b`; an error if git cannot
+/// tell yet (objects still missing).
+fn is_ancestor(at: At, a: &str, b: &str) -> Result<bool, String> {
+    let out = git_in(at, &["merge-base", "--is-ancestor", a, b]).map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+    }
+}
+
+fn blob_at(wt: &Path, commit: &str, path: &OsStr) -> Option<String> {
+    let mut spec = format!("{commit}:").into_bytes();
+    spec.extend_from_slice(path.as_bytes());
+    let out = git_ok(git_args(
+        At::Worktree(wt),
+        [
+            OsStr::new("rev-parse"),
+            OsStr::new("-q"),
+            OsStr::new("--verify"),
+            OsStr::from_bytes(&spec),
+        ],
+    ))
+    .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+fn index_blob(wt: &Path, path: &OsStr) -> Option<String> {
+    let out = git_ok(git_args(
+        At::Worktree(wt),
+        [
+            OsStr::new("ls-files"),
+            OsStr::new("-s"),
+            OsStr::new("-z"),
+            OsStr::new("--"),
+            path,
+        ],
+    ))
+    .ok()?;
+    let line = out.stdout.split(|&b| b == 0).next()?;
+    let mut parts = line.split(|&b| b == b' ');
+    parts.next()?;
+    Some(String::from_utf8_lossy(parts.next()?).into_owned())
+}
+
+/// The blob id git would record for a worktree file.
+fn worktree_blob(wt: &Path, path: &OsStr) -> Option<String> {
+    let full = wt.join(path);
+    let meta = fs::symlink_metadata(&full).ok()?;
+    let out = if meta.file_type().is_symlink() {
+        let target = fs::read_link(&full).ok()?;
+        let mut child = Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .current_dir(wt)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        child
+            .stdin
+            .take()?
+            .write_all(target.as_os_str().as_bytes())
+            .ok()?;
+        child.wait_with_output().ok()?
+    } else if meta.is_file() {
+        git_args(
+            At::Worktree(wt),
+            [OsStr::new("hash-object"), OsStr::new("--"), path],
+        )
+        .ok()?
+    } else {
+        return Some("(directory)".into());
+    };
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Removes conflict copies next to `path` whose content is one of the
+/// given committed versions.
+fn drop_redundant_copies(wt: &Path, path: &OsStr, versions: &[Option<String>]) -> bool {
+    let path = Path::new(path);
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let Ok(rd) = fs::read_dir(wt.join(dir)) else {
+        return false;
+    };
+    let mut changed = false;
+    for e in rd.flatten() {
+        let n = e.file_name();
+        if original_name(n.as_bytes()).as_deref() != Some(name.as_bytes()) {
+            continue;
+        }
+        let rel = dir.join(&n);
+        let blob = worktree_blob(wt, rel.as_os_str());
+        if blob.is_some() && versions.contains(&blob) && fs::remove_file(e.path()).is_ok() {
+            info!(copy = %wt.join(&rel).display(), "removed conflict copy already kept in git history");
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::conflict_name;
+    use rustfuse_types::{Hlc, ReplicaId, Version};
+
+    #[test]
+    fn original_names() {
+        let v = Version {
+            time: Hlc(1_760_000_000_000_000_000),
+            replica: ReplicaId(0xabcdef12),
+        };
+        for name in ["main", "a.txt", ".gitignore", "v1.0", "packed-refs", "x.tar.gz"] {
+            let c = conflict_name(name.as_bytes(), v);
+            assert_eq!(original_name(&c).as_deref(), Some(name.as_bytes()), "{name}");
+        }
+        assert_eq!(original_name(b"main"), None);
+        assert_eq!(original_name(b"a.conflict-zz.txt"), None);
+    }
+
+    #[test]
+    fn reflog_union_is_ordered() {
+        let a = b"0 1 T <t@e> 100 +0000\tcommit: a\n0 2 T <t@e> 300 +0000\tcommit: c\n";
+        assert_eq!(
+            reflog_time(&a[..a.iter().position(|&b| b == b'\n').unwrap()]),
+            100
+        );
+    }
+
+    #[test]
+    fn relative_paths() {
+        assert_eq!(
+            relative(Path::new("/v/repo/wt"), Path::new("/v/repo/.git/worktrees/wt")),
+            Some(PathBuf::from("../.git/worktrees/wt"))
+        );
+        assert_eq!(
+            relative(Path::new("/v/wt"), Path::new("/v/repo/.git/worktrees/wt")),
+            Some(PathBuf::from("../repo/.git/worktrees/wt"))
+        );
+    }
+
+    #[test]
+    fn packed_refs_parse() {
+        let (h, refs) = parse_packed(
+            b"# pack-refs with: peeled fully-peeled sorted \naaa refs/heads/main\nbbb refs/tags/v1\n^ccc\n",
+        );
+        assert!(h.is_some());
+        assert_eq!(refs["refs/heads/main"].oid, "aaa");
+        assert_eq!(refs["refs/tags/v1"].peeled.as_deref(), Some("ccc"));
+    }
+}

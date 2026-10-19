@@ -26,6 +26,7 @@ use rustfuse_types::{
 use tracing::{debug, info, warn};
 
 use crate::apply::Applier;
+use crate::git::{GitTidy, Plan};
 use crate::ignore::Ignore;
 use crate::index::{Commit, Config, Counters, Index, StatKey};
 use crate::scan::{Change, Kind, ScanRoot, Scanner};
@@ -91,6 +92,8 @@ pub struct Replica {
     volume: Volume,
     builder: Arc<Mutex<PackBuilder>>,
     ignore: Ignore,
+    /// Taken while the git pass runs on a blocking thread.
+    git: Option<GitTidy>,
 }
 
 /// Creates the state folder, hidden from git (and tools honouring
@@ -191,6 +194,7 @@ impl Replica {
         // Watch events carry absolute, resolved paths.
         let root = root.canonicalize().at(root)?;
         Ok(Replica {
+            git: Some(GitTidy::load(&root)),
             ignore: Ignore::load(&root).map_err(|e| Error::Corrupt(format!("ignore file: {e}")))?,
             root,
             clock: Clock::new(l.counters.clock),
@@ -785,7 +789,47 @@ impl Replica {
             self.receive(batch).await?;
             stats.pushed += self.push_outbox(&mut conn, &mut sent).await?;
         }
+        if self.tidy_git().await? {
+            // Fixes go out like any other change.
+            stats.pushed += self.push_outbox(&mut conn, &mut sent).await?;
+            while !self.outbox.is_empty() {
+                let batch = match tokio::time::timeout(timeout, conn.next()).await {
+                    Err(_) => return Err(Error::Timeout),
+                    Ok(None) => return Err(Error::Disconnected),
+                    Ok(Some(ev)) => match ev? {
+                        Event::Changeset(cs) => vec![cs],
+                        Event::Pushed { .. } => continue,
+                    },
+                };
+                stats.received += batch.len();
+                self.receive(batch).await?;
+                stats.pushed += self.push_outbox(&mut conn, &mut sent).await?;
+            }
+        }
         Ok(stats)
+    }
+
+    /// Runs the git-aware pass ([`crate::git`]) and captures what it
+    /// changed. Returns whether it changed anything.
+    pub async fn tidy_git(&mut self) -> Result<bool> {
+        let plan = Plan::from_tree(&self.tree);
+        if plan.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut git) = self.git.take() else {
+            return Ok(false);
+        };
+        let (git, changed) = tokio::task::spawn_blocking(move || {
+            let changed = git.run(plan);
+            (git, changed)
+        })
+        .await
+        .expect("git pass panicked");
+        self.git = Some(git);
+        if changed {
+            self.capture(None).await?;
+        }
+        Ok(changed)
     }
 
     // ---- continuous mode -----------------------------------------------------
@@ -898,14 +942,25 @@ impl Replica {
             if rescan || !dirty.is_empty() {
                 let paths = (!rescan).then(|| dirty.into_iter().collect());
                 match self.capture(paths).await {
-                    Ok(s) => report(s),
+                    Ok(s) => {
+                        let tidy = s.is_some();
+                        report(s);
+                        if tidy && let Err(e) = self.tidy_git().await {
+                            warn!("git pass failed, will retry: {e}");
+                        }
+                    }
                     Err(e) => warn!("capturing changes failed, will retry: {e}"),
                 }
             }
             if !batch.is_empty() {
                 let n = batch.len();
                 match self.receive(batch).await {
-                    Ok(()) => debug!(changesets = n, applied = self.counters.applied, "applied"),
+                    Ok(()) => {
+                        debug!(changesets = n, applied = self.counters.applied, "applied");
+                        if let Err(e) = self.tidy_git().await {
+                            warn!("git pass failed, will retry: {e}");
+                        }
+                    }
                     Err(e @ (Error::Index(_) | Error::Corrupt(_))) => return Err(e),
                     Err(e) => {
                         // Reconnecting replays from the last applied changeset.
