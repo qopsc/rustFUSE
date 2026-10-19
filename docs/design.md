@@ -181,10 +181,13 @@ watcher's bookmark (FSEvents event id / last scan).
   (after the objects they point to exist), so git never sees a ref to a
   missing object.
 
-**Exclusions (R6).** Defaults: `target/`, `node_modules/`, `.venv/`,
-`build/`, `dist/`, `.DS_Store`, editor swap files, `.git/*.lock`,
-`.git/gc.pid`, `.git/fsmonitor--daemon/`. Configurable per volume
-(`.rustfuseignore`, gitignore syntax). Excluded paths stay purely local.
+**Exclusions (R6).** Built-in: `.rustfuse/`, `.DS_Store`, `.git/**/*.lock`,
+`.git/gc.pid`, `.git/fsmonitor--daemon/`. Then `.rustfuseignore` at the root
+(gitignore syntax, `!` re-includes). Then directories the repository's own
+`.gitignore` files and `.git/info/exclude` exclude, which is how `target/`,
+`node_modules/` and friends stay local without a hard-coded list. Files
+matched by `.gitignore` still sync, because repositories often track them
+(`Cargo.lock`). Excluded paths stay purely local.
 
 ## 7. Conflict resolution
 

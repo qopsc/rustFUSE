@@ -1,97 +1,189 @@
-//! Core identifiers and data-layout math shared by every rustFUSE crate.
-//!
-//! See `docs/design.md` §5: a file is split into fixed-size *chunks*; each
-//! write produces an immutable *slice*, stored in the object store as one or
-//! more *blocks*.
+//! Core types shared by every rustFUSE crate: identifiers, the operation
+//! model, and content references (`docs/design.md` §5).
 
 use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Logical size of a chunk (64 MiB).
-pub const CHUNK_SIZE: u64 = 64 << 20;
+use serde::{Deserialize, Serialize};
 
-/// Default maximum size of a stored block (4 MiB).
-pub const DEFAULT_BLOCK_SIZE: u32 = 4 << 20;
+/// Version of the on-bucket encoding of changesets and snapshots.
+pub const FORMAT_VERSION: u32 = 1;
 
-/// Inode number. `1` is the root directory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Ino(pub u64);
+/// Files up to this size are stored inside the operation, not in packs.
+pub const INLINE_MAX: u64 = 4096;
 
-impl Ino {
-    pub const ROOT: Ino = Ino(1);
+/// Identifies one machine's replica of a volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReplicaId(pub u64);
+
+/// Stable identity of a file or directory, independent of its path:
+/// the creating replica in the high 64 bits, a per-replica counter in the
+/// low 64 bits.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NodeId(pub u128);
+
+impl NodeId {
+    /// The volume's root directory.
+    pub const ROOT: NodeId = NodeId(0);
+
+    pub fn new(replica: ReplicaId, counter: u64) -> Self {
+        NodeId((u128::from(replica.0) << 64) | u128::from(counter))
+    }
 }
 
-/// Globally unique id of an immutable slice, allocated by the metadata server.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SliceId(pub u64);
-
-impl fmt::Display for SliceId {
+impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "NodeId({:016x}:{:x})", (self.0 >> 64) as u64, self.0 as u64)
     }
 }
 
-/// Address of one stored block of a slice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BlockRef {
-    pub slice: SliceId,
-    pub index: u32,
-    pub len: u32,
+/// BLAKE3 hash of a chunk's uncompressed bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChunkHash(pub [u8; 32]);
+
+impl fmt::Debug for ChunkHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ChunkHash({})", &hex::encode(self.0)[..16])
+    }
 }
 
-impl BlockRef {
-    /// Object key of this block, relative to the filesystem's prefix.
-    ///
-    /// Format: `data/{shard:02x}/{slice_id}_{index}_{len}`. The shard spreads
-    /// keys across the store's partitions and is derived from a stable hash
-    /// so it never changes between versions.
+/// Identity of an immutable pack object in the bucket.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PackId(pub u128);
+
+impl PackId {
+    /// Object key of this pack, relative to the volume prefix.
     pub fn object_key(&self) -> String {
-        format!(
-            "data/{:02x}/{}_{}_{}",
-            shard(self.slice),
-            self.slice,
-            self.index,
-            self.len
-        )
-    }
-
-    /// Parses a key produced by [`BlockRef::object_key`].
-    pub fn parse_object_key(key: &str) -> Option<BlockRef> {
-        let rest = key.strip_prefix("data/")?;
-        let (shard_hex, name) = rest.split_once('/')?;
-        let mut parts = name.splitn(3, '_');
-        let slice = SliceId(parts.next()?.parse().ok()?);
-        let index = parts.next()?.parse().ok()?;
-        let len = parts.next()?.parse().ok()?;
-        let block = BlockRef { slice, index, len };
-        (u8::from_str_radix(shard_hex, 16).ok()? == shard(slice)).then_some(block)
+        // Leading byte as a directory spreads keys across store partitions.
+        let hex = format!("{:032x}", self.0);
+        format!("pack/{}/{}", &hex[..2], hex)
     }
 }
 
-/// Stable shard of a slice id (splitmix64 finalizer, low byte).
-fn shard(slice: SliceId) -> u8 {
-    let mut z = slice.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    (z ^ (z >> 31)) as u8
+impl fmt::Debug for PackId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PackId({:032x})", self.0)
+    }
 }
 
-/// Splits a slice of `len` bytes into block references of at most
-/// `block_size` bytes each.
-pub fn blocks_of_slice(slice: SliceId, len: u64, block_size: u32) -> Vec<BlockRef> {
-    assert!(block_size > 0, "block_size must be non-zero");
-    let bs = u64::from(block_size);
-    (0..len.div_ceil(bs))
-        .map(|i| BlockRef {
-            slice,
-            index: u32::try_from(i).expect("too many blocks in slice"),
-            len: u32::try_from((len - i * bs).min(bs)).expect("block fits u32"),
-        })
-        .collect()
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Codec {
+    Raw,
+    Zstd,
 }
 
-/// Chunk index and offset within that chunk for a file offset.
-pub fn chunk_pos(offset: u64) -> (u64, u64) {
-    (offset / CHUNK_SIZE, offset % CHUNK_SIZE)
+/// Where one chunk of file content is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRef {
+    pub hash: ChunkHash,
+    /// Uncompressed length.
+    pub len: u32,
+    pub pack: PackId,
+    pub offset: u64,
+    pub stored_len: u32,
+    pub codec: Codec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Content {
+    Dir,
+    /// Small file stored in the operation itself.
+    Inline(Vec<u8>),
+    File {
+        size: u64,
+        chunks: Vec<ChunkRef>,
+    },
+    Symlink(Vec<u8>),
+}
+
+impl Content {
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Content::Dir)
+    }
+
+    /// Whether two contents hold the same bytes (ignoring where they live).
+    pub fn same_data(&self, other: &Content) -> bool {
+        match (self, other) {
+            (Content::File { size: a, chunks: ca }, Content::File { size: b, chunks: cb }) => {
+                a == b && ca.len() == cb.len() && ca.iter().zip(cb).all(|(x, y)| x.hash == y.hash)
+            }
+            _ => self == other,
+        }
+    }
+}
+
+/// Nanoseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Timestamp(pub i64);
+
+impl Timestamp {
+    pub fn now() -> Self {
+        SystemTime::now().into()
+    }
+}
+
+impl From<SystemTime> for Timestamp {
+    fn from(t: SystemTime) -> Self {
+        match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => Timestamp(d.as_nanos() as i64),
+            Err(e) => Timestamp(-(e.duration().as_nanos() as i64)),
+        }
+    }
+}
+
+impl From<Timestamp> for SystemTime {
+    fn from(t: Timestamp) -> Self {
+        if t.0 >= 0 {
+            UNIX_EPOCH + Duration::from_nanos(t.0 as u64)
+        } else {
+            UNIX_EPOCH - Duration::from_nanos(t.0.unsigned_abs())
+        }
+    }
+}
+
+/// State of one node: where it lives and what it contains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub parent: NodeId,
+    /// File name bytes (not necessarily UTF-8 on Linux).
+    pub name: Vec<u8>,
+    /// Permission bits (`0o777`).
+    pub mode: u32,
+    pub mtime: Timestamp,
+    pub content: Content,
+}
+
+/// A state-based change to one node. Upserts are idempotent: applying the
+/// same op twice gives the same tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Op {
+    /// Create, modify, move or rename a node.
+    Upsert {
+        node: NodeId,
+        entry: Entry,
+    },
+    Remove {
+        node: NodeId,
+    },
+}
+
+/// One batch of operations from one replica, stored as `log/{seq}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changeset {
+    pub format: u32,
+    pub seq: u64,
+    pub replica: ReplicaId,
+    pub time: Timestamp,
+    pub ops: Vec<Op>,
+}
+
+/// Full state of a volume after applying changeset `seq`, stored as
+/// `snap/{seq}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub format: u32,
+    pub seq: u64,
+    pub nodes: Vec<(NodeId, Entry)>,
 }
 
 #[cfg(test)]
@@ -99,75 +191,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn object_key_round_trips() {
-        for id in [0, 1, 42, u64::MAX] {
-            let b = BlockRef {
-                slice: SliceId(id),
-                index: 3,
-                len: 4096,
-            };
-            let key = b.object_key();
-            assert!(key.starts_with("data/"));
-            assert_eq!(BlockRef::parse_object_key(&key), Some(b));
+    fn node_ids_embed_replica() {
+        let id = NodeId::new(ReplicaId(0xabc), 7);
+        assert_eq!((id.0 >> 64) as u64, 0xabc);
+        assert_eq!(id.0 as u64, 7);
+        assert_ne!(id, NodeId::ROOT);
+    }
+
+    #[test]
+    fn pack_keys_are_sharded() {
+        let key = PackId(0x1234 << 112).object_key();
+        assert_eq!(key, "pack/12/12340000000000000000000000000000");
+    }
+
+    #[test]
+    fn timestamps_round_trip() {
+        for t in [
+            UNIX_EPOCH + Duration::new(1_700_000_000, 5),
+            UNIX_EPOCH - Duration::new(3, 7),
+        ] {
+            assert_eq!(SystemTime::from(Timestamp::from(t)), t);
         }
     }
 
     #[test]
-    fn object_key_is_stable() {
-        // Changing this breaks every existing filesystem.
-        let b = BlockRef {
-            slice: SliceId(12345),
-            index: 0,
-            len: 1,
+    fn same_data_ignores_location() {
+        let c = |pack| ChunkRef {
+            hash: ChunkHash([1; 32]),
+            len: 10,
+            pack: PackId(pack),
+            offset: 0,
+            stored_len: 10,
+            codec: Codec::Raw,
         };
-        assert_eq!(
-            b.object_key(),
-            format!("data/{:02x}/12345_0_1", shard(SliceId(12345)))
-        );
-        assert_eq!(shard(SliceId(12345)), shard(SliceId(12345)));
-    }
-
-    #[test]
-    fn parse_rejects_bad_keys() {
-        assert_eq!(BlockRef::parse_object_key("meta/x"), None);
-        assert_eq!(BlockRef::parse_object_key("data/zz/1_0_1"), None);
-        assert_eq!(BlockRef::parse_object_key("data/00/a_0_1"), None);
-        let good = BlockRef {
-            slice: SliceId(7),
-            index: 0,
-            len: 1,
-        }
-        .object_key();
-        let wrong_shard = good.replacen(&good[5..7], if &good[5..7] == "00" { "01" } else { "00" }, 1);
-        assert_eq!(BlockRef::parse_object_key(&wrong_shard), None);
-    }
-
-    #[test]
-    fn shards_are_spread() {
-        let mut seen = [false; 256];
-        for id in 0..4096 {
-            seen[shard(SliceId(id)) as usize] = true;
-        }
-        assert!(seen.iter().filter(|s| **s).count() > 250);
-    }
-
-    #[test]
-    fn slice_block_split() {
-        let bs = 4;
-        assert!(blocks_of_slice(SliceId(1), 0, bs).is_empty());
-        let lens: Vec<u32> = blocks_of_slice(SliceId(1), 10, bs)
-            .iter()
-            .map(|b| b.len)
-            .collect();
-        assert_eq!(lens, vec![4, 4, 2]);
-        let lens: Vec<u32> = blocks_of_slice(SliceId(1), 8, bs).iter().map(|b| b.len).collect();
-        assert_eq!(lens, vec![4, 4]);
-    }
-
-    #[test]
-    fn chunk_positions() {
-        assert_eq!(chunk_pos(0), (0, 0));
-        assert_eq!(chunk_pos(CHUNK_SIZE - 1), (0, CHUNK_SIZE - 1));
-        assert_eq!(chunk_pos(CHUNK_SIZE + 5), (1, 5));
+        let a = Content::File {
+            size: 10,
+            chunks: vec![c(1)],
+        };
+        let b = Content::File {
+            size: 10,
+            chunks: vec![c(2)],
+        };
+        assert!(a.same_data(&b));
+        assert!(!a.same_data(&Content::Inline(vec![0; 10])));
     }
 }
