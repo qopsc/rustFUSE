@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–3 implemented** · 2026-10-19
+Status: **Phases 0–3 implemented, Phase 4 in progress** · 2026-10-19
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -147,7 +147,9 @@ replicas converge to the same result).
   average) and hashed with **BLAKE3**. Identical chunks are stored once
   across files, versions and machines. A small edit to a large file uploads
   only the changed chunks.
-- Files ≤ 4 KiB are stored inline in the op (most refs, small configs).
+- Files ≤ 256 bytes are stored inline in the op (refs, `HEAD`, worktree
+  pointers). Inline data lives in every tree, index and snapshot, so a
+  larger threshold costs memory on trees with many small files (§8.1).
 - Chunks are batched into **pack objects** (~8–32 MiB) per push, with an
   index, so a 100k-file repo is not 100k S3 PUTs. Packs are immutable;
   compaction (Phase 5) rewrites sparse packs.
@@ -284,6 +286,27 @@ before you commit over a concurrent session.
 | Remote links | Packs compress well; ops are tiny; resumable transfers |
 | Propagation latency | Hub pushes notifications over a persistent connection; no polling |
 
+### 8.1 Measurements
+
+A synthetic git repository with 312k entries (300k text files, 700 MB, one
+commit), two machines on one host against rustFS in docker:
+
+| | Phase 3 | Phase 4 so far |
+|---|---|---|
+| `init` (scan, upload) | 35–74 s | 14–15 s |
+| `attach` (download, write) | 60–72 s | 32–34 s |
+| No-op full rescan | 4.2–4.8 s | 2.6–3.0 s |
+| One edited file reaches the other machine | 0.15–0.25 s | 0.16 s |
+| 2000-file commit reaches the other machine's `HEAD` | 2.1 s | 0.46 s |
+| Daemon memory (RSS) | ~2 GB | ~0.7 GB |
+| Hub memory | 516 MB | 127 MB |
+| Local index (`.rustfuse/`) | 0.9–1.3 GB | 210–270 MB |
+
+What changed: inline threshold 4 KiB → 256 bytes; files are written in
+parallel on apply (directories first, permissions last); the index rewrites
+only nodes that actually changed after a catch-up instead of every pending
+node, and clears the pending table by dropping it.
+
 ## 9. Hub
 
 - Rust, tokio; one process (`rustfuse hub`) per deployment, run next to
@@ -342,7 +365,7 @@ crates/
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
-| **4. Scale & speed** | 25 GB / 500k-file repos, parallel clone, fsmonitor hook, compression, encryption |
+| **4. Scale & speed** (in progress) | Measured on a 300k-file repo (§8.1); parallel apply and leaner index (**done**). Next: fsmonitor hook, batched git cleanup, compression, encryption, 25 GB repos |
 | **5. Remote & ops** | Hub as S3 proxy for remote machines, pack compaction + GC, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
