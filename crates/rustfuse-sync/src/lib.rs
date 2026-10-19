@@ -6,6 +6,7 @@
 //! same way (`docs/design.md` §7).
 
 mod apply;
+mod git;
 mod ignore;
 mod index;
 mod replica;
@@ -14,6 +15,7 @@ mod tree;
 
 use std::path::PathBuf;
 
+pub use git::original_name;
 pub use ignore::Ignore;
 pub use index::Config;
 pub use replica::{CaptureStats, HubSpec, Replica, SyncStats};

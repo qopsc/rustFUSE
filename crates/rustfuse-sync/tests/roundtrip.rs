@@ -130,6 +130,8 @@ fn describe(root: &Path) -> Vec<String> {
             if r.starts_with(STATE_DIR)
                 || r == Path::new("target")
                 || name.to_string_lossy().ends_with(".lock")
+                // Each machine's own pointer to its copy of a worktree.
+                || (name == "gitdir" && r.parent().and_then(Path::parent).is_some_and(|p| p.ends_with(".git/worktrees")))
             {
                 continue;
             }
@@ -202,6 +204,12 @@ struct Cluster {
 impl Cluster {
     /// Machine 0 creates the volume from `populate`; the others attach.
     async fn new(n: usize, populate: impl FnOnce(&Path)) -> Cluster {
+        if std::env::var_os("RUSTFUSE_TEST_LOG").is_some() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("rustfuse_sync=debug"))
+                .with_test_writer()
+                .try_init();
+        }
         let tmp = tempfile::tempdir().unwrap();
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = root_store(&format!("rustfuse-tests/{nanos}")).await;
@@ -688,43 +696,198 @@ async fn git_repository_with_worktree() {
     assert_eq!(git(&dst.join("wt"), &["status", "--porcelain"]), "");
 }
 
+/// Files under `dir` (recursively) whose name marks a conflict copy.
+fn conflict_copies(dir: &Path) -> Vec<String> {
+    describe(dir)
+        .into_iter()
+        .filter(|l| l.contains(".conflict-"))
+        .collect()
+}
+
+fn git_repo(root: &Path) {
+    git(root, &["init", "-q", "-b", "main"]);
+    fs::write(root.join("a.txt"), "one\n").unwrap();
+    fs::write(root.join("shared.txt"), "base\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "first"]);
+}
+
 #[tokio::test]
 async fn git_commits_on_two_machines_offline() {
-    let mut c = Cluster::new(2, |root| {
-        git(root, &["init", "-q", "-b", "main"]);
-        fs::write(root.join("a.txt"), "one\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "first"]);
-    })
-    .await;
+    let mut c = Cluster::new(2, git_repo).await;
     let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
-    // Both commit to main, and each starts its own branch, without syncing.
+    // Both commit to main without syncing: a changes a.txt and shared.txt,
+    // b adds b.txt and changes shared.txt too. Each starts a branch.
     fs::write(a.join("a.txt"), "from a\n").unwrap();
+    fs::write(a.join("shared.txt"), "a's version\n").unwrap();
     git(&a, &["commit", "-q", "-am", "commit on a"]);
     git(&a, &["branch", "topic-a"]);
     fs::write(b.join("b.txt"), "from b\n").unwrap();
-    git(&b, &["add", "b.txt"]);
+    fs::write(b.join("shared.txt"), "b's version\n").unwrap();
+    git(&b, &["add", "."]);
     git(&b, &["commit", "-q", "-m", "commit on b"]);
     git(&b, &["branch", "topic-b"]);
     c.replicas[0].capture(None).await.unwrap();
     c.replicas[1].capture(None).await.unwrap();
     c.settle().await;
 
+    let main = git(&a, &["rev-parse", "main"]);
     for dir in [&a, &b] {
         git(dir, &["fsck", "--strict"]);
-        // Both lines of work are reachable: the losing main is kept as a
-        // conflict branch until Phase 3 merges refs by ancestry.
-        let all = git(dir, &["log", "--all", "--format=%s"]);
-        assert!(
-            all.contains("commit on a") && all.contains("commit on b"),
-            "{all}"
-        );
+        // main is one side; the other is a branch to merge, and nothing
+        // else is left over: the worktree matches main exactly.
         let branches = git(dir, &["branch", "--format=%(refname:short)"]);
+        let lines: Vec<&str> = branches.lines().collect();
+        assert_eq!(lines.len(), 4, "{branches}");
         assert!(
             branches.contains("topic-a") && branches.contains("topic-b"),
             "{branches}"
         );
+        let other = lines
+            .iter()
+            .find(|l| l.starts_with("main.conflict-"))
+            .expect("conflict branch");
+        let logs = git(dir, &["log", "--format=%s", "main", other]);
+        assert!(
+            logs.contains("commit on a") && logs.contains("commit on b"),
+            "{logs}"
+        );
+        assert_eq!(git(dir, &["status", "--porcelain"]), "", "worktree not clean");
+        assert_eq!(git(dir, &["rev-parse", "main"]), main);
+        assert_eq!(
+            conflict_copies(dir),
+            Vec::<String>::new()
+                .into_iter()
+                .chain(
+                    describe(dir)
+                        .into_iter()
+                        .filter(|l| l.contains("refs/heads/main.conflict-"))
+                )
+                .collect::<Vec<_>>(),
+            "leftover conflict copies"
+        );
+        // Both machines' history stays in the reflog.
+        let reflog = fs::read_to_string(dir.join(".git/logs/HEAD")).unwrap();
+        assert!(
+            reflog.contains("commit on a") && reflog.contains("commit on b"),
+            "{reflog}"
+        );
+        // Settings that keep the synced index valid on every machine.
+        assert_eq!(git(dir, &["config", "core.checkStat"]), "minimal\n");
     }
+    // Merging the conflict branch retires it, and leaves the worktree as
+    // the user left it, even an edit back to the other side's version.
+    let other = git(
+        &a,
+        &["branch", "--list", "main.conflict-*", "--format=%(refname:short)"],
+    );
+    let other = other.trim();
+    git(&a, &["merge", "-q", "-X", "ours", "-m", "merge", other]);
+    fs::write(a.join("shared.txt"), "a's version\n").unwrap();
+    c.replicas[0].capture(None).await.unwrap();
+    c.settle().await;
+    for dir in [&a, &b] {
+        assert_eq!(git(dir, &["status", "--porcelain"]), " M shared.txt\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("shared.txt")).unwrap(),
+            "a's version\n"
+        );
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "from a\n");
+        assert!(dir.join("b.txt").exists());
+        let branches = git(dir, &["branch", "--format=%(refname:short)"]);
+        assert!(!branches.contains("conflict"), "{branches}");
+        assert_eq!(conflict_copies(dir), Vec::<String>::new());
+    }
+}
+
+#[tokio::test]
+async fn git_refs_fast_forward() {
+    // Three commits; two refs that machines move concurrently, each time
+    // one machine ahead of the other (as after fetching at different
+    // times). The descendant wins whichever write the log orders last.
+    let mut c = Cluster::new(2, |root| {
+        git_repo(root);
+        for i in 0..3 {
+            fs::write(root.join("a.txt"), format!("v{i}\n")).unwrap();
+            git(root, &["commit", "-q", "-am", &format!("c{i}")]);
+        }
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD~3"]);
+        git(root, &["update-ref", "refs/remotes/origin/dev", "HEAD~3"]);
+    })
+    .await;
+    let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    git(&a, &["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    git(&a, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+    git(&b, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&b, &["update-ref", "refs/remotes/origin/dev", "HEAD~1"]);
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    let head = git(&a, &["rev-parse", "HEAD"]);
+    for dir in [&a, &b] {
+        assert_eq!(git(dir, &["rev-parse", "origin/main"]), head);
+        assert_eq!(git(dir, &["rev-parse", "origin/dev"]), head);
+        assert_eq!(conflict_copies(dir), Vec::<String>::new());
+    }
+
+    // Same with packed refs: both machines pack after moving refs.
+    git(&a, &["update-ref", "refs/remotes/origin/main", "HEAD~2"]);
+    git(&a, &["tag", "only-a"]);
+    git(&a, &["pack-refs", "--all"]);
+    git(&b, &["update-ref", "refs/remotes/origin/dev", "HEAD~2"]);
+    git(&b, &["tag", "only-b"]);
+    git(&b, &["pack-refs", "--all"]);
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    for dir in [&a, &b] {
+        git(dir, &["fsck", "--strict"]);
+        let tags = git(dir, &["tag"]);
+        assert!(tags.contains("only-a") && tags.contains("only-b"), "{tags}");
+        assert_eq!(conflict_copies(dir), Vec::<String>::new());
+    }
+}
+
+#[tokio::test]
+async fn git_worktree_links_work_on_every_machine() {
+    let mut c = Cluster::new(2, git_repo).await;
+    let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    git(&a, &["worktree", "add", "-q", "-b", "feature", "wt"]);
+    c.settle().await;
+    // The link inside the worktree is relative, so it is right everywhere.
+    assert_eq!(
+        fs::read_to_string(b.join("wt/.git")).unwrap(),
+        "gitdir: ../.git/worktrees/wt\n"
+    );
+    for dir in [&a, &b] {
+        let dir = dir.canonicalize().unwrap();
+        let list = git(&dir, &["worktree", "list", "--porcelain"]);
+        assert!(
+            list.contains(&format!("worktree {}\n", dir.join("wt").display())),
+            "{list}"
+        );
+        assert_eq!(
+            git(&dir.join("wt"), &["rev-parse", "--show-toplevel"]).trim(),
+            dir.join("wt").display().to_string()
+        );
+    }
+    // Work in the worktree on the second machine comes back.
+    fs::write(b.join("wt/f.txt"), "feature\n").unwrap();
+    git(&b.join("wt"), &["add", "f.txt"]);
+    git(&b.join("wt"), &["commit", "-q", "-m", "on b"]);
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    assert_eq!(git(&a.join("wt"), &["log", "-1", "--format=%s"]), "on b\n");
+    assert_eq!(git(&a.join("wt"), &["status", "--porcelain"]), "");
+    git(&a, &["worktree", "prune", "--dry-run"]);
+    assert_eq!(git(&b, &["worktree", "prune", "-n", "-v"]), "");
+
+    // Removing it on one machine removes it everywhere.
+    git(&a, &["worktree", "remove", "wt"]);
+    c.replicas[0].capture(None).await.unwrap();
+    c.settle().await;
+    assert!(!b.join("wt").exists());
+    assert!(!b.join(".git/worktrees/wt").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -79,7 +79,8 @@ enum Command {
     },
     /// Show the volume, sync position and local changes not yet captured.
     Status { dir: PathBuf },
-    /// List conflict copies kept next to the files they conflicted with.
+    /// List conflict copies kept next to the files they conflicted with,
+    /// and git branches that diverged on two machines.
     Conflicts { dir: PathBuf },
     /// Measure raw object-store throughput and latency.
     Bench(bench::BenchArgs),
@@ -258,6 +259,34 @@ fn describe_changes(dir: &Path, r: &Replica) -> Result<()> {
     Ok(())
 }
 
+/// Conflict copies under `root` (relative paths, sorted), skipping what
+/// does not sync.
+fn find_conflicts(root: &Path) -> Result<Vec<PathBuf>> {
+    let ignore = rustfuse_sync::Ignore::load(root).context("reading ignore rules")?;
+    let mut found = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = rel.join(e.file_name());
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            if ignore.is_ignored(&p, is_dir) {
+                continue;
+            }
+            if rustfuse_sync::original_name(e.file_name().as_encoded_bytes()).is_some() {
+                found.push(p.clone());
+            }
+            if is_dir {
+                stack.push(p);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -372,19 +401,36 @@ async fn main() -> Result<()> {
             describe_changes(&dir, &r)?;
         }
         Command::Conflicts { dir } => {
-            let r = Replica::open(&dir, Arc::new(rustfuse_store::MemoryStore::new()))?;
-            let mut found: Vec<PathBuf> = r
-                .tree()
-                .iter()
-                .filter(|(_, n)| n.entry.name.windows(10).any(|w| w == b".conflict-"))
-                .filter_map(|(id, _)| r.tree().path(*id))
-                .collect();
-            found.sort();
-            if found.is_empty() {
-                println!("No conflict copies.");
+            // Reads the disk, not the index, so it works while `sync` runs.
+            if !dir.join(rustfuse_sync::STATE_DIR).is_dir() {
+                bail!("{} is not a rustfuse directory", dir.display());
             }
+            let found = find_conflicts(&dir)?;
+            let mut any = false;
             for p in found {
-                println!("{}", p.display());
+                // Branches that diverged on two machines; other copies
+                // inside .git are handled by the git pass.
+                let s = p.to_string_lossy();
+                if let Some((repo, branch)) = s
+                    .split_once(".git/refs/heads/")
+                    .or_else(|| s.strip_prefix(".git/refs/heads/").map(|b| ("", b)))
+                {
+                    let repo = if repo.is_empty() {
+                        ".".into()
+                    } else {
+                        repo.trim_end_matches('/').to_owned()
+                    };
+                    println!(
+                        "branch {branch} in {repo}: diverged on two machines; merge it with `git merge {branch}`"
+                    );
+                    any = true;
+                } else if !p.components().any(|c| c.as_os_str() == ".git") {
+                    println!("{}", p.display());
+                    any = true;
+                }
+            }
+            if !any {
+                println!("No conflicts.");
             }
         }
         Command::Bench(args) => bench::bench(args).await?,
