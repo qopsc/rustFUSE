@@ -1001,3 +1001,45 @@ async fn fsmonitor_hook_reports_changes() {
     assert_eq!((t2, paths.len()), (t1, 0));
     task.abort();
 }
+
+#[tokio::test]
+async fn git_cleanup_handles_odd_names_and_deletes() {
+    let mut c = Cluster::new(2, |root: &Path| {
+        git(root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("with space.txt"), "base\n").unwrap();
+        fs::write(root.join("gone file.txt"), "base\n").unwrap();
+        fs::write(root.join("-dash.txt"), "base\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "first"]);
+    })
+    .await;
+    let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    fs::write(a.join("with space.txt"), "a\n").unwrap();
+    fs::write(a.join("-dash.txt"), "a\n").unwrap();
+    git(&a, &["rm", "-q", "gone file.txt"]);
+    git(&a, &["commit", "-q", "-am", "on a"]);
+    fs::write(b.join("with space.txt"), "b\n").unwrap();
+    fs::create_dir(b.join("dir with space")).unwrap();
+    fs::write(b.join("dir with space/new.txt"), "b\n").unwrap();
+    fs::write(b.join("gone file.txt"), "b\n").unwrap();
+    git(&b, &["add", "."]);
+    git(&b, &["commit", "-q", "-m", "on b"]);
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    let main = git(&a, &["rev-parse", "main"]);
+    for dir in [&a, &b] {
+        assert_eq!(git(dir, &["rev-parse", "main"]), main);
+        assert_eq!(
+            git(dir, &["status", "--porcelain"]),
+            "",
+            "worktree not clean in {}",
+            dir.display()
+        );
+        let copies: Vec<String> = conflict_copies(dir)
+            .into_iter()
+            .filter(|c| !c.contains(".git/"))
+            .collect();
+        assert_eq!(copies, Vec::<String>::new(), "leftover conflict copies");
+    }
+}

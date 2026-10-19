@@ -702,7 +702,8 @@ impl GitTidy {
 
     /// Puts worktree files that hold `other`'s committed version back to
     /// `target`'s, and drops conflict copies that only repeat a committed
-    /// version.
+    /// version. Each step is one git command for all paths, so a large
+    /// diverged commit costs a handful of processes, not several per file.
     fn clean_worktrees(&self, r: &Resolved) -> Result<bool, String> {
         let mut changed = false;
         for wt in self.worktrees_of(r) {
@@ -710,61 +711,55 @@ impl GitTidy {
                 At::Worktree(&wt),
                 &[
                     "diff",
-                    "--name-only",
+                    "--raw",
                     "-z",
                     "--no-renames",
+                    "--no-abbrev",
                     &r.other,
                     &r.target,
                     "--",
                 ],
             ))?;
-            let mut restored = 0usize;
-            for p in out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()) {
-                let p = OsStr::from_bytes(p);
-                let t = blob_at(&wt, &r.target, p);
-                let x = blob_at(&wt, &r.other, p);
-                let file = wt.join(p);
-                let w = worktree_blob(&wt, p);
-                if w == x && w != t {
-                    match &t {
-                        Some(_) => {
-                            git_ok(git_args(
-                                At::Worktree(&wt),
-                                [OsStr::new("checkout"), OsStr::new(&r.target), OsStr::new("--"), p],
-                            ))?;
-                        }
-                        None => {
-                            remove(&file)?;
-                            git_ok(git_args(
-                                At::Worktree(&wt),
-                                [
-                                    OsStr::new("rm"),
-                                    OsStr::new("--cached"),
-                                    OsStr::new("-q"),
-                                    OsStr::new("--ignore-unmatch"),
-                                    OsStr::new("--"),
-                                    p,
-                                ],
-                            ))?;
-                        }
-                    }
-                    restored += 1;
-                    changed = true;
-                } else if x != t && index_blob(&wt, p) == x {
-                    git_ok(git_args(
-                        At::Worktree(&wt),
-                        [
-                            OsStr::new("reset"),
-                            OsStr::new("-q"),
-                            OsStr::new(&r.target),
-                            OsStr::new("--"),
-                            p,
-                        ],
-                    ))?;
-                    changed = true;
-                }
-                changed |= drop_redundant_copies(&wt, p, &[t, x]);
+            let diffs = parse_raw_diff(&out.stdout);
+            if diffs.is_empty() {
+                continue;
             }
+            let wanted: HashSet<&[u8]> = diffs.iter().map(|d| d.path.as_slice()).collect();
+            let index = index_blobs(&wt, &wanted)?;
+            let paths: Vec<&[u8]> = diffs.iter().map(|d| d.path.as_slice()).collect();
+            let work = worktree_blobs(&wt, &paths);
+            let (mut checkout, mut unstage, mut reset) = (Vec::new(), Vec::new(), Vec::new());
+            let mut copies = Vec::new();
+            for (d, w) in diffs.iter().zip(&work) {
+                let (x, t) = (&d.from, &d.to);
+                if w == x && w != t {
+                    if t.is_some() {
+                        checkout.push(d.path.as_slice());
+                    } else {
+                        remove(&wt.join(OsStr::from_bytes(&d.path)))?;
+                        unstage.push(d.path.as_slice());
+                    }
+                } else if x != t && index.get(d.path.as_slice()) == x.as_ref() {
+                    reset.push(d.path.as_slice());
+                }
+                copies.push((d.path.as_slice(), [t.clone(), x.clone()]));
+            }
+            if !checkout.is_empty() {
+                git_ok(git_paths(&wt, &["checkout", &r.target], &checkout))?;
+            }
+            if !unstage.is_empty() {
+                git_ok(git_paths(
+                    &wt,
+                    &["rm", "--cached", "-q", "--ignore-unmatch"],
+                    &unstage,
+                ))?;
+            }
+            if !reset.is_empty() {
+                git_ok(git_paths(&wt, &["reset", "-q", &r.target], &reset))?;
+            }
+            let restored = checkout.len() + unstage.len();
+            changed |= restored + reset.len() > 0;
+            changed |= drop_redundant_copies(&wt, &copies);
             if restored > 0 {
                 info!(
                     worktree = %wt.display(),
@@ -775,6 +770,106 @@ impl GitTidy {
         }
         Ok(changed)
     }
+}
+
+/// One path of `git diff --raw`: its blob before and after (`None` where
+/// the path does not exist on that side).
+struct RawDiff {
+    path: Vec<u8>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+fn parse_raw_diff(out: &[u8]) -> Vec<RawDiff> {
+    let blob = |b: &[u8]| {
+        let s = String::from_utf8_lossy(b).into_owned();
+        (!s.bytes().all(|c| c == b'0')).then_some(s)
+    };
+    let mut diffs = Vec::new();
+    let mut fields = out.split(|&b| b == 0);
+    // Each entry is ":<mode> <mode> <blob> <blob> <status>" then the path.
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let parts: Vec<&[u8]> = meta.split(|&b| b == b' ').collect();
+        if parts.len() < 5 || path.is_empty() {
+            continue;
+        }
+        diffs.push(RawDiff {
+            path: path.to_vec(),
+            from: blob(parts[2]),
+            to: blob(parts[3]),
+        });
+    }
+    diffs
+}
+
+/// Blob ids in the index (stage 0, or the first stage listed) for the
+/// wanted paths.
+fn index_blobs(
+    wt: &Path,
+    wanted: &HashSet<&[u8]>,
+) -> Result<std::collections::HashMap<Vec<u8>, String>, String> {
+    let out = git_ok(git_in(At::Worktree(wt), &["ls-files", "-s", "-z"]))?;
+    let mut map = std::collections::HashMap::new();
+    for line in out.stdout.split(|&b| b == 0) {
+        let Some(tab) = line.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let (meta, path) = (&line[..tab], &line[tab + 1..]);
+        if !wanted.contains(path) || map.contains_key(path) {
+            continue;
+        }
+        if let Some(blob) = meta.split(|&b| b == b' ').nth(1) {
+            map.insert(path.to_vec(), String::from_utf8_lossy(blob).into_owned());
+        }
+    }
+    Ok(map)
+}
+
+/// The blob ids git would record for these worktree files, in order;
+/// regular files are hashed by one `git hash-object` for all of them.
+fn worktree_blobs(wt: &Path, paths: &[&[u8]]) -> Vec<Option<String>> {
+    let mut out = vec![None; paths.len()];
+    let mut batch = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let path = OsStr::from_bytes(p);
+        match fs::symlink_metadata(wt.join(path)) {
+            // One path per line: names with a newline go one at a time.
+            Ok(m) if m.is_file() && !p.contains(&b'\n') => batch.push(i),
+            Ok(_) => out[i] = worktree_blob(wt, path),
+            Err(_) => {}
+        }
+    }
+    if batch.is_empty() {
+        return out;
+    }
+    let mut input = Vec::new();
+    for &i in &batch {
+        input.extend_from_slice(paths[i]);
+        input.push(b'\n');
+    }
+    let hashed = git_stdin(At::Worktree(wt), &["hash-object", "--stdin-paths"], &input)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+    match hashed {
+        Some(lines) if lines.len() == batch.len() => {
+            for (&i, h) in batch.iter().zip(lines) {
+                out[i] = Some(h);
+            }
+        }
+        // A file vanished or could not be read: fall back to one at a time.
+        _ => {
+            for &i in &batch {
+                out[i] = worktree_blob(wt, OsStr::from_bytes(paths[i]));
+            }
+        }
+    }
+    out
 }
 
 enum Outcome {
@@ -891,7 +986,7 @@ enum At<'a> {
     Worktree(&'a Path),
 }
 
-fn git_args<I, S>(at: At, args: I) -> std::io::Result<Output>
+fn git_command<I, S>(at: At, args: I) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -913,13 +1008,49 @@ where
         .env("LC_ALL", "C")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
-        .output()
+        .env_remove("GIT_INDEX_FILE");
+    cmd
+}
+
+fn git_args<I, S>(at: At, args: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    git_command(at, args).stdin(Stdio::null()).output()
 }
 
 fn git_in(at: At, args: &[&str]) -> std::io::Result<Output> {
     git_args(at, args)
+}
+
+/// Runs git with `input` on stdin.
+fn git_stdin(at: At, args: &[&str], input: &[u8]) -> std::io::Result<Output> {
+    let mut cmd = git_command(at, args);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let input = input.to_vec();
+    // Written from another thread so a full stdout pipe cannot deadlock.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output()?;
+    writer.join().expect("stdin writer panicked")?;
+    Ok(out)
+}
+
+/// Runs a git command on many paths at once, passed NUL-separated on stdin.
+fn git_paths(wt: &Path, args: &[&str], paths: &[&[u8]]) -> std::io::Result<Output> {
+    let mut args = args.to_vec();
+    args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p);
+        input.push(0);
+    }
+    git_stdin(At::Worktree(wt), &args, &input)
 }
 
 fn git_ok(out: std::io::Result<Output>) -> Result<Output, String> {
@@ -945,40 +1076,6 @@ fn is_ancestor(at: At, a: &str, b: &str) -> Result<bool, String> {
         Some(1) => Ok(false),
         _ => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
     }
-}
-
-fn blob_at(wt: &Path, commit: &str, path: &OsStr) -> Option<String> {
-    let mut spec = format!("{commit}:").into_bytes();
-    spec.extend_from_slice(path.as_bytes());
-    let out = git_ok(git_args(
-        At::Worktree(wt),
-        [
-            OsStr::new("rev-parse"),
-            OsStr::new("-q"),
-            OsStr::new("--verify"),
-            OsStr::from_bytes(&spec),
-        ],
-    ))
-    .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
-fn index_blob(wt: &Path, path: &OsStr) -> Option<String> {
-    let out = git_ok(git_args(
-        At::Worktree(wt),
-        [
-            OsStr::new("ls-files"),
-            OsStr::new("-s"),
-            OsStr::new("-z"),
-            OsStr::new("--"),
-            path,
-        ],
-    ))
-    .ok()?;
-    let line = out.stdout.split(|&b| b == 0).next()?;
-    let mut parts = line.split(|&b| b == b' ');
-    parts.next()?;
-    Some(String::from_utf8_lossy(parts.next()?).into_owned())
 }
 
 /// The blob id git would record for a worktree file.
@@ -1015,30 +1112,54 @@ fn worktree_blob(wt: &Path, path: &OsStr) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// Removes conflict copies next to `path` whose content is one of the
-/// given committed versions.
-fn drop_redundant_copies(wt: &Path, path: &OsStr, versions: &[Option<String>]) -> bool {
-    let path = Path::new(path);
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-        return false;
-    };
-    let Ok(rd) = fs::read_dir(wt.join(dir)) else {
-        return false;
-    };
-    let mut changed = false;
-    for e in rd.flatten() {
-        let n = e.file_name();
-        if original_name(n.as_bytes()).as_deref() != Some(name.as_bytes()) {
-            continue;
-        }
-        let rel = dir.join(&n);
-        let blob = worktree_blob(wt, rel.as_os_str());
-        if blob.is_some() && versions.contains(&blob) && fs::remove_file(e.path()).is_ok() {
-            info!(copy = %wt.join(&rel).display(), "removed conflict copy already kept in git history");
-            changed = true;
+/// A path's blob in the winning and the other commit.
+type Versions = [Option<String>; 2];
+
+/// Removes conflict copies next to each path whose content is one of that
+/// path's committed versions. Reads each directory once.
+fn drop_redundant_copies(wt: &Path, items: &[(&[u8], Versions)]) -> bool {
+    let mut by_dir: BTreeMap<&Path, Vec<(&OsStr, &Versions)>> = BTreeMap::new();
+    for (p, versions) in items {
+        let path = Path::new(OsStr::from_bytes(p));
+        if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+            by_dir.entry(dir).or_default().push((name, versions));
         }
     }
-    changed
+    let mut candidates: Vec<(Vec<u8>, &Versions)> = Vec::new();
+    for (dir, names) in by_dir {
+        let Ok(rd) = fs::read_dir(wt.join(dir)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let Some(orig) = original_name(n.as_bytes()) else {
+                continue;
+            };
+            if let Some((_, versions)) = names.iter().find(|(name, _)| name.as_bytes() == orig.as_slice()) {
+                candidates.push((dir.join(&n).into_os_string().into_vec(), versions));
+            }
+        }
+    }
+    let paths: Vec<&[u8]> = candidates.iter().map(|(p, _)| p.as_slice()).collect();
+    let blobs = worktree_blobs(wt, &paths);
+    let mut removed = 0usize;
+    for ((rel, versions), blob) in candidates.iter().zip(blobs) {
+        if blob.is_some()
+            && versions.contains(&blob)
+            && fs::remove_file(wt.join(OsStr::from_bytes(rel))).is_ok()
+        {
+            debug!(copy = %wt.join(OsStr::from_bytes(rel)).display(), "removed conflict copy");
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!(
+            worktree = %wt.display(),
+            copies = removed,
+            "removed conflict copies already kept in git history"
+        );
+    }
+    removed > 0
 }
 
 #[cfg(test)]
