@@ -366,7 +366,7 @@ async fn read_only_directory_keeps_its_contents() {
         fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
     })
     .await;
-    assert_same(&c.dir(0), &c.dir(1));
+    assert_same(c.dir(0), c.dir(1));
     for i in 0..2 {
         for d in ["ro", "ro/sub"] {
             fs::set_permissions(c.dir(i).join(d), fs::Permissions::from_mode(0o755)).unwrap();
