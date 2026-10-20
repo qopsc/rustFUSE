@@ -18,6 +18,7 @@
 
 mod client;
 pub mod codec;
+pub mod keys;
 mod log;
 pub mod metrics;
 mod server;

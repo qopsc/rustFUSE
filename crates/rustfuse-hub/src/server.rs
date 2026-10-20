@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::codec::{read_frame, write_frame};
+use crate::keys::{KeyCheck, Keys};
 use crate::log::Volume;
 use crate::metrics::{Counter, Family, Gauge, Histogram, Text};
 use crate::{Error, Request, Response, Result, valid_volume_name};
@@ -30,7 +31,9 @@ const MAX_RACES: usize = 16;
 pub struct Hub {
     /// Store scoped to the bucket prefix that holds `volumes/`.
     root: Arc<dyn ObjectStore>,
+    /// Shared token; empty when only per-machine keys are accepted.
     token: String,
+    keys: Arc<Keys>,
     logs: Mutex<HashMap<String, Arc<Log>>>,
     metrics: Arc<HubMetrics>,
 }
@@ -259,7 +262,14 @@ impl Hub {
     /// `root` holds the volumes (`volumes/<name>/…`); `token` is the shared
     /// secret every client must present.
     pub fn new(root: Arc<dyn ObjectStore>, token: String) -> Arc<Hub> {
+        Self::with_key_ttl(root, token, crate::keys::CACHE_TTL)
+    }
+
+    /// Like [`new`](Self::new); per-machine keys ([`crate::keys`]) are
+    /// re-read after `key_ttl`. An empty `token` accepts only those keys.
+    pub fn with_key_ttl(root: Arc<dyn ObjectStore>, token: String, key_ttl: Duration) -> Arc<Hub> {
         Arc::new(Hub {
+            keys: Arc::new(Keys::new(root.clone(), key_ttl)),
             root,
             token,
             logs: Mutex::new(HashMap::new()),
@@ -377,22 +387,31 @@ impl Hub {
             Some(Request::Store { volume, token }) => (volume, token, None),
             _ => return Err(Error::Protocol("expected hello".into())),
         };
-        if !constant_time_eq(token.as_bytes(), self.token.as_bytes()) {
-            self.metrics.refused_total.inc();
-            write_frame(&mut wr, &Response::Error("invalid token".into())).await?;
-            return Err(Error::Refused("invalid token".into()));
-        }
         if !valid_volume_name(&volume) {
             self.metrics.refused_total.inc();
             write_frame(&mut wr, &Response::Error("invalid volume name".into())).await?;
             return Err(Error::Refused("invalid volume name".into()));
         }
+        let mut check = match self.authorize(&token, &volume).await {
+            Ok(None) => None,
+            Ok(Some(id)) => Some(KeyCheck {
+                keys: self.keys.clone(),
+                id,
+                volume: volume.clone(),
+                last: Instant::now(),
+            }),
+            Err(msg) => {
+                self.metrics.refused_total.inc();
+                write_frame(&mut wr, &Response::Error(msg.clone())).await?;
+                return Err(Error::Refused(msg));
+            }
+        };
         let Some(after) = after else {
             // Storage works before the volume exists: `init` creates it.
             let store = Arc::new(PrefixStore::new(self.root.clone(), &format!("volumes/{volume}")));
             debug!(volume, "storage connection");
             let _open = Open::new(&self.metrics, "store");
-            return crate::store::serve(store, rd, wr, self.metrics.clone()).await;
+            return crate::store::serve(store, rd, wr, self.metrics.clone(), check).await;
         };
         let log = match self.log(&volume).await {
             Ok(l) => l,
@@ -429,6 +448,9 @@ impl Hub {
         let (head, from_bucket, cached, mut rx) = log.since(after).await;
         write_frame(&mut wr, &Response::Welcome { head }).await?;
         let mut sent = after;
+        let mut recheck =
+            tokio::time::interval(check.as_ref().map_or(Duration::from_secs(3600), KeyCheck::ttl));
+        recheck.tick().await;
         for seq in from_bucket {
             let cs = log.volume.get_changeset(seq).await?;
             write_frame(&mut wr, &Response::Changeset(cs)).await?;
@@ -441,6 +463,15 @@ impl Hub {
 
         loop {
             tokio::select! {
+                _ = recheck.tick(), if check.is_some() => {
+                    if let Some(c) = check.as_mut()
+                        && !c.ok().await
+                    {
+                        debug!(volume, key = c.id, "key revoked; closing");
+                        write_frame(&mut wr, &Response::Error("key revoked".into())).await?;
+                        return Ok(());
+                    }
+                }
                 req = req_rx.recv() => match req {
                     None => return Ok(()),
                     Some(Err(e)) => return Err(e),
@@ -494,7 +525,23 @@ impl Drop for AbortOnDrop {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+impl Hub {
+    /// Checks a token for `volume`: `None` for the shared token, the key
+    /// id for a per-machine key, or why it is refused.
+    async fn authorize(&self, token: &str, volume: &str) -> std::result::Result<Option<String>, String> {
+        if !self.token.is_empty() && constant_time_eq(token.as_bytes(), self.token.as_bytes()) {
+            return Ok(None);
+        }
+        match self.keys.verify(token).await {
+            Ok(Some(k)) if k.allows(volume) => Ok(Some(k.id.clone())),
+            Ok(Some(k)) => Err(format!("key {} does not open volume {volume}", k.name)),
+            Ok(None) => Err("invalid token".into()),
+            Err(e) => Err(format!("cannot check the key: {e}")),
+        }
+    }
+}
+
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

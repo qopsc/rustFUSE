@@ -119,6 +119,17 @@ enum Command {
         #[command(flatten)]
         creds: Credentials,
     },
+    /// Manage per-machine hub keys: each machine gets its own token, which
+    /// can be limited to some volumes and revoked on its own. Run it where
+    /// the bucket is reachable, like the hub.
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+    },
     /// Measure raw object-store throughput and latency.
     Bench(bench::BenchArgs),
     /// Make `git status` in a repository inside a synced directory ask the
@@ -138,6 +149,24 @@ enum Command {
         #[arg(default_value = "")]
         token: String,
     },
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Create a key and print its token (shown only once).
+    Create {
+        /// What the key is for, e.g. the machine's name.
+        #[arg(long)]
+        name: String,
+        /// Limit the key to this volume; repeat for more. Default: all.
+        #[arg(long = "volume")]
+        volumes: Vec<String>,
+    },
+    /// List keys.
+    List,
+    /// Revoke a key; hubs stop accepting it within 30 seconds, open
+    /// connections included.
+    Revoke { id: String },
 }
 
 #[derive(Args)]
@@ -170,7 +199,9 @@ struct Credentials {
     secret_key: Option<String>,
 }
 
-/// Shared secret between the hub and machines; never written to disk.
+/// Shared secret between the hub and machines, or a machine's own key from
+/// `rustfuse key create`; never written to disk. A hub started without one
+/// accepts only per-machine keys.
 #[derive(Args)]
 struct Token {
     #[arg(long = "hub-token", env = "RUSTFUSE_HUB_TOKEN", hide_env_values = true)]
@@ -500,7 +531,11 @@ async fn run(cli: Cli) -> Result<()> {
                 listener.local_addr()?,
                 if tls.is_some() { " with TLS" } else { "" }
             );
-            let hub = rustfuse_hub::Hub::new(root, token.get()?);
+            // Without a shared token the hub accepts only per-machine keys.
+            if token.hub_token.as_deref().is_none_or(str::is_empty) {
+                println!("No shared token set: accepting only per-machine keys (rustfuse key create).");
+            }
+            let hub = rustfuse_hub::Hub::new(root, token.hub_token.clone().unwrap_or_default());
             if let Some(addr) = metrics {
                 let m = hub.metrics().clone();
                 serve_metrics(&addr, move || m.render()).await?;
@@ -630,6 +665,40 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if !any {
                 println!("No conflicts.");
+            }
+        }
+        Command::Key { action, store, creds } => {
+            let root = store.connect(&creds, &store.prefix).await?;
+            match action {
+                KeyAction::Create { name, volumes } => {
+                    let (k, token) = rustfuse_hub::keys::create(&root, &name, volumes).await?;
+                    println!("Created key {} for {}.", k.id, k.name);
+                    println!("Token (shown only once; set it as RUSTFUSE_HUB_TOKEN on that machine):");
+                    println!("{token}");
+                }
+                KeyAction::List => {
+                    let keys = rustfuse_hub::keys::list(&root).await?;
+                    if keys.is_empty() {
+                        println!("No keys.");
+                    }
+                    for k in keys {
+                        let vols = if k.volumes.is_empty() {
+                            "all volumes".to_owned()
+                        } else {
+                            k.volumes.join(", ")
+                        };
+                        let created = std::time::UNIX_EPOCH + Duration::from_millis(k.created);
+                        let days = created.elapsed().map_or(0, |d| d.as_secs() / 86_400);
+                        println!("{}  {}  ({vols}; created {days} days ago)", k.id, k.name);
+                    }
+                }
+                KeyAction::Revoke { id } => {
+                    if rustfuse_hub::keys::revoke(&root, &id).await? {
+                        println!("Revoked key {id}; hubs refuse it within 30 seconds.");
+                    } else {
+                        bail!("no key {id}");
+                    }
+                }
             }
         }
         Command::Gc {
