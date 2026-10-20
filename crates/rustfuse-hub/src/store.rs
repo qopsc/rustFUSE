@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -165,6 +166,14 @@ impl HubStore {
     }
 }
 
+fn to_millis(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+fn from_millis(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
 fn backend(e: Error) -> rustfuse_store::Error {
     rustfuse_store::Error::Backend(Box::new(e))
 }
@@ -210,9 +219,10 @@ impl ObjectStore for HubStore {
 
     async fn head(&self, key: &str) -> rustfuse_store::Result<Option<ObjectMeta>> {
         match self.call(|| ObjectOp::Head { key: key.to_owned() }).await? {
-            ObjectReply::Head(size) => Ok(size.map(|size| ObjectMeta {
+            ObjectReply::Head(meta) => Ok(meta.map(|(size, modified)| ObjectMeta {
                 key: key.to_owned(),
                 size,
+                modified: modified.map(from_millis),
             })),
             r => Err(unexpected(r)),
         }
@@ -243,7 +253,11 @@ impl ObjectStore for HubStore {
             } => Ok(ListPage {
                 objects: objects
                     .into_iter()
-                    .map(|(key, size)| ObjectMeta { key, size })
+                    .map(|(key, size, modified)| ObjectMeta {
+                        key,
+                        size,
+                        modified: modified.map(from_millis),
+                    })
                     .collect(),
                 next_start_after,
             }),
@@ -317,7 +331,7 @@ async fn run(store: &dyn ObjectStore, op: ObjectOp) -> Reply {
         ObjectOp::Head { key } => store
             .head(&key)
             .await
-            .map(|m| ObjectReply::Head(m.map(|m| m.size))),
+            .map(|m| ObjectReply::Head(m.map(|m| (m.size, m.modified.map(to_millis))))),
         ObjectOp::Delete { key } => store.delete(&key).await.map(|_| ObjectReply::Done),
         ObjectOp::List {
             prefix,
@@ -327,7 +341,11 @@ async fn run(store: &dyn ObjectStore, op: ObjectOp) -> Reply {
             .list(&prefix, start_after.as_deref(), limit as usize)
             .await
             .map(|page| ObjectReply::List {
-                objects: page.objects.into_iter().map(|m| (m.key, m.size)).collect(),
+                objects: page
+                    .objects
+                    .into_iter()
+                    .map(|m| (m.key, m.size, m.modified.map(to_millis)))
+                    .collect(),
                 next_start_after: page.next_start_after,
             }),
     };

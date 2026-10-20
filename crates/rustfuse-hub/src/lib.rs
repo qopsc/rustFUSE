@@ -126,10 +126,11 @@ pub struct ObjectResponse {
 pub enum ObjectReply {
     Data(Bytes),
     Done,
-    /// Size of the object, if it exists.
-    Head(Option<u64>),
+    /// Size and modification time of the object, if it exists.
+    Head(Option<(u64, Option<u64>)>),
     List {
-        objects: Vec<(String, u64)>,
+        /// Key, size and modification time (milliseconds since the epoch).
+        objects: Vec<(String, u64, Option<u64>)>,
         next_start_after: Option<String>,
     },
 }

@@ -45,6 +45,9 @@ env -u RUSTFUSE_BUCKET -u RUSTFUSE_ACCESS_KEY -u RUSTFUSE_SECRET_KEY \
 rustfuse sync ~/src/project
 rustfuse status ~/src/project
 rustfuse conflicts ~/src/project
+
+# Next to the hub, e.g. daily: delete stored content nobody needs any more.
+rustfuse gc --volume project
 ```
 
 Build directories ignored by `.gitignore` (`target/`, `node_modules/`, …)

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use rayon::prelude::*;
 use rustfuse_chunk::{PackBuilder, SealedPack};
 use rustfuse_hub::{Event, HubClient, Volume};
@@ -45,6 +45,10 @@ const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
 /// Rounds of "capture local edits, then apply" before giving up on a busy
 /// directory for now.
 const RECONCILE_ATTEMPTS: usize = 5;
+/// How long a pack checked before sending stays trusted; well below the
+/// cleanup delay (`gc::GcOptions::delay`).
+const PACK_CHECK_TTL: Duration = Duration::from_secs(300);
+const PACK_CHECK_CONCURRENCY: usize = 16;
 
 /// Where the hub is and how to authenticate.
 #[derive(Clone, Debug)]
@@ -97,6 +101,8 @@ pub struct Replica {
     ignore: Ignore,
     /// Taken while the git pass runs on a blocking thread.
     git: Option<GitTidy>,
+    /// Packs found in the bucket (and not marked for deletion), and when.
+    checked_packs: HashMap<PackId, Instant>,
 }
 
 /// Creates the state folder, hidden from git (and tools honouring
@@ -212,6 +218,7 @@ impl Replica {
             stats: l.stats,
             volume: Volume::new(store),
             builder: Arc::new(Mutex::new(builder)),
+            checked_packs: HashMap::new(),
         })
     }
 
@@ -287,6 +294,18 @@ impl Replica {
     pub async fn receive(&mut self, batch: Vec<Changeset>) -> Result<()> {
         self.apply_log(batch).await?;
         self.reconcile_with_capture().await
+    }
+
+    /// Like [`receive`](Self::receive), but updates the disk only once the
+    /// log is applied up to `head`: a machine catching up never fetches
+    /// files that are gone again by then, whose content cleanup may already
+    /// have removed ([`crate::gc`]).
+    async fn receive_upto(&mut self, batch: Vec<Changeset>, head: u64) -> Result<()> {
+        self.apply_log(batch).await?;
+        if self.counters.applied >= head {
+            self.reconcile_with_capture().await?;
+        }
+        Ok(())
     }
 
     async fn apply_log(&mut self, batch: Vec<Changeset>) -> Result<()> {
@@ -793,13 +812,187 @@ impl Replica {
         .await?)
     }
 
+    /// Makes sure every pack the unsent changesets point into is still in
+    /// the bucket and not about to be deleted by cleanup ([`crate::gc`]);
+    /// content in packs that are gone is uploaded again from the files.
+    async fn check_outbox_content(&mut self, sent: &HashSet<u64>) -> Result<()> {
+        let now = Instant::now();
+        let packs: HashSet<PackId> = self
+            .outbox
+            .iter()
+            .filter(|cs| !sent.contains(&cs.local))
+            .flat_map(|cs| content_chunks(&cs.ops))
+            .map(|r| r.pack)
+            .filter(|p| {
+                self.checked_packs
+                    .get(p)
+                    .is_none_or(|t| now.duration_since(*t) > PACK_CHECK_TTL)
+            })
+            .collect();
+        if packs.is_empty() {
+            return Ok(());
+        }
+        let store = self.store().clone();
+        let found: Vec<(PackId, bool)> = futures::stream::iter(packs)
+            .map(|p| {
+                let store = store.clone();
+                async move {
+                    let doomed = store.head(&crate::gc::tombstone_key(p)).await?.is_some();
+                    let ok = !doomed && store.head(&p.object_key()).await?.is_some();
+                    Ok::<_, Error>((p, ok))
+                }
+            })
+            .buffer_unordered(PACK_CHECK_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let mut missing = HashSet::new();
+        for (p, ok) in found {
+            if ok {
+                self.checked_packs.insert(p, now);
+            } else {
+                missing.insert(p);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        warn!(
+            packs = missing.len(),
+            "content of unsent changes was removed by cleanup; uploading it again"
+        );
+        self.repair_outbox(&missing).await
+    }
+
+    /// Re-uploads the content of unsent changesets that lives in `missing`
+    /// packs, reading it from the files, and points the changesets at the
+    /// new copies.
+    async fn repair_outbox(&mut self, missing: &HashSet<PackId>) -> Result<()> {
+        let forgotten = self.builder.lock().unwrap().forget_packs(missing);
+        self.index.commit(Commit {
+            chunks_remove: forgotten,
+            ..Commit::default()
+        })?;
+        // The disk may have moved on; capture first so the disk tree says
+        // what the files hold.
+        self.capture(None).await?;
+
+        let in_missing = |c: &Content| match c {
+            Content::File { chunks, .. } => chunks.iter().any(|r| missing.contains(&r.pack)),
+            _ => false,
+        };
+        let mut nodes = HashSet::new();
+        for cs in &self.outbox {
+            for op in &cs.ops {
+                if let Op::Upsert { node, entry, .. } = op
+                    && in_missing(&entry.content)
+                {
+                    nodes.insert(*node);
+                }
+            }
+        }
+        for (id, n) in self.tree.iter() {
+            if in_missing(&n.entry.content) {
+                nodes.insert(*id);
+            }
+        }
+        // Reading the files again stores every chunk no longer known.
+        let mut reads = Vec::new();
+        let mut read_ids = Vec::new();
+        for id in &nodes {
+            if let Some(path) = self.tree.path(*id)
+                && matches!(self.tree.get(*id).map(|e| &e.content), Some(Content::File { .. }))
+            {
+                reads.push((self.root.join(path), Kind::File));
+                read_ids.push(*id);
+            }
+        }
+        let (contents, _) = self.read_contents(reads).await?;
+        let mut fresh: HashMap<rustfuse_types::ChunkHash, ChunkRef> = HashMap::new();
+        for c in contents.iter().flatten() {
+            if let Content::File { chunks, .. } = c {
+                fresh.extend(chunks.iter().map(|r| (r.hash, *r)));
+            }
+        }
+        let fix = |content: &mut Content| -> bool {
+            let Content::File { chunks, .. } = content else {
+                return true;
+            };
+            let mut all = true;
+            for r in chunks.iter_mut().filter(|r| missing.contains(&r.pack)) {
+                match fresh.get(&r.hash) {
+                    Some(f) => *r = *f,
+                    None => all = false,
+                }
+            }
+            all
+        };
+
+        // The disk tree first: its content is what the files hold now.
+        let mut disk_ids = Vec::new();
+        for id in nodes.iter().copied() {
+            if let Some(mut n) = self.tree.node(id).cloned()
+                && in_missing(&n.entry.content)
+            {
+                if !fix(&mut n.entry.content) {
+                    warn!(?id, "could not recover content; the file will be re-read");
+                }
+                self.tree.set_content(id, n.entry.content);
+                disk_ids.push(id);
+            }
+        }
+        // Changesets: an older version of a file that no longer exists
+        // anywhere becomes the current one (the end result is the same).
+        let mut changed = Vec::new();
+        for cs in self.outbox.iter_mut() {
+            let mut touched = false;
+            for op in cs.ops.iter_mut() {
+                if let Op::Upsert { node, entry, .. } = op
+                    && in_missing(&entry.content)
+                {
+                    touched = true;
+                    if !fix(&mut entry.content) {
+                        entry.content = match self.tree.get(*node).map(|e| &e.content) {
+                            Some(c @ Content::File { .. }) if !in_missing(c) => c.clone(),
+                            _ => Content::File {
+                                size: 0,
+                                chunks: Vec::new(),
+                            },
+                        };
+                        warn!(node = ?node, "an unsent older version was lost to cleanup");
+                    }
+                }
+            }
+            if touched {
+                changed.push(cs.local);
+            }
+        }
+        let new_chunks: Vec<ChunkRef> = fresh.into_values().collect();
+        self.index.commit(Commit {
+            disk: Some((&self.tree, disk_ids)),
+            outbox_put: self
+                .outbox
+                .iter()
+                .filter(|cs| changed.contains(&cs.local))
+                .collect(),
+            chunks: new_chunks,
+            ..Commit::default()
+        })?;
+        info!(
+            changesets = changed.len(),
+            files = read_ids.len(),
+            "re-uploaded removed content"
+        );
+        Ok(())
+    }
+
     /// Sends outbox changesets not already sent on this connection.
-    async fn push_outbox(&self, conn: &mut HubClient, sent: &mut HashSet<u64>) -> Result<usize> {
+    async fn push_outbox(&mut self, conn: &mut HubClient, sent: &mut HashSet<u64>) -> Result<usize> {
         if !self.outbox.iter().any(|cs| !sent.contains(&cs.local)) {
             return Ok(0);
         }
         // Content must be in the bucket before anyone can see the changes.
         self.flush_spool().await?;
+        self.check_outbox_content(sent).await?;
         let mut n = 0;
         for cs in &self.outbox {
             if sent.insert(cs.local) {
@@ -837,7 +1030,7 @@ impl Replica {
                 next = conn.try_next();
             }
             stats.received += batch.len();
-            self.receive(batch).await?;
+            self.receive_upto(batch, head).await?;
             stats.pushed += self.push_outbox(&mut conn, &mut sent).await?;
         }
         if self.tidy_git().await? {
@@ -853,7 +1046,7 @@ impl Replica {
                     },
                 };
                 stats.received += batch.len();
-                self.receive(batch).await?;
+                self.receive_upto(batch, head).await?;
                 stats.pushed += self.push_outbox(&mut conn, &mut sent).await?;
             }
         }
@@ -911,6 +1104,8 @@ impl Replica {
         full.tick().await;
 
         let mut conn: Option<HubClient> = None;
+        // Where the log ended when we connected; see `receive_upto`.
+        let mut catch_up = 0;
         let mut sent = HashSet::new();
         let mut backoff = Duration::from_millis(500);
         let mut next_attempt = Instant::now();
@@ -924,6 +1119,7 @@ impl Replica {
                             applied = self.counters.applied,
                             "connected to hub"
                         );
+                        catch_up = c.head();
                         conn = Some(c);
                         sent.clear();
                         backoff = Duration::from_millis(500);
@@ -1010,7 +1206,7 @@ impl Replica {
             }
             if !batch.is_empty() {
                 let n = batch.len();
-                match self.receive(batch).await {
+                match self.receive_upto(batch, catch_up).await {
                     Ok(()) => {
                         debug!(changesets = n, applied = self.counters.applied, "applied");
                         if let Err(e) = self.tidy_git().await {

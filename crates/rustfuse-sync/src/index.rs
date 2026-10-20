@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use rustfuse_types::{Changeset, ChunkRef, Hlc, Node, NodeId, ReplicaId};
+use rustfuse_types::{Changeset, ChunkHash, ChunkRef, Hlc, Node, NodeId, ReplicaId};
 use serde::{Deserialize, Serialize};
 
 use crate::tree::Tree;
@@ -141,6 +141,8 @@ pub struct Commit<'a> {
     pub pending_clear: bool,
     pub stats: Vec<(NodeId, Option<StatKey>)>,
     pub chunks: Vec<ChunkRef>,
+    /// Known chunks to forget (their pack was deleted).
+    pub chunks_remove: Vec<ChunkHash>,
 }
 
 fn db_err(e: impl std::fmt::Display) -> Error {
@@ -321,6 +323,9 @@ impl Index {
                 };
             }
             let mut chunks = tx.open_table(CHUNKS).map_err(db_err)?;
+            for h in &c.chunks_remove {
+                chunks.remove(h.0.as_slice()).map_err(db_err)?;
+            }
             for r in &c.chunks {
                 chunks
                     .insert(r.hash.0.as_slice(), enc(r).as_slice())
