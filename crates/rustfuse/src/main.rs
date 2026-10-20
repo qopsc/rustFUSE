@@ -83,6 +83,10 @@ enum Command {
         /// Sync once and exit instead of running continuously.
         #[arg(long, conflicts_with = "metrics")]
         once: bool,
+        /// Answer the macOS File Provider extension on this Unix socket
+        /// (used by the rustfuse Mac app; `docs/design.md` §2.2).
+        #[arg(long, conflicts_with = "once")]
+        provider_socket: Option<PathBuf>,
         #[command(flatten)]
         opts: SyncOpts,
     },
@@ -548,6 +552,7 @@ async fn start_sync(
     mut r: Replica,
     spec: HubSpec,
     opts: &SyncOpts,
+    calls: Option<tokio::sync::mpsc::Receiver<rustfuse_sync::provider::Call>>,
 ) -> Result<impl std::future::Future<Output = Result<()>> + use<>> {
     if let Some(addr) = &opts.metrics {
         let m = r.metrics();
@@ -558,7 +563,7 @@ async fn start_sync(
         Duration::from_millis(opts.debounce_ms),
         Duration::from_secs(opts.full_scan_secs),
     );
-    Ok(async move { Ok(r.run(&spec, debounce, full_scan).await?) })
+    Ok(async move { Ok(r.run_serving(&spec, debounce, full_scan, calls).await?) })
 }
 
 /// What a mount serves for `dir`, and the sync to run beside it (none with
@@ -619,7 +624,7 @@ async fn prepare_serving(
         ),
         _ => {}
     }
-    let sync = start_sync(dir, r, spec, opts).await?;
+    let sync = start_sync(dir, r, spec, opts, None).await?;
     Ok((backing, Some(sync)))
 }
 
@@ -867,7 +872,12 @@ async fn run(cli: Cli) -> Result<()> {
             );
             first_sync(&mut r, &spec).await;
         }
-        Command::Sync { dir, once, opts } => {
+        Command::Sync {
+            dir,
+            once,
+            provider_socket,
+            opts,
+        } => {
             if once {
                 let (mut r, spec) = open_replica(&dir, &opts).await?;
                 let s = r.sync_once(&spec, SYNC_TIMEOUT).await?;
@@ -879,9 +889,32 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 let (r, spec) = open_replica(&dir, &opts).await?;
-                let sync = start_sync(&dir, r, spec, &opts).await?;
+                let mut calls = None;
+                let mut provider = None;
+                if let Some(sock) = provider_socket {
+                    let hydrator = if rustfuse_sync::lazy::is_lazy(&dir) {
+                        Some(Arc::new(rustfuse_sync::lazy::Hydrator::new(
+                            &dir,
+                            r.store().clone(),
+                        )?))
+                    } else {
+                        None
+                    };
+                    let (tx, rx) = tokio::sync::mpsc::channel(64);
+                    calls = Some(rx);
+                    println!("Answering the File Provider on {}.", sock.display());
+                    provider = Some(rustfuse_sync::provider::serve(sock, tx, hydrator));
+                }
+                let provider = async move {
+                    match provider {
+                        Some(p) => p.await.context("File Provider socket"),
+                        None => std::future::pending().await,
+                    }
+                };
+                let sync = start_sync(&dir, r, spec, &opts, calls).await?;
                 tokio::select! {
                     res = sync => res?,
+                    res = provider => res?,
                     _ = tokio::signal::ctrl_c() => {}
                 }
             }

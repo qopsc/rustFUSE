@@ -141,6 +141,12 @@ fn marker(file: &File) -> Option<String> {
     String::from_utf8(buf[..n].to_vec()).ok()
 }
 
+/// Whether the file at `path` is a placeholder (content not fetched yet).
+pub(crate) fn is_placeholder(path: &Path) -> bool {
+    let mut buf = [0u8; 128];
+    rustix::fs::lgetxattr(path, XATTR, &mut buf[..]).is_ok()
+}
+
 /// The content a placeholder stands for, or `None` if `file` holds its
 /// content.
 pub(crate) fn placeholder_content(root: &Path, file: &File) -> Result<Option<Content>> {

@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustfuse_store::{ListPage, MemoryStore, ObjectMeta, ObjectStore, PrefixStore, S3Config, S3Store};
-use rustfuse_sync::{Config, HubSpec, Replica, STATE_DIR};
+use rustfuse_sync::{Config, HubSpec, Replica, STATE_DIR, provider};
 use rustfuse_types::ReplicaId;
 
 /// Root store holding `volumes/`.
@@ -1104,6 +1104,292 @@ async fn git_cleanup_is_retried_after_a_failure() {
     }
 }
 
+/// One File Provider request, answered by `r` as its sync loop would.
+async fn ask(r: &mut Replica, req: provider::Request) -> provider::Response {
+    r.provide(req).await
+}
+
+fn item(resp: provider::Response) -> provider::Item {
+    match resp {
+        provider::Response::Item { item } => item,
+        other => panic!("expected an item, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn file_provider_sees_and_changes_the_volume() {
+    use provider::{ErrorCode, Kind, Request, Response};
+    let mut c = Cluster::new(2, sample_tree).await;
+    let (src, dst) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    fs::create_dir_all(dst.join("target/debug")).unwrap();
+
+    // Listing: names from disk, the state folder hidden, local-only
+    // entries (ignored `target/`) present but not synced.
+    let Response::List { items, next: None } = ask(
+        &mut c.replicas[1],
+        Request::List {
+            id: provider::ROOT_ID.into(),
+            after: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected a listing")
+    };
+    let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"README.md") && names.contains(&"src") && !names.contains(&STATE_DIR));
+    let readme = items.iter().find(|i| i.name == "README.md").unwrap().clone();
+    assert!(readme.synced && readme.downloaded && readme.id.starts_with('n'));
+    assert_eq!(
+        (readme.kind, readme.size, readme.parent.as_str()),
+        (Kind::File, 6, "root")
+    );
+    let target = items.iter().find(|i| i.name == "target").unwrap();
+    assert!(!target.synced && target.id.starts_with('p'));
+    let link = items.iter().find(|i| i.name == "link").unwrap();
+    assert_eq!(link.target.as_deref(), Some("src/main.rs"));
+    let local = item(
+        ask(
+            &mut c.replicas[1],
+            Request::Item {
+                id: target.id.clone(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(local.kind, Kind::Dir);
+
+    // Changes from elsewhere show up after the anchor, under the same id.
+    let Response::Anchor { anchor } = ask(&mut c.replicas[1], Request::Anchor).await else {
+        panic!()
+    };
+    fs::write(src.join("README.md"), "hello again\n").unwrap();
+    fs::write(src.join("new.txt"), "new\n").unwrap();
+    c.sync(0).await;
+    c.sync(1).await;
+    let Response::Changes {
+        updated,
+        deleted,
+        anchor: a2,
+    } = ask(
+        &mut c.replicas[1],
+        Request::Changes {
+            anchor: anchor.clone(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(deleted.is_empty());
+    let r2 = updated
+        .iter()
+        .find(|i| i.id == readme.id)
+        .expect("README changed");
+    assert_ne!(r2.content_version, readme.content_version);
+    assert_eq!(r2.meta_version, readme.meta_version);
+    assert!(updated.iter().any(|i| i.name == "new.txt"));
+
+    // Creating, renaming, rewriting and deleting through the provider
+    // change the directory and sync like any edit.
+    let staged = c._tmp.path().join("staged");
+    fs::write(&staged, "from finder\n").unwrap();
+    let made = item(
+        ask(
+            &mut c.replicas[1],
+            Request::Create {
+                parent: provider::ROOT_ID.into(),
+                name: "fp.txt".into(),
+                kind: Kind::File,
+                source: Some(staged.clone()),
+                target: None,
+                mode: Some(0o640),
+                mtime_ns: Some(1_600_000_000_000_000_000),
+            },
+        )
+        .await,
+    );
+    assert!(made.synced && made.id.starts_with('n'));
+    assert_eq!(made.mtime_ns, 1_600_000_000_000_000_000);
+    let again = ask(
+        &mut c.replicas[1],
+        Request::Create {
+            parent: provider::ROOT_ID.into(),
+            name: "fp.txt".into(),
+            kind: Kind::Dir,
+            source: None,
+            target: None,
+            mode: None,
+            mtime_ns: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        again,
+        Response::Error {
+            code: ErrorCode::Exists,
+            ..
+        }
+    ));
+    let dir = item(
+        ask(
+            &mut c.replicas[1],
+            Request::Create {
+                parent: provider::ROOT_ID.into(),
+                name: "docs".into(),
+                kind: Kind::Dir,
+                source: None,
+                target: None,
+                mode: None,
+                mtime_ns: None,
+            },
+        )
+        .await,
+    );
+    fs::write(&staged, "edited in finder\n").unwrap();
+    let moved = item(
+        ask(
+            &mut c.replicas[1],
+            Request::Modify {
+                id: made.id.clone(),
+                parent: Some(dir.id.clone()),
+                name: Some("notes.txt".into()),
+                source: Some(staged.clone()),
+                mode: None,
+                mtime_ns: None,
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        (moved.id.as_str(), moved.parent.as_str()),
+        (made.id.as_str(), dir.id.as_str())
+    );
+    assert_ne!(moved.content_version, made.content_version);
+    c.settle().await;
+    assert_eq!(
+        fs::read(src.join("docs/notes.txt")).unwrap(),
+        b"edited in finder\n"
+    );
+    assert_eq!(
+        fs::metadata(src.join("docs/notes.txt")).unwrap().mode() & 0o777,
+        0o640
+    );
+    let gone = ask(
+        &mut c.replicas[1],
+        Request::Delete {
+            id: dir.id.clone(),
+            recursive: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        gone,
+        Response::Error {
+            code: ErrorCode::NotEmpty,
+            ..
+        }
+    ));
+    let gone = ask(
+        &mut c.replicas[1],
+        Request::Delete {
+            id: dir.id.clone(),
+            recursive: true,
+        },
+    )
+    .await;
+    assert_eq!(gone, Response::Done);
+    c.settle().await;
+    assert!(!src.join("docs").exists());
+
+    // Deletes from elsewhere come back as deleted ids.
+    fs::remove_file(src.join("new.txt")).unwrap();
+    let new_id = updated.iter().find(|i| i.name == "new.txt").unwrap().id.clone();
+    c.sync(0).await;
+    c.sync(1).await;
+    let Response::Changes { deleted, .. } = ask(&mut c.replicas[1], Request::Changes { anchor: a2 }).await
+    else {
+        panic!()
+    };
+    assert!(deleted.contains(&new_id), "{deleted:?}");
+    assert!(!dst.join("new.txt").exists());
+
+    // Ids and names never reach outside the directory or into its state.
+    for id in ["p2e2e2f6574632f706173737764", "p2e7275737466757365"] {
+        let r = ask(&mut c.replicas[1], Request::Item { id: id.into() }).await;
+        assert!(
+            matches!(
+                r,
+                Response::Error {
+                    code: ErrorCode::NoSuchItem,
+                    ..
+                }
+            ),
+            "{id}: {r:?}"
+        );
+    }
+    let bad = ask(
+        &mut c.replicas[1],
+        Request::Modify {
+            id: readme.id.clone(),
+            parent: None,
+            name: Some("..".into()),
+            source: None,
+            mode: None,
+            mtime_ns: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        bad,
+        Response::Error {
+            code: ErrorCode::BadRequest,
+            ..
+        }
+    ));
+
+    // An anchor from another run has expired.
+    let old = ask(
+        &mut c.replicas[1],
+        Request::Changes {
+            anchor: "0000000000000001-0".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        old,
+        Response::Error {
+            code: ErrorCode::AnchorExpired,
+            ..
+        }
+    ));
+
+    // The same over the socket, one JSON line each way.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let sock = c._tmp.path().join("provider.sock");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let server = tokio::spawn(provider::serve(sock.clone(), tx, None));
+    let mut conn = loop {
+        match tokio::net::UnixStream::connect(&sock).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let line = format!("{{\"op\":\"item\",\"id\":\"{}\"}}\n", readme.id);
+    conn.write_all(line.as_bytes()).await.unwrap();
+    let (req, reply) = rx.recv().await.unwrap();
+    reply.send(ask(&mut c.replicas[1], req).await).unwrap();
+    let mut answer = String::new();
+    BufReader::new(&mut conn).read_line(&mut answer).await.unwrap();
+    let resp: Response = serde_json::from_str(&answer).unwrap();
+    assert_eq!(item(resp).name, "README.md");
+    conn.write_all(b"not json\n").await.unwrap();
+    let mut answer = String::new();
+    BufReader::new(&mut conn).read_line(&mut answer).await.unwrap();
+    assert!(answer.contains("bad_request"), "{answer}");
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn large_files_stream_and_reuse_local_chunks() {
     let size = 80 << 20;
@@ -1384,8 +1670,42 @@ async fn lazy_directory_fetches_on_demand() {
     );
 
     // First use fetches the content, once.
-    let h = rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap();
-    assert!(h.hydrate(&lazy.join(big)).await.unwrap());
+    // The File Provider sees which files are not fetched yet, and a fetch
+    // through its socket fills them in.
+    let big_id = format!("n{:032x}", r.tree().resolve(Path::new(big)).unwrap().0);
+    let before = item(ask(&mut r, provider::Request::Item { id: big_id.clone() }).await);
+    assert!(!before.downloaded && before.size == real.len() as u64);
+    let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap());
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let sock = c._tmp.path().join("lazy.sock");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let server = tokio::spawn(provider::serve(sock.clone(), tx, Some(h.clone())));
+        let mut conn = loop {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let line = format!("{{\"op\":\"fetch\",\"id\":\"{big_id}\"}}\n");
+        conn.write_all(line.as_bytes()).await.unwrap();
+        let (req, reply) = rx.recv().await.unwrap();
+        reply.send(ask(&mut r, req).await).unwrap();
+        let mut answer = String::new();
+        BufReader::new(&mut conn).read_line(&mut answer).await.unwrap();
+        let provider::Response::Path { path } = serde_json::from_str(&answer).unwrap() else {
+            panic!("{answer}")
+        };
+        assert_eq!(fs::read(path).unwrap(), real);
+        server.abort();
+    }
+    let after = item(ask(&mut r, provider::Request::Item { id: big_id }).await);
+    assert!(after.downloaded);
+    assert_eq!(
+        after.content_version, before.content_version,
+        "fetching changes nothing"
+    );
+    assert!(!h.hydrate(&lazy.join(big)).await.unwrap());
     assert!(!h.hydrate(&lazy.join(big)).await.unwrap());
     assert!(!h.hydrate(&lazy.join("README.md")).await.unwrap());
     assert_eq!(fs::read(lazy.join(big)).unwrap(), real);
@@ -1410,7 +1730,6 @@ async fn lazy_directory_fetches_on_demand() {
 
     // Fetched content can be dropped again, but not right after use, nor
     // while the file is open.
-    let h = Arc::new(h);
     let e = evict(&h, None).await;
     assert_eq!((e.held, e.files), (real.len() as u64 + 4000 * 6, 0));
     let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap());
