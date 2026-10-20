@@ -55,8 +55,8 @@ pub struct ListPage {
 /// The operations rustFUSE needs from an object store.
 ///
 /// Keys are relative to the store's configured prefix. Data blocks are
-/// written once and never modified, so no conditional or partial writes are
-/// required.
+/// written once and never modified; the only conditional write is
+/// [`put_if_absent`](ObjectStore::put_if_absent), which orders the log.
 #[async_trait]
 pub trait ObjectStore: Send + Sync + 'static {
     /// Reads the whole object.
@@ -69,6 +69,17 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     /// Writes the object, replacing any existing one.
     async fn put(&self, key: &str, data: Bytes) -> Result<()>;
+
+    /// Writes the object only if no object has the key, atomically where the
+    /// store supports it (S3 `If-None-Match: *`). Returns whether it wrote.
+    /// The default checks first and then writes, which is not atomic.
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
+        if self.head(key).await?.is_some() {
+            return Ok(false);
+        }
+        self.put(key, data).await?;
+        Ok(true)
+    }
 
     /// Returns the object's metadata, or `None` if it does not exist.
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>>;

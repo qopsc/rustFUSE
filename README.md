@@ -57,6 +57,10 @@ rustfuse sync ~/src/project --metrics 127.0.0.1:9421
 rustfuse hub --metrics 127.0.0.1:9420
 ```
 
+For high availability, run a second `rustfuse hub` over the same bucket
+(it needs conditional writes, which rustFS and AWS S3 have) and give
+machines both: `--hub hub1,hub2`. See `docs/design.md` §9.1.
+
 Build directories ignored by `.gitignore` (`target/`, `node_modules/`, …)
 stay local; add a `.rustfuseignore` (gitignore syntax) for anything else.
 

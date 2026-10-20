@@ -50,6 +50,10 @@ impl ObjectStore for PrefixStore {
         self.inner.put(&self.key(key), data).await
     }
 
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
+        self.inner.put_if_absent(&self.key(key), data).await
+    }
+
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         Ok(self.inner.head(&self.key(key)).await?.map(|m| ObjectMeta {
             key: self.strip(m.key),

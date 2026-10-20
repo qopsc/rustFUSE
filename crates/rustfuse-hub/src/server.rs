@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustfuse_store::{ObjectStore, PrefixStore};
 use rustfuse_types::{Changeset, FORMAT_VERSION};
@@ -19,6 +19,13 @@ const RECENT: usize = 4096;
 /// Changesets buffered per connection before a slow client is dropped
 /// (it reconnects and catches up).
 const BROADCAST_CAPACITY: usize = 4096;
+/// How often a hub looks in the bucket for changesets another hub
+/// appended, while machines are connected to the volume.
+const PEER_POLL: Duration = Duration::from_secs(2);
+/// Changesets read into the cache when a hub opens a volume.
+const WARM: usize = 64;
+/// Times an append retries after another hub took its number.
+const MAX_RACES: usize = 16;
 
 pub struct Hub {
     /// Store scoped to the bucket prefix that holds `volumes/`.
@@ -42,6 +49,8 @@ pub struct HubMetrics {
     pub head: Family<Gauge>,
     /// Machines dropped for falling too far behind the broadcast.
     pub slow_clients_total: Counter,
+    /// Changesets another hub appended, found in the bucket.
+    pub peer_changesets_total: Counter,
     pub store_requests_total: Family<Counter>,
     pub store_errors_total: Family<Counter>,
     pub store_seconds: Family<Histogram>,
@@ -60,6 +69,7 @@ impl Default for HubMetrics {
             append_seconds: Histogram::default(),
             head: Family::new("volume"),
             slow_clients_total: Counter::default(),
+            peer_changesets_total: Counter::default(),
             store_requests_total: Family::new("op"),
             store_errors_total: Family::new("op"),
             store_seconds: Family::new("op"),
@@ -102,6 +112,11 @@ impl HubMetrics {
                 "rustfuse_hub_slow_clients_total",
                 "Machines disconnected for falling behind.",
                 &self.slow_clients_total,
+            )
+            .metric(
+                "rustfuse_hub_peer_changesets_total",
+                "Changesets appended by another hub and picked up from the bucket.",
+                &self.peer_changesets_total,
             )
             .family(
                 "rustfuse_hub_store_requests_total",
@@ -147,6 +162,7 @@ impl Drop for Open {
 
 struct Log {
     volume: Volume,
+    metrics: Arc<HubMetrics>,
     inner: Mutex<LogInner>,
     tx: broadcast::Sender<Arc<Changeset>>,
 }
@@ -159,17 +175,63 @@ struct LogInner {
 impl Log {
     async fn append(&self, mut cs: Changeset) -> Result<u64> {
         let mut inner = self.inner.lock().await;
-        cs.seq = inner.head + 1;
         cs.format = FORMAT_VERSION;
-        self.volume.put_changeset(&cs).await?;
+        for _ in 0..MAX_RACES {
+            // A machine re-sends what it pushed just before losing its
+            // connection, maybe to another hub: answer with the number it
+            // already got.
+            if let Some(seq) = inner
+                .recent
+                .iter()
+                .rev()
+                .find(|c| c.version.replica == cs.version.replica && c.local == cs.local)
+                .map(|c| c.seq)
+            {
+                return Ok(seq);
+            }
+            cs.seq = inner.head + 1;
+            match self.volume.put_changeset(&cs).await {
+                Ok(()) => {
+                    let seq = cs.seq;
+                    self.publish(&mut inner, Arc::new(cs));
+                    return Ok(seq);
+                }
+                // Another hub appended: take what it wrote, then try the
+                // next number.
+                Err(Error::Conflict(seq)) => {
+                    debug!(seq, "changeset number taken by another hub");
+                    self.catch_up(&mut inner).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Refused("log too busy; try again".into()))
+    }
+
+    /// Records an appended changeset and sends it to connected machines.
+    fn publish(&self, inner: &mut LogInner, cs: Arc<Changeset>) {
         inner.head = cs.seq;
-        let cs = Arc::new(cs);
         if inner.recent.len() == RECENT {
             inner.recent.pop_front();
         }
         inner.recent.push_back(cs.clone());
-        let _ = self.tx.send(cs.clone());
-        Ok(cs.seq)
+        let _ = self.tx.send(cs);
+    }
+
+    /// Takes in changesets other hubs appended after this hub's head, in
+    /// order. Returns how many.
+    async fn catch_up(&self, inner: &mut LogInner) -> Result<usize> {
+        let mut n = 0;
+        for seq in self.volume.changesets_after(inner.head).await? {
+            if seq != inner.head + 1 {
+                break;
+            }
+            let cs = self.volume.get_changeset(seq).await?;
+            self.publish(inner, Arc::new(cs));
+            n += 1;
+        }
+        self.metrics.peer_changesets_total.add(n as u64);
+        Ok(n)
     }
 
     /// Everything after `after` that is cached, the range that must be read
@@ -222,6 +284,7 @@ impl Hub {
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<()> {
         let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+        let _poll = AbortOnDrop(tokio::spawn(self.clone().poll_peers()));
         loop {
             let (stream, peer) = listener.accept().await?;
             let _ = stream.set_nodelay(true);
@@ -243,6 +306,40 @@ impl Hub {
         }
     }
 
+    /// Picks up changesets other hubs append to the same volumes, so
+    /// machines on this hub see them without waiting for their own next
+    /// push. One hub per bucket finds nothing; several can serve at once.
+    async fn poll_peers(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(PEER_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let logs: Vec<(String, Arc<Log>)> = {
+                let logs = self.logs.lock().await;
+                logs.iter()
+                    .filter(|(_, l)| l.tx.receiver_count() > 0)
+                    .map(|(n, l)| (n.clone(), l.clone()))
+                    .collect()
+            };
+            for (name, log) in logs {
+                let mut inner = log.inner.lock().await;
+                match log.catch_up(&mut inner).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        debug!(
+                            volume = name,
+                            n,
+                            head = inner.head,
+                            "took changesets from another hub"
+                        );
+                        self.metrics.head.get(&name).max(inner.head as i64);
+                    }
+                    Err(e) => warn!(volume = name, "reading the log from the bucket failed: {e}"),
+                }
+            }
+        }
+    }
+
     async fn log(&self, name: &str) -> Result<Arc<Log>> {
         let mut logs = self.logs.lock().await;
         if let Some(l) = logs.get(name) {
@@ -254,12 +351,16 @@ impl Hub {
         let head = volume.head().await?;
         info!(volume = name, head, "opened volume");
         self.metrics.head.get(name).set(head as i64);
+        // The tail of the log, so changesets re-sent after a failover from
+        // another hub are recognised.
+        let mut recent = VecDeque::new();
+        for seq in head.saturating_sub(WARM as u64 - 1).max(1)..=head {
+            recent.push_back(Arc::new(volume.get_changeset(seq).await?));
+        }
         let log = Arc::new(Log {
             volume,
-            inner: Mutex::new(LogInner {
-                head,
-                recent: VecDeque::new(),
-            }),
+            metrics: self.metrics.clone(),
+            inner: Mutex::new(LogInner { head, recent }),
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
         });
         logs.insert(name.to_owned(), log.clone());
@@ -382,6 +483,14 @@ impl Hub {
                 },
             }
         }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

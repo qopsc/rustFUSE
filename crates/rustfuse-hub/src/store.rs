@@ -218,6 +218,19 @@ impl ObjectStore for HubStore {
         }
     }
 
+    /// Atomic on the hub's store. A call retried after a lost connection
+    /// may report `false` for its own first write.
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> rustfuse_store::Result<bool> {
+        let op = || ObjectOp::PutIfAbsent {
+            key: key.to_owned(),
+            data: data.clone(),
+        };
+        match self.call(op).await? {
+            ObjectReply::Written(w) => Ok(w),
+            r => Err(unexpected(r)),
+        }
+    }
+
     async fn head(&self, key: &str) -> rustfuse_store::Result<Option<ObjectMeta>> {
         match self.call(|| ObjectOp::Head { key: key.to_owned() }).await? {
             ObjectReply::Head(meta) => Ok(meta.map(|(size, modified)| ObjectMeta {
@@ -298,7 +311,7 @@ where
         let metrics = metrics.clone();
         tokio::spawn(async move {
             let op = op_name(&req.op);
-            if let ObjectOp::Put { data, .. } = &req.op {
+            if let ObjectOp::Put { data, .. } | ObjectOp::PutIfAbsent { data, .. } = &req.op {
                 metrics.store_bytes_total.get("in").add(data.len() as u64);
             }
             let t0 = Instant::now();
@@ -326,6 +339,7 @@ fn op_name(op: &ObjectOp) -> &'static str {
         ObjectOp::Get { .. } => "get",
         ObjectOp::GetRange { .. } => "get_range",
         ObjectOp::Put { .. } => "put",
+        ObjectOp::PutIfAbsent { .. } => "put_if_absent",
         ObjectOp::Head { .. } => "head",
         ObjectOp::Delete { .. } => "delete",
         ObjectOp::List { .. } => "list",
@@ -343,6 +357,7 @@ async fn run(store: &dyn ObjectStore, op: ObjectOp) -> Reply {
         ObjectOp::Get { key }
         | ObjectOp::GetRange { key, .. }
         | ObjectOp::Put { key, .. }
+        | ObjectOp::PutIfAbsent { key, .. }
         | ObjectOp::Head { key }
         | ObjectOp::Delete { key } => &[Some(key.as_str())],
         ObjectOp::List {
@@ -358,6 +373,9 @@ async fn run(store: &dyn ObjectStore, op: ObjectOp) -> Reply {
             store.get_range(&key, start..end).await.map(ObjectReply::Data)
         }
         ObjectOp::Put { key, data } => store.put(&key, data).await.map(|_| ObjectReply::Done),
+        ObjectOp::PutIfAbsent { key, data } => {
+            store.put_if_absent(&key, data).await.map(ObjectReply::Written)
+        }
         ObjectOp::Head { key } => store
             .head(&key)
             .await

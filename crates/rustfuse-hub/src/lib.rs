@@ -114,6 +114,11 @@ pub enum ObjectOp {
         start_after: Option<String>,
         limit: u32,
     },
+    /// Answered with [`ObjectReply::Written`].
+    PutIfAbsent {
+        key: String,
+        data: Bytes,
+    },
 }
 
 /// The answer to the [`ObjectRequest`] with the same `id`.
@@ -127,6 +132,8 @@ pub struct ObjectResponse {
 pub enum ObjectReply {
     Data(Bytes),
     Done,
+    /// Whether a [`ObjectOp::PutIfAbsent`] wrote.
+    Written(bool),
     /// Size and modification time of the object, if it exists.
     Head(Option<(u64, Option<u64>)>),
     List {
