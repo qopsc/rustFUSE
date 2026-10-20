@@ -2346,6 +2346,7 @@ dependencies = [
  "rustfuse-store",
  "rustfuse-sync",
  "rustfuse-types",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

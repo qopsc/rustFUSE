@@ -281,14 +281,66 @@ final class AppModel: ObservableObject {
     }
 
     func showInFinder(_ v: VolumeConfig) {
+        Task {
+            if let url = await visibleURL(v, path: "") { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    /// Where `path` (relative to the volume's top) is for the user: in the
+    /// folder or mount, or in Finder's location for a Finder volume.
+    func visibleURL(_ v: VolumeConfig, path: String) async -> URL? {
+        let root: URL?
         switch v.mode {
         case .folder, .mount:
-            if let p = v.path { NSWorkspace.shared.open(URL(fileURLWithPath: p)) }
+            root = v.path.map { URL(fileURLWithPath: $0, isDirectory: true) }
         case .finder:
-            NSFileProviderManager(for: finderDomain(v))?.getUserVisibleURL(for: .rootContainer) { url, _ in
-                if let url { Task { @MainActor in NSWorkspace.shared.open(url) } }
+            root = await withCheckedContinuation { cont in
+                guard let manager = NSFileProviderManager(for: finderDomain(v)) else {
+                    cont.resume(returning: nil)
+                    return
+                }
+                manager.getUserVisibleURL(for: .rootContainer) { url, _ in cont.resume(returning: url) }
             }
         }
+        return path.isEmpty ? root : root?.appendingPathComponent(path)
+    }
+
+    /// Selects `paths` of `v` in a Finder window.
+    func reveal(_ v: VolumeConfig, paths: [String]) {
+        Task {
+            var urls: [URL] = []
+            for p in paths {
+                if let url = await visibleURL(v, path: p) { urls.append(url) }
+            }
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+        }
+    }
+
+    /// Opens `path` of `v` with its app, which downloads it if needed.
+    func open(_ v: VolumeConfig, path: String) {
+        Task {
+            if let url = await visibleURL(v, path: path) { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    /// The conflict copies and diverged branches in `v` on this Mac.
+    func conflicts(of v: VolumeConfig) async throws -> ConflictReport {
+        let dir = syncedDir(v, container: try Shared.container())
+        let out = try await runTool(conflictsArguments(dir: dir), connection: nil)
+        return try JSONDecoder().decode(ConflictReport.self, from: Data(out.utf8))
+    }
+
+    // MARK: Bucket
+
+    /// The folder `path` of volume `volume` as the bucket holds it.
+    func listRemote(_ c: Connection, volume: String, path: String) async throws -> RemoteListing {
+        let out = try await runTool(lsArguments(volume: volume, path: path, c), connection: c)
+        return try JSONDecoder().decode(RemoteListing.self, from: Data(out.utf8))
+    }
+
+    /// Downloads the file or folder `path` of `volume` to `dest`.
+    func download(_ c: Connection, volume: String, path: String, to dest: URL) async throws {
+        _ = try await runTool(getArguments(volume: volume, path: path, dest: dest, c), connection: c)
     }
 
     /// Asks each volume's daemon how much disk it uses. A daemon that

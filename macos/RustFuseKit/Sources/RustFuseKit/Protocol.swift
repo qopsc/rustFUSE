@@ -13,7 +13,7 @@ public enum Kind: String, Codable, Sendable {
 }
 
 /// A file, directory or symlink in the volume.
-public struct Item: Codable, Equatable, Sendable {
+public struct Item: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var parent: String
     public var name: String

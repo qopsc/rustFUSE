@@ -47,6 +47,7 @@ struct VolumeDetail: View {
                     .foregroundStyle(.secondary)
                 }
             }
+            ConflictsSection(model: model, volume: volume)
             Section {
                 HStack {
                     Button("Show in Finder") { model.showInFinder(volume) }
@@ -57,7 +58,6 @@ struct VolumeDetail: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle(volume.key)
         .onAppear { cacheGB = Double(currentCache) / Double(gigabyte) }
         .onChange(of: volume.key) { _, _ in cacheGB = Double(currentCache) / Double(gigabyte) }
         .confirmationDialog("Remove \(volume.key)?", isPresented: $confirmRemove) {

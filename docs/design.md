@@ -220,6 +220,9 @@ protocol, and its tests and the daemon's check the same samples.
 a hub request filtered by the token's key), reading a volume straight from
 the bucket for a bucket browser (`rustfuse ls`, `rustfuse get`: the latest
 snapshot plus later changesets, nothing written), pins and usage (done).
+(2c) The app's browsers: a volume's files over its socket (status, keep
+downloaded, free up space), the bucket through `rustfuse ls`/`get`, and
+conflicts through `rustfuse conflicts --json` (done).
 (3) On a Mac: sign with a personal team, run the git checks above,
 tune. One open question: whether macOS needs the working set to list every
 item. It is now empty, and items arrive as folders are browsed.

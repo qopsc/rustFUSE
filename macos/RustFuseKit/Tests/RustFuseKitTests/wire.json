@@ -29,5 +29,18 @@
     {"result": "usage", "usage": {"files": 120, "total": 9000000000, "local": 2500000000, "git": 1500000000, "pinned": 400000000, "cached": 600000000}, "limit": 21474836480, "lazy": true},
     {"result": "usage", "usage": {"files": 0, "total": 0, "local": 0, "git": 0, "pinned": 0, "cached": 0}, "lazy": false},
     {"result": "error", "code": "anchor_expired", "message": "the anchor is from an earlier run"}
+  ],
+  "listings": [
+    {"seq": 42, "entries": [
+      {"name": ".git", "kind": "dir", "size": 0, "mode": 493, "mtime_ns": 1700000000000000000},
+      {"name": "a.conflict-000000ab-20261019-150000.txt", "kind": "file", "size": 12, "mode": 420, "mtime_ns": 1792422000000000000},
+      {"name": "a.txt", "kind": "file", "size": 5, "mode": 420, "mtime_ns": 1700000000123456789},
+      {"name": "link", "kind": "symlink", "size": 5, "mode": 511, "mtime_ns": 1700000000000000000, "target": "a.txt"}
+    ]},
+    {"seq": 0, "entries": []}
+  ],
+  "conflicts": [
+    {"files": ["docs/a.conflict-000000ab-20261019-150000.txt", "notes.conflict-0000000c-20261020-091500"], "branches": [{"repo": ".", "branch": "main.conflict-0000000c-20261020-091500"}, {"repo": "tools/sub", "branch": "feature/x.conflict-0000000c-20261020-091500"}]},
+    {"files": [], "branches": []}
   ]
 }

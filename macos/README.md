@@ -17,6 +17,16 @@ volumes a connection's token opens, adds them here, or creates a new
 volume from a folder. Each lazy volume has its own cache size (20 GB by
 default); the window shows what each volume takes on disk against it.
 
+**Browsing.** Each volume's page has three views: an overview (disk use,
+cache size, and conflicts: conflict copies to reveal in Finder, and
+branches that diverged, with the `git merge` to run), its **files** on this
+Mac (downloaded, kept downloaded, only in the bucket or only on this Mac,
+with Keep Downloaded and Free Up Space for volumes that download on open),
+and the volume **in the bucket**. The bucket view, also reached with
+Browse next to any volume of a connection, reads the volume without
+syncing it (`rustfuse ls`) and downloads files and folders anywhere
+(`rustfuse get`).
+
 **Settings:** what quitting does (stop syncing, or keep syncing in the
 background through a login agent per volume), open at login, the default
 cache size, and the mount backend.
@@ -35,7 +45,8 @@ How it fits together is in [docs/design.md §2.2](../docs/design.md).
 - `RustFuseKit/`: what both share: the wire protocol, the socket client, the
   app group layout and the saved library (connections, volumes, settings)
   with the daemon command lines built from it. `swift test` checks the
-  protocol against the same samples the daemon's tests use.
+  protocol, `rustfuse ls --json` and `rustfuse conflicts --json` against
+  the same samples the daemon's tests use.
 
 ## Build
 

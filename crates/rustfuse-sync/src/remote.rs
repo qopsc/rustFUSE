@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rustfuse_store::ObjectStore;
 use rustfuse_types::{ChunkRef, Content, NodeId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::tree::{Tree, os_str};
 use crate::{Error, IoContext, Result, STATE_DIR, Volume};
@@ -27,7 +27,7 @@ pub struct RemoteTree {
 }
 
 /// One entry of a remote directory.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEntry {
     pub name: String,
     pub kind: crate::provider::Kind,
@@ -35,7 +35,7 @@ pub struct RemoteEntry {
     pub mode: u32,
     pub mtime_ns: i64,
     /// Symlink target.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
 
