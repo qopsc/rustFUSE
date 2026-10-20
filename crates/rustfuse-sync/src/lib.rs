@@ -13,6 +13,7 @@ mod ignore;
 mod index;
 pub mod lazy;
 pub mod metrics;
+pub mod provider;
 mod replica;
 mod scan;
 mod tree;

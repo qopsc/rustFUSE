@@ -107,6 +107,8 @@ pub struct Replica {
     metrics: Arc<SyncMetrics>,
     /// Content is fetched on first use through a mount (`crate::lazy`).
     lazy: bool,
+    /// Nodes changed on disk this run, for the File Provider.
+    changes: crate::provider::ChangeLog,
 }
 
 /// Creates the state folder, hidden from git (and tools honouring
@@ -247,6 +249,7 @@ impl Replica {
             builder: Arc::new(Mutex::new(builder)),
             checked_packs: HashMap::new(),
             metrics: Arc::default(),
+            changes: crate::provider::ChangeLog::new(),
         })
     }
 
@@ -265,6 +268,15 @@ impl Replica {
     /// What is on disk, as far as the index knows.
     pub fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    /// The synced directory (canonical).
+    pub fn root_dir(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn change_log(&self) -> &crate::provider::ChangeLog {
+        &self.changes
     }
 
     /// Local changesets not yet accepted by the hub.
@@ -472,6 +484,7 @@ impl Replica {
                 self.tree.node(id) != target.node(id) || self.tree.removed(id) != target.removed(id)
             })
             .collect();
+        self.changes.record(differ.iter().copied());
         self.tree.copy_from(target, &differ);
         let ids: Vec<NodeId> = differ.into_iter().collect();
         for (id, st) in &stats {
@@ -705,6 +718,7 @@ impl Replica {
             };
             self.counters.next_local += 1;
             let touched = self.tree.apply(cs.version, &cs.ops);
+            self.changes.record(touched.iter().copied());
             self.outbox_nodes.extend(&touched);
             disk_ids.extend(touched);
             stats.ops += cs.ops.len();
@@ -1239,6 +1253,18 @@ impl Replica {
     /// and applies everyone's changes as they arrive. Works offline and
     /// catches up on reconnect.
     pub async fn run(&mut self, hub: &HubSpec, debounce: Duration, full_scan_every: Duration) -> Result<()> {
+        self.run_serving(hub, debounce, full_scan_every, None).await
+    }
+
+    /// [`Replica::run`], also answering File Provider requests from
+    /// `calls` ([`crate::provider`]) between sync steps.
+    pub async fn run_serving(
+        &mut self,
+        hub: &HubSpec,
+        debounce: Duration,
+        full_scan_every: Duration,
+        mut calls: Option<tokio::sync::mpsc::Receiver<crate::provider::Call>>,
+    ) -> Result<()> {
         use notify::{RecursiveMode, Watcher};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let journal = crate::fsmonitor::Journal::new();
@@ -1309,6 +1335,10 @@ impl Replica {
             let mut lost = false;
             tokio::select! {
                 _ = full.tick() => rescan = true,
+                Some((req, reply)) = next_call(&mut calls) => {
+                    let resp = self.provide(req).await;
+                    let _ = reply.send(resp);
+                }
                 ev = rx.recv() => {
                     let Some(ev) = ev else { return Ok(()) };
                     if self.collect_event(ev, &mut dirty, &mut rescan) {
@@ -1451,6 +1481,16 @@ impl Replica {
             relevant = true;
         }
         relevant
+    }
+}
+
+/// The next File Provider request; never ready without a channel.
+async fn next_call(
+    calls: &mut Option<tokio::sync::mpsc::Receiver<crate::provider::Call>>,
+) -> Option<crate::provider::Call> {
+    match calls {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

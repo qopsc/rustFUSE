@@ -66,7 +66,7 @@ kernel extension but only mounts under `/Volumes` and is slower than the
 kernel backend. macOS mounts pass `noappledouble`, so Finder metadata never
 becomes `._*` files that would sync and show in `git status`. NFS stays at
 v3: the macOS client has no v4.1, and the server is local. A native lazy
-mode through Apple's File Provider framework is planned next.
+mode through Apple's File Provider framework is in progress (§2.2).
 
 Both pass every operation straight to the synced directory
 (`rustfuse-mount/src/backing.rs`). The sync engine therefore sees a write
@@ -124,6 +124,67 @@ A lazy directory must be used through its mount: read directly, files not
 fetched yet look empty, and its sync must run in the mount's process. After
 a diverged branch, the git pass cannot compare placeholder files with
 either commit, so it leaves them as they are instead of restoring them.
+
+### 2.2 macOS File Provider (in progress)
+
+Goal: on a Mac, a lazy volume behaves like iCloud Drive. It appears in
+Finder's sidebar, files download on first open, and macOS can drop them
+again when space runs low. It needs no kernel extension or macFUSE.
+
+**Shape: another view over the replica.** The File Provider extension is a
+third frontend next to FUSE and NFS; it does not replace the replica. A
+lazy replica stays where it is, and the sync engine, conflict rules, git
+pass and offline work are unchanged. The extension holds no sync logic: it
+asks the running `rustfuse sync` (`--provider-socket`) over a Unix socket,
+one JSON request per line (`rustfuse-sync/src/provider.rs`):
+
+- `list`, `item`: built from the directory on disk. Items are named by
+  their node id (`n…`), which survives renames, edits and restarts; the
+  root is `root`. Entries the volume does not hold (ignored, machine-local
+  paths such as `target/`) appear too, named by their path (`p…`) and
+  marked unsynced. `.rustfuse/` is hidden. Each item carries a content
+  version and a metadata version from the node's versions plus its size,
+  time and mode, and whether its content is downloaded.
+- `anchor`, `changes`: the daemon records each node that changes on disk
+  (remote changes applied, local changes captured) in an in-memory journal.
+  `changes` returns what changed after an anchor, as items or deleted ids.
+  An anchor from an earlier run has expired, and the extension enumerates
+  again.
+- `fetch`: fills a placeholder in through the hydrator (as a mount does)
+  and returns its path. The extension then hands macOS an APFS clone
+  (`clonefile`), so the two copies share blocks and a file takes its space
+  once.
+- `create`, `modify`, `delete`: applied to the directory as a mount write
+  would be (new content is moved in from a staged file), then captured at
+  once so the answer carries the item's id. A move and new content in one
+  request are captured in two steps, so the node keeps its id.
+
+Requests that read or change the tree run inside the sync loop between
+sync steps (`Replica::run_serving`), so they never race the applier.
+Fetching runs beside it. The socket is owner-only.
+
+**Processes.** A small host app (Swift) registers the domain and runs
+`rustfuse sync --provider-socket` as a login item; the sandboxed extension
+(Swift) only speaks the protocol. The socket and staging folder live in the
+app group container both can reach. Credentials stay with the daemon.
+
+**Git.** Git reads files with plain POSIX calls. Reading a dataless file
+makes macOS download it on the spot, so git works, only slower on first
+touch. `.git/` is always present in full, and its items are reported as
+downloaded. *To check on a real Mac before building further:* how `git
+status` behaves on a large tree of dataless files, whether reads ever fail
+with `EDEADLK` (seen with other providers when the reading process is
+itself sandboxed), and how the `~/Library/CloudStorage/` location
+interacts with tools that resolve symlinks.
+
+**Signing.** macOS only runs the extension when the app and extension are
+signed by one team and share an App Group. Development may work with
+Xcode's free personal team (to verify); release needs the paid Apple
+Developer account.
+
+**Steps.** (1) The daemon side and the protocol (done, tested on Linux).
+(2) The Swift host app and extension in `macos/`, built unsigned in CI.
+(3) On a Mac: sign with a personal team, run the git checks above, tune.
 
 ## 3. Prior art
 
@@ -566,7 +627,7 @@ crates/
   rustfuse-chunk   FastCDC + BLAKE3 + packs
   rustfuse-hub     log in the bucket, wire protocol, hub server + client
   rustfuse-sync    tree + conflict rules, redb index, scanner, watcher,
-                   applier, outbox, sync loop
+                   applier, outbox, sync loop, File Provider protocol (§2.2)
   rustfuse-mount   FUSE and NFS frontends over a synced directory (§2.1)
   rustfuse         CLI: hub, init, attach, sync, mount, nfs, status,
                    conflicts, gc, key, bench
@@ -598,7 +659,7 @@ crates/
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
 | **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
-| **6. Optional mount** | Read/write FUSE (Linux; macOS through macFUSE, kernel or FSKit backend) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1, with `--cache-size` to drop fetched content again (**done**) |
+| **6. Optional mount** | Read/write FUSE (Linux; macOS through macFUSE, kernel or FSKit backend) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1, with `--cache-size` to drop fetched content again (**done**). macOS File Provider lazy mode, §2.2 (daemon side done; Mac app next) |
 
 ## 13. Decisions and open questions
 
