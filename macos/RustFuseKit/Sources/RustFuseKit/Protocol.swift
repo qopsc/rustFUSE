@@ -32,9 +32,12 @@ public struct Item: Codable, Equatable, Sendable {
     public var downloaded: Bool
     /// Whether the volume holds it; machine-local entries are not synced.
     public var synced: Bool
+    /// Whether it is kept downloaded: git's own data, or pinned with
+    /// "keep downloaded" (itself or a folder it is in).
+    public var pinned: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, parent, name, kind, size, mode, target, downloaded, synced
+        case id, parent, name, kind, size, mode, target, downloaded, synced, pinned
         case mtimeNs = "mtime_ns"
         case contentVersion = "content_version"
         case metaVersion = "meta_version"
@@ -64,11 +67,19 @@ public enum Request: Equatable, Sendable {
         mode: UInt32? = nil, mtimeNs: Int64? = nil)
     /// Deletes an item; a directory only if empty unless `recursive`.
     case delete(id: String, recursive: Bool = false)
+    /// How much disk the volume uses, and its cache limit.
+    case usage
+    /// Keeps an item (a folder: everything in it) downloaded, fetching
+    /// what is missing in the background; `keep: false` undoes it.
+    case keep(id: String, keep: Bool)
+    /// Unpins an item and turns its downloaded content back into
+    /// placeholders, except what is open or changed.
+    case free(id: String)
 
     /// Whether sending it twice is harmless.
     public var isReadOnly: Bool {
         switch self {
-        case .item, .list, .anchor, .changes, .fetch: return true
+        case .item, .list, .anchor, .changes, .fetch, .usage, .keep, .free: return true
         case .create, .modify, .delete: return false
         }
     }
@@ -89,9 +100,10 @@ extension Request: Encodable {
         var mode: UInt32?
         var mtimeNs: Int64?
         var recursive: Bool?
+        var keep: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case op, id, after, anchor, parent, name, kind, source, target, mode, recursive
+            case op, id, after, anchor, parent, name, kind, source, target, mode, recursive, keep
             case mtimeNs = "mtime_ns"
         }
     }
@@ -117,6 +129,12 @@ extension Request: Encodable {
             w = Wire(op: "modify", id: id, parent: parent, name: name, source: source, mode: mode, mtimeNs: mtimeNs)
         case .delete(let id, let recursive):
             w = Wire(op: "delete", id: id, recursive: recursive)
+        case .usage:
+            w = Wire(op: "usage")
+        case .keep(let id, let keep):
+            w = Wire(op: "keep", id: id, keep: keep)
+        case .free(let id):
+            w = Wire(op: "free", id: id)
         }
         try w.encode(to: encoder)
     }
@@ -132,6 +150,31 @@ public enum ErrorCode: String, Sendable {
     case io
 }
 
+/// Disk use of a synced directory, in bytes.
+public struct Usage: Codable, Equatable, Sendable {
+    /// Files (and symlinks) in the directory.
+    public var files: UInt64
+    /// Their combined size, downloaded or not.
+    public var total: UInt64
+    /// Bytes of content on this machine.
+    public var local: UInt64
+    /// Of `local`, git's own data (always kept).
+    public var git: UInt64
+    /// Of `local`, files kept downloaded by a pin.
+    public var pinned: UInt64
+    /// Of `local`, fetched content that can be dropped again.
+    public var cached: UInt64
+
+    public init(files: UInt64, total: UInt64, local: UInt64, git: UInt64, pinned: UInt64, cached: UInt64) {
+        self.files = files
+        self.total = total
+        self.local = local
+        self.git = git
+        self.pinned = pinned
+        self.cached = cached
+    }
+}
+
 public enum Response: Equatable, Sendable {
     case item(Item)
     /// `next` is passed as `after` for the next page; nil on the last.
@@ -140,6 +183,9 @@ public enum Response: Equatable, Sendable {
     case changes(updated: [Item], deleted: [String], anchor: String)
     case path(String)
     case done
+    /// `limit` is the cache size (nil: none); `lazy` whether files download
+    /// on demand at all.
+    case usage(Usage, limit: UInt64?, lazy: Bool)
     case error(ErrorCode, String)
 }
 
@@ -155,6 +201,9 @@ extension Response: Decodable {
         var path: String?
         var code: String?
         var message: String?
+        var usage: Usage?
+        var limit: UInt64?
+        var lazy: Bool?
     }
 
     public init(from decoder: Decoder) throws {
@@ -176,6 +225,7 @@ extension Response: Decodable {
                 anchor: try need(w.anchor, "anchor"))
         case "path": self = .path(try need(w.path, "path"))
         case "done": self = .done
+        case "usage": self = .usage(try need(w.usage, "usage"), limit: w.limit, lazy: try need(w.lazy, "lazy"))
         case "error":
             // A code this version does not know is still an error.
             self = .error(ErrorCode(rawValue: w.code ?? "") ?? .io, w.message ?? "")

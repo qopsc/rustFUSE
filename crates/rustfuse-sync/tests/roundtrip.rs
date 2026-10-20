@@ -1368,7 +1368,13 @@ async fn file_provider_sees_and_changes_the_volume() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let sock = c._tmp.path().join("provider.sock");
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let server = tokio::spawn(provider::serve(sock.clone(), tx, None));
+    let serving = provider::Serving {
+        root: c.dir(1).to_path_buf(),
+        hydrator: None,
+        cache_size: None,
+        in_use: None,
+    };
+    let server = tokio::spawn(provider::serve(sock.clone(), tx, serving));
     let mut conn = loop {
         match tokio::net::UnixStream::connect(&sock).await {
             Ok(s) => break s,
@@ -1680,7 +1686,13 @@ async fn lazy_directory_fetches_on_demand() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let sock = c._tmp.path().join("lazy.sock");
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let server = tokio::spawn(provider::serve(sock.clone(), tx, Some(h.clone())));
+        let serving = provider::Serving {
+            root: lazy.clone(),
+            hydrator: Some(h.clone()),
+            cache_size: None,
+            in_use: None,
+        };
+        let server = tokio::spawn(provider::serve(sock.clone(), tx, serving));
         let mut conn = loop {
             match tokio::net::UnixStream::connect(&sock).await {
                 Ok(s) => break s,
@@ -1761,5 +1773,230 @@ async fn lazy_directory_fetches_on_demand() {
     assert_eq!(
         fs::read_dir(lazy.join(STATE_DIR).join("lazy")).unwrap().count(),
         0
+    );
+}
+
+/// Sends one JSON line to the provider socket, letting `r` answer whatever
+/// reaches the sync loop, and returns the answer.
+async fn over_socket(
+    conn: &mut tokio::net::UnixStream,
+    rx: &mut tokio::sync::mpsc::Receiver<provider::Call>,
+    r: &mut Replica,
+    line: &str,
+) -> provider::Response {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    conn.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+    let (read, _) = conn.split();
+    let mut read = BufReader::new(read);
+    let mut answer = String::new();
+    loop {
+        tokio::select! {
+            call = rx.recv() => {
+                let (req, reply) = call.unwrap();
+                reply.send(ask(r, req).await).unwrap();
+            }
+            n = read.read_line(&mut answer) => {
+                n.unwrap();
+                return serde_json::from_str(&answer).unwrap_or_else(|e| panic!("{answer}: {e}"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn keep_downloaded_free_up_space_and_usage() {
+    let c = Cluster::new(1, |root| {
+        sample_tree(root);
+        fs::create_dir_all(root.join("repo/.git")).unwrap();
+        fs::write(root.join("repo/.git/pack"), pseudo_random(100_000, 9)).unwrap();
+    })
+    .await;
+    let lazy = c._tmp.path().join("lazy");
+    let mut cfg = config("vol", 9);
+    cfg.hub = Some(c.hub.addr.clone());
+    let mut r = Replica::attach_with(&lazy, cfg, c.volume.clone(), true)
+        .await
+        .unwrap();
+    let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap());
+    r.set_pins(h.pins());
+    let src = c.dir(0).to_path_buf();
+    let (big, medium) = ("src/nested/deep/big.bin", "src/nested/medium.txt");
+    let big_len = fs::metadata(src.join(big)).unwrap().len();
+    let medium_len = fs::metadata(src.join(medium)).unwrap().len();
+
+    let sock = c._tmp.path().join("pins.sock");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    // Served through a symlink, as on macOS where /var is /private/var.
+    let link = c._tmp.path().join("lazy-link");
+    symlink(&lazy, &link).unwrap();
+    let serving = provider::Serving {
+        root: link,
+        hydrator: Some(h.clone()),
+        cache_size: Some(20 << 30),
+        in_use: None,
+    };
+    let server = tokio::spawn(provider::serve(sock.clone(), tx, serving));
+    let mut conn = loop {
+        match tokio::net::UnixStream::connect(&sock).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let usage = async |conn: &mut tokio::net::UnixStream,
+                       rx: &mut tokio::sync::mpsc::Receiver<provider::Call>,
+                       r: &mut Replica| {
+        match over_socket(conn, rx, r, r#"{"op":"usage"}"#).await {
+            provider::Response::Usage { usage, limit, lazy } => {
+                assert_eq!(limit, Some(20 << 30));
+                assert!(lazy);
+                usage
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // Before anything is fetched: git's data is local, the rest is not.
+    let u = usage(&mut conn, &mut rx, &mut r).await;
+    assert_eq!(u.git, 100_000);
+    assert_eq!((u.pinned, u.cached), (0, 0));
+    assert!(u.total >= big_len + medium_len + 100_000);
+    assert!(u.local < u.total - big_len - medium_len + 1);
+
+    // Keeping a folder downloaded pins everything in it and fetches it.
+    let folder = provider::Request::Item {
+        id: format!("n{:032x}", r.tree().resolve(Path::new("src/nested")).unwrap().0),
+    };
+    let nested = item(ask(&mut r, folder).await);
+    assert!(!nested.pinned);
+    let keep = format!(r#"{{"op":"keep","id":"{}","keep":true}}"#, nested.id);
+    assert_eq!(
+        over_socket(&mut conn, &mut rx, &mut r, &keep).await,
+        provider::Response::Done
+    );
+    let big_id = format!("n{:032x}", r.tree().resolve(Path::new(big)).unwrap().0);
+    let big_item = item(ask(&mut r, provider::Request::Item { id: big_id }).await);
+    assert!(big_item.pinned, "inside a pinned folder");
+    // The folder is fetched in the background, a file at a time; a file
+    // is done once its fill is noted (after its content is written).
+    let fetched = || {
+        let notes = fs::read_dir(lazy.join(STATE_DIR).join("lazy"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".filled"))
+            .count();
+        notes == 2
+    };
+    for _ in 0..1000 {
+        if fetched() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fs::read(lazy.join(big)).unwrap(),
+        fs::read(src.join(big)).unwrap()
+    );
+    assert_eq!(
+        fs::read(lazy.join(medium)).unwrap(),
+        fs::read(src.join(medium)).unwrap()
+    );
+    let u = usage(&mut conn, &mut rx, &mut r).await;
+    assert_eq!((u.pinned, u.cached), (big_len + medium_len, 0));
+    // Pins survive a restart, and eviction leaves pinned files alone.
+    assert!(rustfuse_sync::lazy::Pins::load(&lazy).covers(Path::new(big)));
+    assert_eq!(evict(&h, None).await.files, 0);
+    assert_eq!(
+        fs::read(lazy.join(big)).unwrap(),
+        fs::read(src.join(big)).unwrap()
+    );
+
+    // Free up space: unpinned and back to placeholders.
+    let free = format!(r#"{{"op":"free","id":"{}"}}"#, nested.id);
+    assert_eq!(
+        over_socket(&mut conn, &mut rx, &mut r, &free).await,
+        provider::Response::Done
+    );
+    assert!(fs::read(lazy.join(big)).unwrap().iter().all(|&b| b == 0));
+    assert!(fs::read(lazy.join(medium)).unwrap().iter().all(|&b| b == 0));
+    // A fetch still running for the folder stops once it is freed.
+    assert_eq!(h.hydrate_all(Path::new("src/nested")).await.unwrap(), 0);
+    assert!(fs::read(lazy.join(big)).unwrap().iter().all(|&b| b == 0));
+    assert!(
+        !item(
+            ask(
+                &mut r,
+                provider::Request::Item {
+                    id: big_item.id.clone()
+                }
+            )
+            .await
+        )
+        .pinned
+    );
+    let u = usage(&mut conn, &mut rx, &mut r).await;
+    assert_eq!((u.pinned, u.cached), (0, 0));
+
+    // Fetched on demand, a file counts as cache until freed.
+    assert!(h.hydrate(&lazy.join(medium)).await.unwrap());
+    let u = usage(&mut conn, &mut rx, &mut r).await;
+    assert_eq!(u.cached, medium_len);
+    let s = r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+    assert_eq!(s.pushed, 0, "pinning and freeing are not edits");
+    server.abort();
+}
+
+#[tokio::test]
+async fn remote_tree_lists_and_downloads_without_a_replica() {
+    let mut c = Cluster::new(1, sample_tree).await;
+    // A later change: the tree is the snapshot plus every changeset.
+    fs::write(c.dir(0).join("src/new.txt"), "new\n").unwrap();
+    fs::remove_file(c.dir(0).join("README.md")).unwrap();
+    c.sync(0).await;
+
+    let tree = rustfuse_sync::remote::RemoteTree::load(c.volume.clone())
+        .await
+        .unwrap();
+    let names = |p: &str| -> Vec<String> {
+        tree.list(Path::new(p))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    };
+    assert!(!names("").contains(&"README.md".to_owned()));
+    assert!(!names("").contains(&STATE_DIR.to_owned()));
+    assert_eq!(names("src"), ["main.rs", "nested", "new.txt"]);
+    let link = tree
+        .list(Path::new(""))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "link")
+        .unwrap();
+    assert_eq!(link.kind, provider::Kind::Symlink);
+    assert_eq!(link.target.as_deref(), Some("src/main.rs"));
+    assert!(tree.list(Path::new("src/main.rs")).is_err());
+    assert!(tree.list(Path::new("nope")).is_err());
+    assert!(tree.list(Path::new("../x")).is_err());
+
+    let dest = c._tmp.path().join("got");
+    let d = tree.download(Path::new("src"), &dest).await.unwrap();
+    assert_eq!((d.files, d.dirs), (4, 3));
+    for f in ["main.rs", "new.txt", "nested/medium.txt", "nested/deep/big.bin"] {
+        assert_eq!(
+            fs::read(dest.join(f)).unwrap(),
+            fs::read(c.dir(0).join("src").join(f)).unwrap(),
+            "{f}"
+        );
+    }
+    let one = c._tmp.path().join("run.sh");
+    tree.download(Path::new("run.sh"), &one).await.unwrap();
+    assert_eq!(fs::metadata(&one).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(
+        fs::metadata(&one).unwrap().modified().unwrap(),
+        fs::metadata(c.dir(0).join("run.sh")).unwrap().modified().unwrap()
+    );
+    assert!(
+        tree.download(Path::new("run.sh"), &one).await.is_err(),
+        "never overwrites"
     );
 }

@@ -61,6 +61,10 @@ pub struct Item {
     pub downloaded: bool,
     /// Whether the volume holds it; machine-local entries are not synced.
     pub synced: bool,
+    /// Whether it is kept downloaded: git's own data, or pinned by the
+    /// user (or inside a pinned folder).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +128,14 @@ pub enum Request {
         #[serde(default)]
         recursive: bool,
     },
+    /// The space the directory takes on this machine.
+    Usage,
+    /// Keeps an item (a folder: everything in it) downloaded, fetching
+    /// what is missing, or stops keeping it so.
+    Keep { id: String, keep: bool },
+    /// Drops the downloaded content of an item (a folder: everything in
+    /// it) back to the bucket ("free up space"), and stops keeping it.
+    Free { id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +162,14 @@ pub enum Response {
         path: PathBuf,
     },
     Done,
+    Usage {
+        usage: crate::lazy::Usage,
+        /// The cache size the daemon keeps fetched content within.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+        /// Whether content downloads on first use (`attach --lazy`).
+        lazy: bool,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -355,6 +375,7 @@ impl Replica {
             meta_version: format!("{loc}/{meta}/{:o}/{parent}/{name}", m.mode() & 0o7777),
             downloaded,
             synced: node.is_some(),
+            pinned: crate::lazy::always_full(rel) || self.pins().is_some_and(|p| p.covers(rel)),
         })
     }
 
@@ -400,6 +421,32 @@ impl Replica {
                 mtime_ns,
             } => self.modify(&id, parent, name, source, mode, mtime_ns).await,
             Request::Delete { id, recursive } => self.delete(&id, recursive).await,
+            Request::Keep { id, keep } => self.pin(&id, keep),
+            Request::Free { id } => self.pin(&id, false),
+            Request::Usage => error(ErrorCode::BadRequest, "usage is answered outside the sync loop"),
+        }
+    }
+
+    /// Records a pin (or its removal) and returns the item's path for the
+    /// caller to fetch or drop content outside the sync loop.
+    fn pin(&mut self, id: &str, keep: bool) -> Response {
+        let Some(rel) = self.rel_of(id) else {
+            return error(ErrorCode::NoSuchItem, id);
+        };
+        if let Err(e) = fs::symlink_metadata(self.root_dir().join(&rel)) {
+            return io_error(e);
+        }
+        if let Some(pins) = self.pins()
+            && let Err(e) = pins.set(&rel, keep)
+        {
+            return error(ErrorCode::Io, e.to_string());
+        }
+        // The item's `pinned` changed: macOS learns it as a change.
+        if let Some(n) = self.tree().resolve(&rel).filter(|&n| n != NodeId::ROOT) {
+            self.change_log_mut().record([n]);
+        }
+        Response::Path {
+            path: self.root_dir().join(rel),
         }
     }
 
@@ -641,30 +688,63 @@ fn set_attrs(path: &Path, kind: Kind, mode: Option<u32>, mtime_ns: Option<i64>) 
 /// A request and where its answer goes.
 pub type Call = (Request, oneshot::Sender<Response>);
 
+/// `path` relative to `root`, when one of them is reached through a
+/// symlink and the other is not (macOS: `/var` is `/private/var`).
+fn relative_to(root: &Path, path: &Path) -> PathBuf {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.to_owned();
+    }
+    let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    // The item itself may be a symlink: resolve only its parent.
+    let canon = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| path.to_owned()),
+        _ => fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()),
+    };
+    if canon == canon_root {
+        return PathBuf::new();
+    }
+    canon
+        .strip_prefix(&canon_root)
+        .map(Path::to_owned)
+        .unwrap_or_else(|_| path.to_owned())
+}
+
+/// What the socket server needs beside the sync loop.
+#[derive(Clone)]
+pub struct Serving {
+    /// The synced directory.
+    pub root: PathBuf,
+    /// For a lazy directory: fetches and drops content.
+    pub hydrator: Option<Arc<Hydrator>>,
+    /// The cache size fetched content is kept within, if any.
+    pub cache_size: Option<u64>,
+    /// Files a mount has open (by inode), never dropped.
+    pub in_use: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+}
+
 /// Serves the protocol on a Unix socket at `path` (replacing a stale one),
-/// passing requests to the sync loop through `calls`. For a lazy directory,
-/// `hydrator` fetches content before a `Fetch` is answered.
-pub async fn serve(
-    path: PathBuf,
-    calls: mpsc::Sender<Call>,
-    hydrator: Option<Arc<Hydrator>>,
-) -> std::io::Result<()> {
+/// passing requests to the sync loop through `calls`. Fetching, keeping
+/// and freeing content and measuring usage run here, beside the loop.
+pub async fn serve(path: PathBuf, calls: mpsc::Sender<Call>, serving: Serving) -> std::io::Result<()> {
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     // Only this user's processes (the extension runs as the user).
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let serving = Arc::new(serving);
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(connection(stream, calls.clone(), hydrator.clone()));
+        tokio::spawn(connection(stream, calls.clone(), serving.clone()));
     }
 }
 
-async fn connection(stream: UnixStream, calls: mpsc::Sender<Call>, hydrator: Option<Arc<Hydrator>>) {
+async fn connection(stream: UnixStream, calls: mpsc::Sender<Call>, serving: Arc<Serving>) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => answer(req, &calls, hydrator.as_deref()).await,
+            Ok(req) => answer(req, &calls, &serving).await,
             Err(e) => error(ErrorCode::BadRequest, e.to_string()),
         };
         let mut out = serde_json::to_vec(&resp).expect("serializable");
@@ -675,8 +755,28 @@ async fn connection(stream: UnixStream, calls: mpsc::Sender<Call>, hydrator: Opt
     }
 }
 
-async fn answer(req: Request, calls: &mpsc::Sender<Call>, hydrator: Option<&Hydrator>) -> Response {
-    let fetch = matches!(req, Request::Fetch { .. });
+async fn answer(req: Request, calls: &mpsc::Sender<Call>, serving: &Serving) -> Response {
+    if matches!(req, Request::Usage) {
+        let root = serving.root.clone();
+        let pins = serving.hydrator.as_ref().map(|h| h.pins());
+        let measured = tokio::task::spawn_blocking(move || crate::lazy::usage(&root, pins.as_deref())).await;
+        return match measured {
+            Ok(Ok(usage)) => Response::Usage {
+                usage,
+                limit: serving.cache_size,
+                lazy: serving.hydrator.is_some(),
+            },
+            Ok(Err(e)) => error(ErrorCode::Io, e.to_string()),
+            Err(e) => error(ErrorCode::Io, e.to_string()),
+        };
+    }
+    let (fetch, keep, free) = match &req {
+        Request::Fetch { .. } => (true, false, false),
+        Request::Keep { keep, .. } => (false, *keep, false),
+        Request::Free { .. } => (false, false, true),
+        _ => (false, false, false),
+    };
+    let pin_request = matches!(req, Request::Keep { .. } | Request::Free { .. });
     let (tx, rx) = oneshot::channel();
     if calls.send((req, tx)).await.is_err() {
         return error(ErrorCode::Io, "the sync loop has stopped");
@@ -684,11 +784,39 @@ async fn answer(req: Request, calls: &mpsc::Sender<Call>, hydrator: Option<&Hydr
     let resp = rx
         .await
         .unwrap_or_else(|_| error(ErrorCode::Io, "the sync loop has stopped"));
-    if fetch
-        && let (Response::Path { path }, Some(h)) = (&resp, hydrator)
-        && let Err(e) = h.hydrate(path).await
-    {
-        return error(ErrorCode::Io, format!("fetching {}: {e}", path.display()));
+    let (Response::Path { path }, Some(h)) = (&resp, &serving.hydrator) else {
+        return if pin_request && matches!(resp, Response::Path { .. }) {
+            // Nothing is ever dropped from a directory that holds every file.
+            Response::Done
+        } else {
+            resp
+        };
+    };
+    if fetch {
+        if let Err(e) = h.hydrate(path).await {
+            return error(ErrorCode::Io, format!("fetching {}: {e}", path.display()));
+        }
+        return resp;
     }
-    resp
+    let rel = relative_to(&serving.root, path);
+    if keep {
+        // A folder can take long to fetch: answer now, fetch behind.
+        let h = h.clone();
+        tokio::spawn(async move {
+            if let Err(e) = h.hydrate_all(&rel).await {
+                warn!("fetching {} to keep it downloaded: {e}", rel.display());
+            }
+        });
+    } else if free {
+        let (h, in_use) = (h.clone(), serving.in_use.clone());
+        let freed =
+            tokio::task::spawn_blocking(move || h.free(&rel, |ino| in_use.as_ref().is_some_and(|f| f(ino))))
+                .await;
+        match freed {
+            Ok(Ok(e)) => debug!(files = e.files, bytes = e.bytes, "freed space"),
+            Ok(Err(e)) => return error(ErrorCode::Io, e.to_string()),
+            Err(e) => return error(ErrorCode::Io, e.to_string()),
+        }
+    }
+    Response::Done
 }

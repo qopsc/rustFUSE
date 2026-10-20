@@ -158,6 +158,16 @@ one JSON request per line (`rustfuse-sync/src/provider.rs`):
   would be (new content is moved in from a staged file), then captured at
   once so the answer carries the item's id. A move and new content in one
   request are captured in two steps, so the node keeps its id.
+- `keep`, `free`: "keep downloaded" pins a file or folder
+  (`.rustfuse/pinned.json`, machine-local) and fetches everything in it in
+  the background; eviction skips pinned files. "Free up space" unpins it
+  and empties its fetched files at once, except open or changed ones.
+  Items carry `pinned` (git data, or covered by a pin), which the
+  extension maps to its content policy.
+- `usage`: the directory's file count and total size, and of the bytes on
+  this machine how many are git data, pinned, or cache that eviction may
+  drop, with the `--cache-size` limit. `rustfuse sync --cache-size` keeps a
+  lazy directory within it as a mount does.
 
 Requests that read or change the tree run inside the sync loop between
 sync steps (`Replica::run_serving`), so they never race the applier.
@@ -189,13 +199,17 @@ domain, and keeps a `rustfuse sync --provider-socket` running for it. It
 polls the daemon's anchor and signals the working set when it moves. The
 extension maps items and errors onto File Provider. It keeps `.git`
 downloaded (`downloadEagerlyAndKeepDownloaded`, which everything under it
-inherits), stages new content in the container for the daemon to move in,
+inherits) along with whatever the user pinned, stages new content in the container for the daemon to move in,
 and hands fetched content to macOS as a clone. `RustFuseKit` holds the wire
 protocol, and its tests and the daemon's check the same samples.
 
 **Steps.** (1) The daemon side and the protocol (done, tested on Linux).
 (2) The Swift host app and extension in `macos/`, built unsigned in CI
-(done). (3) On a Mac: sign with a personal team, run the git checks above,
+(done). (2b) The app's daemon support: volume listing (`rustfuse volumes`,
+a hub request filtered by the token's key), reading a volume straight from
+the bucket for a bucket browser (`rustfuse ls`, `rustfuse get`: the latest
+snapshot plus later changesets, nothing written), pins and usage (done).
+(3) On a Mac: sign with a personal team, run the git checks above,
 tune. One open question: whether macOS needs the working set to list every
 item. It is now empty, and items arrive as folders are browsed.
 
@@ -530,6 +544,8 @@ nothing here), then later ones take 0.06–0.1 s.
   snapshot plus the log tail, straight from the bucket.
 - Protocol: TCP, length-prefixed zstd + postcard frames. `Hello{volume,
   token, after}` subscribes from a position; `Push(changeset)` appends.
+  `Volumes{token}` answers with the volumes in the bucket the token opens
+  (all for the shared token, a key's own list otherwise).
 - Storage proxy (Phase 5): a connection that opens with `Store{volume,
   token}` instead carries object calls (get, ranged get, put, head,
   delete, list) for that volume's keys, many in flight at once, each

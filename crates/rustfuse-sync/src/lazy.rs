@@ -27,7 +27,7 @@
 //! A lazy directory must be used through `rustfuse mount` or `rustfuse
 //! nfs`: programs reading it directly see placeholders as zeros.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -83,6 +83,129 @@ pub struct Evicted {
     pub held: u64,
     pub files: usize,
     pub bytes: u64,
+}
+
+/// Files and folders the user asked to keep downloaded: eviction skips
+/// them. Kept in `.rustfuse/pinned.json`, relative paths as bytes.
+#[derive(Debug, Default)]
+pub struct Pins {
+    file: PathBuf,
+    set: Mutex<BTreeSet<PathBuf>>,
+}
+
+impl Pins {
+    /// The pins of the directory at `root`.
+    pub fn load(root: &Path) -> Pins {
+        let file = root.join(STATE_DIR).join("pinned.json");
+        let set = fs::read(&file)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Vec<Vec<u8>>>(&raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| PathBuf::from(std::ffi::OsStr::from_bytes(&b)))
+            .collect();
+        Pins {
+            file,
+            set: Mutex::new(set),
+        }
+    }
+
+    /// Whether `rel` (relative to the root) is kept downloaded, by its own
+    /// pin or a folder's above it.
+    pub fn covers(&self, rel: &Path) -> bool {
+        self.set.lock().unwrap().iter().any(|p| rel.starts_with(p))
+    }
+
+    /// Pins or unpins `rel`. Pins below it go either way: they are covered
+    /// by the new pin, or released with it.
+    pub fn set(&self, rel: &Path, keep: bool) -> Result<()> {
+        let mut set = self.set.lock().unwrap();
+        set.retain(|p| !p.starts_with(rel));
+        if keep {
+            set.insert(rel.to_owned());
+        }
+        let list: Vec<&[u8]> = set.iter().map(|p| p.as_os_str().as_bytes()).collect();
+        let tmp = self.file.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec(&list).expect("serializable")).at(&tmp)?;
+        fs::rename(&tmp, &self.file).at(&self.file)
+    }
+}
+
+/// Space a synced directory takes on this machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Files (and symlinks) in the directory.
+    pub files: u64,
+    /// Their combined size, downloaded or not.
+    pub total: u64,
+    /// Bytes of content on this machine.
+    pub local: u64,
+    /// Of `local`, git's own data (always kept).
+    pub git: u64,
+    /// Of `local`, files kept downloaded by a pin.
+    pub pinned: u64,
+    /// Of `local`, fetched content that can be dropped again.
+    pub cached: u64,
+}
+
+/// Measures the directory at `root` (blocking; walks every file).
+pub fn usage(root: &Path, pins: Option<&Pins>) -> Result<Usage> {
+    let mut u = Usage::default();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let dir = root.join(&rel);
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).at(&dir),
+        };
+        for ent in rd.flatten() {
+            let child = rel.join(ent.file_name());
+            if rel.as_os_str().is_empty() && ent.file_name() == STATE_DIR {
+                continue;
+            }
+            let Ok(m) = ent.metadata() else { continue };
+            if m.is_dir() {
+                stack.push(child);
+                continue;
+            }
+            u.files += 1;
+            u.total += m.len();
+            if m.is_file() && is_placeholder(&root.join(&child)) {
+                continue;
+            }
+            u.local += m.len();
+            if always_full(&child) {
+                u.git += m.len();
+            } else if pins.is_some_and(|p| p.covers(&child)) {
+                u.pinned += m.len();
+            }
+        }
+    }
+    // Fetched files that still hold what was fetched.
+    if is_lazy(root) {
+        let dir = records(root);
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                if !ent.file_name().as_bytes().ends_with(FILLED.as_bytes()) {
+                    continue;
+                }
+                let Some(f) = fs::read(ent.path())
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<Filled>(&raw).ok())
+                else {
+                    continue;
+                };
+                let rel = Path::new(std::ffi::OsStr::from_bytes(&f.path));
+                let current =
+                    fs::symlink_metadata(root.join(rel)).is_ok_and(|m| Filled::of(f.path.clone(), &m) == f);
+                if current && !pins.is_some_and(|p| p.covers(rel)) {
+                    u.cached += f.size;
+                }
+            }
+        }
+    }
+    Ok(u)
 }
 
 fn records(root: &Path) -> PathBuf {
@@ -201,17 +324,51 @@ pub struct Hydrator {
     busy: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// When each file was last asked for, by inode.
     used: Mutex<HashMap<u64, Instant>>,
+    pins: Arc<Pins>,
 }
 
 impl Hydrator {
     /// For the lazy directory at `root`, whose volume is in `store`.
     pub fn new(root: &Path, store: Arc<dyn ObjectStore>) -> Result<Hydrator> {
+        let root = root.canonicalize().at(root)?;
         Ok(Hydrator {
-            root: root.canonicalize().at(root)?,
+            pins: Arc::new(Pins::load(&root)),
+            root,
             store,
             busy: Mutex::new(HashMap::new()),
             used: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// What the user asked to keep downloaded; shared with the sync loop.
+    pub fn pins(&self) -> Arc<Pins> {
+        self.pins.clone()
+    }
+
+    /// Fills in every placeholder at or below `rel` (relative to the
+    /// root), as for a folder just pinned. Stops once `rel` is no longer
+    /// pinned (freed meanwhile). Returns how many were fetched.
+    pub async fn hydrate_all(&self, rel: &Path) -> Result<usize> {
+        let mut n = 0;
+        let mut stack = vec![self.root.join(rel)];
+        while let Some(path) = stack.pop() {
+            if !self.pins.covers(rel) {
+                break;
+            }
+            let Ok(m) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if m.is_dir() {
+                for ent in fs::read_dir(&path).at(&path)?.flatten() {
+                    if ent.file_name() != STATE_DIR {
+                        stack.push(ent.path());
+                    }
+                }
+            } else if m.is_file() && self.hydrate(&path).await? {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
@@ -344,13 +501,71 @@ impl Hydrator {
     /// Skips files opened in the last minute and those `in_use` names (by
     /// inode). Blocking.
     pub fn evict(&self, budget: u64, in_use: impl Fn(u64) -> bool) -> Result<Evicted> {
+        let held: Vec<_> = self
+            .held()?
+            .into_iter()
+            .filter(|(_, f, _)| !self.pins.covers(Path::new(std::ffi::OsStr::from_bytes(&f.path))))
+            .collect();
+        let mut out = Evicted {
+            held: held.iter().map(|(_, f, _)| f.size).sum(),
+            ..Evicted::default()
+        };
+        if out.held <= budget {
+            return Ok(out);
+        }
+        let target = budget / 10 * 9;
+        let used = self.used.lock().unwrap().clone();
+        // Never opened since this process started: oldest first, by when
+        // they were filled in.
+        let mut held = held;
+        held.sort_by_key(|(k, f, _)| match used.get(&f.ino) {
+            Some(t) => (1, Some(*t), k.clone()),
+            None => (0, None, k.clone()),
+        });
+        let mut remaining = out.held;
+        for (k, f, path) in held {
+            if remaining <= target {
+                break;
+            }
+            if used.get(&f.ino).is_some_and(|t| t.elapsed() < RECENT) || in_use(f.ino) {
+                continue;
+            }
+            if self.empty_locked(&k, &f, &path)? {
+                remaining -= f.size;
+                out.files += 1;
+                out.bytes += f.size;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Turns every filled-in file at or below `rel` back into a
+    /// placeholder ("free up space"), except those `in_use` names (by
+    /// inode). Blocking.
+    pub fn free(&self, rel: &Path, in_use: impl Fn(u64) -> bool) -> Result<Evicted> {
+        let mut out = Evicted::default();
+        for (k, f, path) in self.held()? {
+            if !Path::new(std::ffi::OsStr::from_bytes(&f.path)).starts_with(rel) {
+                continue;
+            }
+            out.held += f.size;
+            if !in_use(f.ino) && self.empty_locked(&k, &f, &path)? {
+                out.files += 1;
+                out.bytes += f.size;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Filled-in files that still hold exactly what was fetched, with their
+    /// record names; notes of the others are dropped.
+    fn held(&self) -> Result<Vec<(String, Filled, PathBuf)>> {
         let dir = records(&self.root);
         let rd = match fs::read_dir(&dir) {
             Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Evicted::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e).at(&dir),
         };
-        // Filled-in files that still hold exactly what was fetched.
         let mut held = Vec::new();
         for ent in rd {
             let note = ent.at(&dir)?.path();
@@ -381,41 +596,16 @@ impl Hydrator {
                 let _ = fs::remove_file(&note);
             }
         }
-        let mut out = Evicted {
-            held: held.iter().map(|(_, f, _)| f.size).sum(),
-            ..Evicted::default()
-        };
-        if out.held <= budget {
-            return Ok(out);
-        }
-        let target = budget / 10 * 9;
-        let used = self.used.lock().unwrap().clone();
-        // Never opened since this process started: oldest first, by when
-        // they were filled in.
-        held.sort_by_key(|(k, f, _)| match used.get(&f.ino) {
-            Some(t) => (1, Some(*t), k.clone()),
-            None => (0, None, k.clone()),
-        });
-        let mut remaining = out.held;
-        for (k, f, path) in held {
-            if remaining <= target {
-                break;
-            }
-            if used.get(&f.ino).is_some_and(|t| t.elapsed() < RECENT) || in_use(f.ino) {
-                continue;
-            }
-            let lock = self.lock_for(&path);
-            let guard = lock.blocking_lock();
-            let done = self.empty(&k, &f, &path);
-            drop(guard);
-            self.unlock(&path, &lock);
-            if done? {
-                remaining -= f.size;
-                out.files += 1;
-                out.bytes += f.size;
-            }
-        }
-        Ok(out)
+        Ok(held)
+    }
+
+    fn empty_locked(&self, k: &str, f: &Filled, path: &Path) -> Result<bool> {
+        let lock = self.lock_for(path);
+        let guard = lock.blocking_lock();
+        let done = self.empty(k, f, path);
+        drop(guard);
+        self.unlock(path, &lock);
+        done
     }
 
     /// Turns one filled-in file back into a placeholder, if it still holds

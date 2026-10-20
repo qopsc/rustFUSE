@@ -123,6 +123,21 @@ public final class Client: @unchecked Sendable {
         guard case .done = try call(.delete(id: id, recursive: recursive)) else { throw unexpected("done") }
     }
 
+    public func usage() throws -> (usage: Usage, limit: UInt64?, lazy: Bool) {
+        guard case .usage(let u, let limit, let lazy) = try call(.usage) else { throw unexpected("usage") }
+        return (u, limit, lazy)
+    }
+
+    /// Keeps an item downloaded (or stops keeping it).
+    public func keep(_ id: String, _ keep: Bool) throws {
+        guard case .done = try call(.keep(id: id, keep: keep)) else { throw unexpected("done") }
+    }
+
+    /// Frees the space an item's downloaded content takes.
+    public func free(_ id: String) throws {
+        guard case .done = try call(.free(id: id)) else { throw unexpected("done") }
+    }
+
     private func unexpected(_ wanted: String) -> ProviderError {
         .badAnswer("expected \(wanted)")
     }

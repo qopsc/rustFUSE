@@ -62,12 +62,11 @@ final class ProviderItem: NSObject, NSFileProviderItem {
         return f
     }
 
-    /// Git reads its own data constantly and expects it local: keep `.git`
-    /// (a repository's directory, or a worktree's pointer file) and
-    /// everything under it downloaded. Everything else downloads on first
-    /// open.
+    /// Pinned items stay downloaded: git's own data (git reads it
+    /// constantly and expects it local) and whatever the user chose to
+    /// keep. Everything else downloads on first open.
     var contentPolicy: NSFileProviderContentPolicy {
-        item.name == ".git" ? .downloadEagerlyAndKeepDownloaded : .inherited
+        item.pinned ? .downloadEagerlyAndKeepDownloaded : .inherited
     }
 }
 
