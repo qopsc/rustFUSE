@@ -11,6 +11,7 @@ pub mod gc;
 mod git;
 mod ignore;
 mod index;
+pub mod lazy;
 pub mod metrics;
 mod replica;
 mod scan;

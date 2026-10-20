@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow, WriteFlags,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, WriteFlags,
 };
 
 use crate::backing::{self, Backing, SetAttr};
@@ -239,8 +239,24 @@ impl Filesystem for Fuse {
         );
     }
 
-    // `link` stays unsupported (EPERM): a synced volume has no hard links,
-    // and git falls back to renaming.
+    fn link(&self, _req: &Request, _ino: INodeNo, _newparent: INodeNo, _newname: &OsStr, reply: ReplyEntry) {
+        // A synced volume has no hard links; git falls back to renaming.
+        reply.error(Errno::EPERM);
+    }
+
+    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+        // Extended attributes do not sync, and the sync's own markers
+        // stay out of sight.
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let (read, write) = match flags.acc_mode() {

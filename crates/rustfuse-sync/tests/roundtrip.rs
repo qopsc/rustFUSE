@@ -1292,3 +1292,82 @@ async fn metrics_count_sync_activity() {
         assert!(m.render().contains(&format!("rustfuse_applied_seq {head}\n")));
     }
 }
+
+#[tokio::test]
+async fn lazy_directory_fetches_on_demand() {
+    let mut c = Cluster::new(1, |root| {
+        sample_tree(root);
+        fs::create_dir_all(root.join("repo/.git/objects")).unwrap();
+        fs::write(root.join("repo/.git/objects/pack"), pseudo_random(100_000, 9)).unwrap();
+    })
+    .await;
+    let lazy = c._tmp.path().join("lazy");
+    let mut cfg = config("vol", 9);
+    cfg.hub = Some(c.hub.addr.clone());
+    let mut r = Replica::attach_with(&lazy, cfg, c.volume.clone(), true)
+        .await
+        .unwrap();
+    assert!(rustfuse_sync::lazy::is_lazy(&lazy));
+    let src = c.dir(0).to_path_buf();
+    let big = "src/nested/deep/big.bin";
+
+    // Placeholders: right size, no content yet. Git data and small files
+    // are there in full.
+    let real = fs::read(src.join(big)).unwrap();
+    let held = fs::read(lazy.join(big)).unwrap();
+    assert_eq!(held.len(), real.len());
+    assert!(held.iter().all(|&b| b == 0));
+    assert_eq!(
+        fs::read(lazy.join("repo/.git/objects/pack")).unwrap(),
+        fs::read(src.join("repo/.git/objects/pack")).unwrap()
+    );
+    assert_eq!(fs::read(lazy.join("README.md")).unwrap(), b"hello\n");
+    assert_eq!(
+        fs::metadata(lazy.join(big)).unwrap().modified().unwrap(),
+        fs::metadata(src.join(big)).unwrap().modified().unwrap()
+    );
+
+    // A placeholder whose metadata changes still syncs as its content.
+    fs::set_permissions(lazy.join(big), fs::Permissions::from_mode(0o600)).unwrap();
+    r.capture(None).await.unwrap();
+    r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+    c.sync(0).await;
+    assert_eq!(fs::read(src.join(big)).unwrap(), real);
+    assert_eq!(
+        fs::metadata(src.join(big)).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // First use fetches the content, once.
+    let h = rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap();
+    assert!(h.hydrate(&lazy.join(big)).await.unwrap());
+    assert!(!h.hydrate(&lazy.join(big)).await.unwrap());
+    assert!(!h.hydrate(&lazy.join("README.md")).await.unwrap());
+    assert_eq!(fs::read(lazy.join(big)).unwrap(), real);
+    assert_eq!(
+        fs::metadata(lazy.join(big)).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let s = r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+    assert_eq!(s.pushed, 0, "fetching is not an edit");
+
+    // A change from elsewhere arrives as a new placeholder.
+    let medium = "src/nested/medium.txt";
+    fs::write(src.join(medium), "other\n".repeat(4000)).unwrap();
+    c.sync(0).await;
+    r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+    assert!(fs::read(lazy.join(medium)).unwrap().iter().all(|&b| b == 0));
+    assert!(h.hydrate(&lazy.join(medium)).await.unwrap());
+    assert_eq!(
+        fs::read(lazy.join(medium)).unwrap(),
+        fs::read(src.join(medium)).unwrap()
+    );
+
+    // Records of filled-in or replaced placeholders go away.
+    drop(r);
+    Replica::open(&lazy, c.volume.clone()).unwrap();
+    assert_eq!(
+        fs::read_dir(lazy.join(STATE_DIR).join("lazy")).unwrap().count(),
+        0
+    );
+}

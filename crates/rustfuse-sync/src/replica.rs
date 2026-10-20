@@ -105,6 +105,8 @@ pub struct Replica {
     /// Packs found in the bucket (and not marked for deletion), and when.
     checked_packs: HashMap<PackId, Instant>,
     metrics: Arc<SyncMetrics>,
+    /// Content is fetched on first use through a mount (`crate::lazy`).
+    lazy: bool,
 }
 
 /// Creates the state folder, hidden from git (and tools honouring
@@ -169,12 +171,27 @@ impl Replica {
     /// Materializes an existing volume into the empty directory `root`
     /// from the bucket's snapshot and log.
     pub async fn attach(root: &Path, config: Config, store: Arc<dyn ObjectStore>) -> Result<Self> {
+        Replica::attach_with(root, config, store, false).await
+    }
+
+    /// Like [`attach`](Self::attach); with `lazy`, files are written as
+    /// placeholders and fetched when a mount first opens them
+    /// ([`crate::lazy`]).
+    pub async fn attach_with(
+        root: &Path,
+        config: Config,
+        store: Arc<dyn ObjectStore>,
+        lazy: bool,
+    ) -> Result<Self> {
         let volume = Volume::new(store.clone());
         volume.check().await?;
         if root.exists() && fs::read_dir(root).at(root)?.next().is_some() {
             return Err(Error::NotEmpty(root.to_owned()));
         }
         create_state_dir(root)?;
+        if lazy {
+            crate::lazy::enable(root)?;
+        }
         let index = Index::create(&index_path(root), &config)?;
         let mut r = Replica::load(root, index, store)?;
         r.restore_from_bucket().await?;
@@ -204,7 +221,15 @@ impl Replica {
         }
         // Watch events carry absolute, resolved paths.
         let root = root.canonicalize().at(root)?;
+        let lazy = crate::lazy::is_lazy(&root);
+        if lazy {
+            let pruned = crate::lazy::prune(&root, &l.disk)?;
+            if pruned > 0 {
+                debug!(pruned, "removed placeholder records no longer needed");
+            }
+        }
         Ok(Replica {
+            lazy,
             git: Some(GitTidy::load(&root)),
             ignore: Ignore::load(&root).map_err(|e| Error::Corrupt(format!("ignore file: {e}")))?,
             root,
@@ -431,6 +456,7 @@ impl Replica {
         let applier = Applier {
             root: &self.root,
             store: self.volume.store().clone(),
+            lazy: self.lazy,
         };
         let t0 = Instant::now();
         let stats = applier.apply(&changes).await?;
@@ -787,10 +813,11 @@ impl Replica {
         });
 
         let builder = self.builder.clone();
+        let lazy_root = self.lazy.then(|| self.root.clone());
         let reader = tokio::task::spawn_blocking(move || {
             let out: Vec<Result<Option<Content>>> = reads
                 .par_iter()
-                .map(|(path, kind)| read_one(path, *kind, &builder, &tx))
+                .map(|(path, kind)| read_one(path, *kind, &builder, &tx, lazy_root.as_deref()))
                 .collect();
             if let Some(last) = builder.lock().unwrap().seal() {
                 let _ = tx.blocking_send(last);
@@ -1496,11 +1523,14 @@ fn tokio_stream_from<T: Send + 'static>(
 }
 
 /// Reads one file or symlink into a [`Content`], chunking large files.
+/// Reads and chunks one file. In a lazy directory (`lazy_root`), a
+/// placeholder counts as holding the content it stands for.
 fn read_one(
     path: &Path,
     kind: Kind,
     builder: &Mutex<PackBuilder>,
     tx: &tokio::sync::mpsc::Sender<SealedPack>,
+    lazy_root: Option<&Path>,
 ) -> Result<Option<Content>> {
     let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     if kind == Kind::Symlink {
@@ -1517,6 +1547,11 @@ fn read_one(
         Err(e) if not_found(&e) => return Ok(None),
         Err(e) => return Err(e).at(path),
     };
+    if let Some(root) = lazy_root
+        && let Some(content) = crate::lazy::placeholder_content(root, &file)?
+    {
+        return Ok(Some(content));
+    }
     let len = file.metadata().at(path)?.len();
     if len <= INLINE_MAX {
         let mut data = Vec::with_capacity(len as usize);
@@ -1525,7 +1560,7 @@ fn read_one(
             return Ok(Some(Content::Inline(data)));
         }
         // Grew while we looked; fall through and chunk it.
-        return read_one(path, kind, builder, tx);
+        return read_one(path, kind, builder, tx, lazy_root);
     }
     let mut chunks = Vec::new();
     let mut size = 0u64;

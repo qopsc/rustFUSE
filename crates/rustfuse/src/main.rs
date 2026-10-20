@@ -63,6 +63,12 @@ enum Command {
         dir: PathBuf,
         #[arg(long)]
         volume: String,
+        /// Leave file content in the bucket until a mount (`rustfuse mount`
+        /// or `rustfuse nfs`) first opens the file; git data is fetched in
+        /// full. Use the directory only through a mount: read directly,
+        /// files not fetched yet look empty.
+        #[arg(long)]
+        lazy: bool,
         #[command(flatten)]
         hub: HubArgs,
         #[command(flatten)]
@@ -520,10 +526,14 @@ async fn open_replica(dir: &Path, opts: &SyncOpts) -> Result<(Replica, HubSpec)>
     Ok((r, spec))
 }
 
-/// Starts syncing `dir` (and its metrics endpoint); the returned future
-/// syncs until an error stops it.
-async fn run_sync(dir: &Path, opts: &SyncOpts) -> Result<impl std::future::Future<Output = Result<()>>> {
-    let (mut r, spec) = open_replica(dir, opts).await?;
+/// Starts syncing an opened directory (and its metrics endpoint); the
+/// returned future syncs until an error stops it.
+async fn start_sync(
+    dir: &Path,
+    mut r: Replica,
+    spec: HubSpec,
+    opts: &SyncOpts,
+) -> Result<impl std::future::Future<Output = Result<()>> + use<>> {
     if let Some(addr) = &opts.metrics {
         let m = r.metrics();
         serve_metrics(addr, move || m.render()).await?;
@@ -536,24 +546,64 @@ async fn run_sync(dir: &Path, opts: &SyncOpts) -> Result<impl std::future::Futur
     Ok(async move { Ok(r.run(&spec, debounce, full_scan).await?) })
 }
 
-/// Syncs `dir` unless `no_sync`, until `serve` ends or Ctrl-C.
-async fn serve_while_syncing(
+/// What a mount serves for `dir`, and the sync to run beside it (none with
+/// `no_sync`). A lazy directory fetches content as the mount opens files.
+async fn prepare_serving(
     dir: &Path,
     no_sync: bool,
     opts: &SyncOpts,
-    serve: impl std::future::Future<Output = Result<()>>,
-) -> Result<()> {
+) -> Result<(
+    Arc<rustfuse_mount::Backing>,
+    Option<impl std::future::Future<Output = Result<()>> + use<>>,
+)> {
     if !dir.join(rustfuse_sync::STATE_DIR).is_dir() {
         bail!(
             "{} is not a rustfuse directory (run `rustfuse init` or `rustfuse attach`)",
             dir.display()
         );
     }
-    let sync = async {
-        if no_sync {
-            std::future::pending::<()>().await;
+    let mut backing = rustfuse_mount::Backing::new(dir, &[rustfuse_sync::STATE_DIR])?;
+    if no_sync {
+        if rustfuse_sync::lazy::is_lazy(dir) {
+            bail!(
+                "{} fetches files on first use; serve it with its sync (drop --no-sync)",
+                dir.display()
+            );
         }
-        run_sync(dir, opts).await?.await
+        return Ok((Arc::new(backing), None));
+    }
+    let (r, spec) = open_replica(dir, opts).await?;
+    if rustfuse_sync::lazy::is_lazy(dir) {
+        let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(dir, r.store().clone())?);
+        let rt = tokio::runtime::Handle::current();
+        backing = backing.with_fetch(Arc::new(move |path: &Path| {
+            let fetch = || rt.block_on(h.hydrate(path));
+            // FUSE calls from its own threads, NFS from the runtime's.
+            let res = if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(fetch)
+            } else {
+                fetch()
+            };
+            res.map(drop).map_err(|e| {
+                tracing::warn!("cannot fetch {}: {e}", path.display());
+                std::io::Error::other(e)
+            })
+        }));
+    }
+    let sync = start_sync(dir, r, spec, opts).await?;
+    Ok((Arc::new(backing), Some(sync)))
+}
+
+/// Runs `sync` (if any) until `serve` ends or Ctrl-C.
+async fn serve_until(
+    sync: Option<impl std::future::Future<Output = Result<()>>>,
+    serve: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let sync = async {
+        match sync {
+            Some(s) => s.await,
+            None => std::future::pending().await,
+        }
     };
     tokio::select! {
         res = sync => res,
@@ -570,7 +620,7 @@ async fn mount(
     no_sync: bool,
     opts: &SyncOpts,
 ) -> Result<()> {
-    let backing = Arc::new(rustfuse_mount::Backing::new(dir, &[rustfuse_sync::STATE_DIR])?);
+    let (backing, sync) = prepare_serving(dir, no_sync, opts).await?;
     let m = rustfuse_mount::mount_fuse(backing, mountpoint, allow_other)
         .with_context(|| format!("mount at {}", mountpoint.display()))?;
     println!(
@@ -578,7 +628,7 @@ async fn mount(
         dir.display(),
         mountpoint.display()
     );
-    let res = serve_while_syncing(dir, no_sync, opts, std::future::pending()).await;
+    let res = serve_until(sync, std::future::pending()).await;
     m.unmount()?;
     res
 }
@@ -589,7 +639,7 @@ async fn mount(_: &Path, _: &Path, _: bool, _: bool, _: &SyncOpts) -> Result<()>
 }
 
 async fn serve_nfs(dir: &Path, listen: &str, no_sync: bool, opts: &SyncOpts) -> Result<()> {
-    let backing = Arc::new(rustfuse_mount::Backing::new(dir, &[rustfuse_sync::STATE_DIR])?);
+    let (backing, sync) = prepare_serving(dir, no_sync, opts).await?;
     let server = rustfuse_mount::NfsServer::bind(backing, listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
@@ -612,7 +662,7 @@ async fn serve_nfs(dir: &Path, listen: &str, no_sync: bool, opts: &SyncOpts) -> 
     println!(
         "  macOS: mount -t nfs -o vers=3,tcp,port={port},mountport={port},locallocks {host}:/ <mountpoint>"
     );
-    serve_while_syncing(dir, no_sync, opts, async { Ok(server.serve().await?) }).await
+    serve_until(sync, async { Ok(server.serve().await?) }).await
 }
 
 fn main() -> Result<()> {
@@ -718,6 +768,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Attach {
             dir,
             volume,
+            lazy,
             hub,
             store,
             creds,
@@ -725,7 +776,7 @@ async fn run(cli: Cli) -> Result<()> {
             let spec = hub.spec()?;
             let config = store.config(volume, &hub)?;
             let s = volume_store(&config, &creds, &spec).await?;
-            let mut r = Replica::attach(&dir, config, s).await?;
+            let mut r = Replica::attach_with(&dir, config, s, lazy).await?;
             println!(
                 "Attached volume {} at {} ({} entries).",
                 r.config().volume,
@@ -745,7 +796,8 @@ async fn run(cli: Cli) -> Result<()> {
                     r.applied()
                 );
             } else {
-                let sync = run_sync(&dir, &opts).await?;
+                let (r, spec) = open_replica(&dir, &opts).await?;
+                let sync = start_sync(&dir, r, spec, &opts).await?;
                 tokio::select! {
                     res = sync => res?,
                     _ = tokio::signal::ctrl_c() => {}

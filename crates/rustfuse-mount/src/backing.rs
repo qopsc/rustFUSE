@@ -16,7 +16,7 @@ use std::io::ErrorKind;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 pub use rustix::io::Errno;
@@ -47,11 +47,16 @@ pub struct SetAttr {
     pub mtime: Option<SystemTime>,
 }
 
+/// Makes sure a file holds its content before it is opened (a lazy
+/// directory fetches it on first use).
+pub type Fetch = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
 pub struct Backing {
     root: PathBuf,
     /// Names at the root that the mount does not show (the sync state).
     hidden: Vec<Vec<u8>>,
     nodes: Mutex<Nodes>,
+    fetch: Option<Fetch>,
 }
 
 #[derive(Default)]
@@ -111,7 +116,21 @@ impl Backing {
             root,
             hidden: hidden.iter().map(|h| h.as_bytes().to_vec()).collect(),
             nodes: Mutex::new(Nodes::default()),
+            fetch: None,
         })
+    }
+
+    /// Calls `fetch` on a file before opening or truncating it.
+    pub fn with_fetch(mut self, fetch: Fetch) -> Backing {
+        self.fetch = Some(fetch);
+        self
+    }
+
+    fn ensure_content(&self, path: &Path) -> Result<()> {
+        match &self.fetch {
+            Some(f) => f(path).map_err(errno),
+            None => Ok(()),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -212,6 +231,7 @@ impl Backing {
             if m.is_dir() {
                 return Err(Errno::ISDIR);
             }
+            self.ensure_content(&path)?;
             OpenOptions::new()
                 .write(true)
                 .open(&path)
@@ -237,6 +257,7 @@ impl Backing {
     /// Opens a file for the frontends' reads and writes.
     pub fn open(&self, ino: u64, read: bool, write: bool, truncate: bool) -> Result<File> {
         let path = self.path(ino)?;
+        self.ensure_content(&path)?;
         OpenOptions::new()
             .read(read || !write)
             .write(write)
@@ -279,6 +300,10 @@ impl Backing {
         if exclusive {
             o.create_new(true);
         } else {
+            // It may already exist and need its content.
+            if fs::symlink_metadata(&path).is_ok() {
+                self.ensure_content(&path)?;
+            }
             o.create(true);
         }
         let f = o.open(&path).map_err(errno)?;

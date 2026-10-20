@@ -22,6 +22,7 @@ rustfuse-chunk = { version = "0.1.0", path = "../rustfuse-chunk" }
 rustfuse-hub = { version = "0.1.0", path = "../rustfuse-hub" }
 rustfuse-store = { version = "0.1.0", path = "../rustfuse-store" }
 rustfuse-types = { version = "0.1.0", path = "../rustfuse-types" }
+rustix = { version = "1.1.5", features = ["fs", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
