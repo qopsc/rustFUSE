@@ -1,0 +1,77 @@
+# The rustFUSE Mac app and its File Provider extension (docs/design.md
+# §2.2). Generate the Xcode project with `xcodegen` (brew install xcodegen),
+# then build the `rustFUSE` scheme; see macos/README.md.
+name: rustFUSE
+options:
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+packages:
+  RustFuseKit:
+    path: RustFuseKit
+targets:
+  rustFUSE:
+    type: application
+    platform: macOS
+    sources: [App]
+    dependencies:
+      - package: RustFuseKit
+      - target: RustFuseFileProvider
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: rustFUSE
+        LSUIElement: true
+        LSApplicationCategoryType: public.app-category.developer-tools
+        RustFuseAppGroup: $(RUSTFUSE_APP_GROUP)
+    entitlements:
+      path: App/rustFUSE.entitlements
+      properties:
+        com.apple.security.application-groups: [$(RUSTFUSE_APP_GROUP)]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    postBuildScripts:
+      - name: Bundle the rustfuse daemon
+        script: exec "$SRCROOT/bundle-daemon.sh"
+        basedOnDependencyAnalysis: false
+  RustFuseFileProvider:
+    type: app-extension
+    platform: macOS
+    sources: [Extension]
+    dependencies:
+      - package: RustFuseKit
+      - sdk: FileProvider.framework
+    info:
+      path: Extension/Info.plist
+      properties:
+        CFBundleDisplayName: rustFUSE
+        RustFuseAppGroup: $(RUSTFUSE_APP_GROUP)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          NSExtensionFileProviderDocumentGroup: $(RUSTFUSE_APP_GROUP)
+          NSExtensionFileProviderSupportsEnumeration: true
+    entitlements:
+      path: Extension/RustFuseFileProvider.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups: [$(RUSTFUSE_APP_GROUP)]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app.fileprovider
+schemes:
+  rustFUSE:
+    build:
+      targets:
+        rustFUSE: all

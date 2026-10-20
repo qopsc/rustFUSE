@@ -1,0 +1,8 @@
+/rustFUSE.xcodeproj/
+/Config/Local.xcconfig
+/build/
+/RustFuseKit/.build/
+/App/Info.plist
+/App/rustFUSE.entitlements
+/Extension/Info.plist
+/Extension/RustFuseFileProvider.entitlements

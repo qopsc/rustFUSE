@@ -134,6 +134,7 @@ fetched once more when next opened.
 | `rustfuse-sync` | The sync engine: scan, capture, apply, conflict rules, git pass |
 | `rustfuse-mount` | FUSE and NFS frontends over a synced directory |
 | `rustfuse` | CLI |
+| `macos/` | Mac app and File Provider extension (Swift; see [macos/README.md](macos/README.md)) |
 
 ## Development
 
