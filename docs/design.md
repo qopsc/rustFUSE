@@ -192,11 +192,22 @@ signed by one team and share an App Group. Development may work with
 Xcode's free personal team (to verify); release needs the paid Apple
 Developer account.
 
-**The app** (`macos/`, built unsigned in CI). A menu bar app adds a
-volume with `rustfuse attach --lazy` into the app group container, keeps
-its hub token in the keychain, registers the volume as a File Provider
-domain, and keeps a `rustfuse sync --provider-socket` running for it. It
-polls the daemon's anchor and signals the working set when it moves. The
+**The app** (`macos/`, built unsigned in CI, macOS 15). A menu bar item
+and a main window. Saved connections (hub, token, CA, optional direct S3
+keys; secrets in the keychain) list the volumes their token opens. A
+volume is added one of three ways: in Finder (`attach --lazy` into the app
+group container, registered as a File Provider domain, `sync
+--provider-socket --cache-size`), as a folder anywhere (full `attach`,
+`sync --provider-socket` for its usage), or as a macFUSE mount anywhere
+(`attach --lazy` into the container, `mount --provider-socket
+--cache-size`, FSKit or the kernel extension, with a macFUSE build of the
+daemon bundled beside the plain one). A new volume can be created from a
+folder (`init`). Each volume shows its disk use against its cache size.
+Quitting stops every daemon by default (they stop cleanly on SIGTERM, so
+mounts unmount); the "keep syncing" setting instead installs a launchd
+login agent per volume that runs the app headless, so secrets stay in the
+keychain. For Finder volumes the app polls the daemon's anchor and
+signals the working set when it moves. The
 extension maps items and errors onto File Provider. It keeps `.git`
 downloaded (`downloadEagerlyAndKeepDownloaded`, which everything under it
 inherits) along with whatever the user pinned, stages new content in the container for the daemon to move in,

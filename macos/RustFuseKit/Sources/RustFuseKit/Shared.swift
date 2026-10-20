@@ -5,11 +5,14 @@ import Foundation
 /// the app group container both the app and the sandboxed extension can
 /// reach.
 ///
-///     volumes/<name>/   each volume's synced directory (`rustfuse attach --lazy`)
-///     s/<name>.sock     its daemon's provider socket
+///     volumes/<key>/    a Finder or mount volume's synced directory
+///                       (a folder volume's is wherever the user chose)
+///     s/<key>.sock      its daemon's provider socket
 ///     staging/          new content on its way into a volume
-///     logs/<name>.log   its daemon's log
-///     volumes.json      the volumes the app runs
+///     logs/<key>.log    its daemon's log
+///     ca/<id>.pem       a connection's hub CA certificates
+///     library.json      connections, volumes and settings (`Library`)
+///     volumes.json      the first version's volume list, migrated once
 public enum Shared {
     /// The app group, from the bundle's `RustFuseAppGroup` Info.plist key
     /// (set by the build to the team prefix plus the bundle prefix).
@@ -41,8 +44,35 @@ public enum Shared {
         try dir("logs").appendingPathComponent("\(name).log")
     }
 
-    public static func volumesFile() throws -> URL {
+    public static func libraryFile() throws -> URL {
+        try container().appendingPathComponent("library.json")
+    }
+
+    public static func legacyVolumesFile() throws -> URL {
         try container().appendingPathComponent("volumes.json")
+    }
+
+    public static func caFile(_ connection: UUID) throws -> URL {
+        try dir("ca").appendingPathComponent("\(connection.uuidString).pem")
+    }
+
+    /// The library as saved, the first version's volume list migrated, or
+    /// an empty one.
+    public static func loadLibrary() throws -> Library {
+        let url = try libraryFile()
+        if let data = try? Data(contentsOf: url) {
+            return try JSONDecoder().decode(Library.self, from: data)
+        }
+        if let data = try? Data(contentsOf: legacyVolumesFile()) {
+            return Library.migrating(try JSONDecoder().decode([Library.Legacy].self, from: data))
+        }
+        return Library()
+    }
+
+    public static func saveLibrary(_ lib: Library) throws {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(lib).write(to: libraryFile(), options: .atomic)
     }
 
     /// Volume names double as File Provider domain ids and file names.
@@ -55,18 +85,6 @@ public enum Shared {
         let url = try container().appendingPathComponent(sub, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
-    }
-}
-
-/// A volume the app runs: its name (also the File Provider domain) and hub.
-public struct Volume: Codable, Equatable, Identifiable, Sendable {
-    public var name: String
-    public var hub: String
-    public var id: String { name }
-
-    public init(name: String, hub: String) {
-        self.name = name
-        self.hub = hub
     }
 }
 
