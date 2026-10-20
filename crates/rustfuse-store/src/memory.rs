@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::{Bound, Range};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -10,7 +11,7 @@ use crate::{Error, ListPage, ObjectMeta, ObjectStore, Result};
 /// In-process store for tests and benchmarks of the layers above storage.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    objects: Mutex<BTreeMap<String, Bytes>>,
+    objects: Mutex<BTreeMap<String, (Bytes, SystemTime)>>,
 }
 
 impl MemoryStore {
@@ -23,7 +24,7 @@ impl MemoryStore {
             .lock()
             .unwrap()
             .get(key)
-            .cloned()
+            .map(|(d, _)| d.clone())
             .ok_or_else(|| Error::NotFound(key.to_owned()))
     }
 }
@@ -46,14 +47,18 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
-        self.objects.lock().unwrap().insert(key.to_owned(), data);
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), (data, SystemTime::now()));
         Ok(())
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        Ok(self.objects.lock().unwrap().get(key).map(|d| ObjectMeta {
+        Ok(self.objects.lock().unwrap().get(key).map(|(d, t)| ObjectMeta {
             key: key.to_owned(),
             size: d.len() as u64,
+            modified: Some(*t),
         }))
     }
 
@@ -69,7 +74,7 @@ impl ObjectStore for MemoryStore {
             _ => Bound::Included(prefix.to_owned()),
         };
         let mut page = ListPage::default();
-        for (key, data) in objects.range((lower, Bound::Unbounded)) {
+        for (key, (data, t)) in objects.range((lower, Bound::Unbounded)) {
             if !key.starts_with(prefix) {
                 break;
             }
@@ -80,6 +85,7 @@ impl ObjectStore for MemoryStore {
             page.objects.push(ObjectMeta {
                 key: key.clone(),
                 size: data.len() as u64,
+                modified: Some(*t),
             });
         }
         Ok(page)

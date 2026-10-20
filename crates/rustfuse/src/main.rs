@@ -89,6 +89,24 @@ enum Command {
     /// List conflict copies kept next to the files they conflicted with,
     /// and git branches that diverged on two machines.
     Conflicts { dir: PathBuf },
+    /// Delete stored content no machine can need any more. Run it next to
+    /// the hub (it needs the bucket), e.g. daily; a pack is deleted on a
+    /// run at least an hour after the run that found it unused.
+    Gc {
+        #[arg(long)]
+        volume: String,
+        /// Keep content used by changes from this many days back, and
+        /// packs written within it.
+        #[arg(long, default_value_t = 14)]
+        retention_days: u64,
+        /// Only report what would be deleted.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+    },
     /// Measure raw object-store throughput and latency.
     Bench(bench::BenchArgs),
     /// Make `git status` in a repository inside a synced directory ask the
@@ -565,6 +583,45 @@ async fn run(cli: Cli) -> Result<()> {
             if !any {
                 println!("No conflicts.");
             }
+        }
+        Command::Gc {
+            volume,
+            retention_days,
+            dry_run,
+            store,
+            creds,
+        } => {
+            if !rustfuse_hub::valid_volume_name(&volume) {
+                bail!("invalid volume name");
+            }
+            let base = store.prefix.trim_matches('/');
+            let prefix = if base.is_empty() {
+                format!("volumes/{volume}")
+            } else {
+                format!("{base}/volumes/{volume}")
+            };
+            let s: Arc<dyn ObjectStore> = Arc::new(store.connect(&creds, &prefix).await?);
+            let opts = rustfuse_sync::gc::GcOptions {
+                retention: Duration::from_secs(retention_days * 24 * 3600),
+                dry_run,
+                ..Default::default()
+            };
+            let st = rustfuse_sync::gc::collect(s, &opts).await?;
+            let verb = if dry_run { "would delete" } else { "deleted" };
+            println!(
+                "{} packs ({}), {} in use. Marked {} unused, {} {} ({}), {} waiting, {} back in use; {} old snapshots {}.",
+                st.packs,
+                mib(st.pack_bytes),
+                st.used_packs,
+                st.marked,
+                verb,
+                st.deleted,
+                mib(st.deleted_bytes),
+                st.waiting,
+                st.revived,
+                st.snapshots_deleted,
+                verb,
+            );
         }
         Command::Bench(args) => bench::bench(args).await?,
         Command::GitFsmonitor { repo, off } => git_fsmonitor(&repo, off)?,

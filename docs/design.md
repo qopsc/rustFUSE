@@ -154,7 +154,8 @@ replicas converge to the same result).
   larger threshold costs memory on trees with many small files (§8.1).
 - Chunks are batched into **pack objects** (~8–32 MiB) per push, with an
   index, so a 100k-file repo is not 100k S3 PUTs. Packs are immutable;
-  compaction (Phase 5) rewrites sparse packs.
+  cleanup deletes unused ones (§5.5) and compaction (Phase 5) will
+  rewrite sparse ones.
 - Optional zstd compression and client-side encryption per chunk.
 - Each daemon keeps a local **chunk cache** so applying remote ops for
   content it already has costs nothing.
@@ -165,6 +166,33 @@ The daemon's `redb` database holds, per volume: node table (id → parent,
 name, kind, mode, version, size, mtime, content hash, inode/dev for fast
 change detection), last applied seq, outbox, conflict list, and the
 watcher's bookmark (FSEvents event id / last scan).
+
+### 5.5 Cleanup
+
+`rustfuse gc --volume <name>` (next to the hub, e.g. daily) deletes packs
+no machine can need. A pack is **unused** when no file in the current state
+and no changeset from the last 14 days (`--retention-days`) points into it,
+and it was written more than 14 days ago. Deletion takes two runs:
+
+1. A run writes a tombstone `gc/dead/<pack>` for each unused pack.
+2. A later run, at least an hour after, deletes the pack and its tombstone
+   if it is still unused, or drops the tombstone if something uses it
+   again. Old snapshots are deleted too (the latest two stay).
+
+The danger is a machine that was offline for longer than the retention and
+holds unsent changesets pointing at such packs: a copy of a file others
+deleted, a rename of it, or new content that matched old chunks and so was
+never uploaded. Before sending, a machine checks that every pack its unsent
+changesets use exists and has no tombstone (a pack checked in the last five
+minutes is trusted). If one is gone or marked, it forgets those chunks,
+re-reads the files and uploads them again, and points the changesets at the
+new copies; an intermediate version that no longer exists on disk is
+replaced by the file's current content (the end result is the same). A
+changeset checked before a tombstone appeared is in the log well within
+the hour, so the deleting run sees it and keeps the pack.
+
+A machine catching up applies the whole log before it updates the disk, so
+it never fetches files that are gone again by the time it is up to date.
 
 ## 6. Change capture and apply
 
@@ -401,7 +429,7 @@ crates/
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
-| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), pack compaction + GC, metrics, HA notes |
+| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots (**done**), compaction of sparse packs, metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
 ## 13. Decisions and open questions

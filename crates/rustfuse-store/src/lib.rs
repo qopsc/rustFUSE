@@ -6,6 +6,7 @@
 //! service (rustFS, MinIO, Ceph RGW, AWS) in production.
 
 use std::ops::Range;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -39,6 +40,8 @@ impl Error {
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
+    /// When the object was last written, if the store reports it.
+    pub modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

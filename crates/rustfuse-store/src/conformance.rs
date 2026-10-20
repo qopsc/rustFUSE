@@ -26,6 +26,14 @@ pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     assert_eq!(store.get(&k("a")).await.unwrap(), data);
     let meta = store.head(&k("a")).await.unwrap().unwrap();
     assert_eq!(meta.size, data.len() as u64);
+    // Cleanup decides by age, so stores must report when objects were
+    // written (allowing for clock skew between client and store).
+    let age = |t: Option<std::time::SystemTime>| {
+        let t = t.expect("store reports modification times");
+        let now = std::time::SystemTime::now();
+        now.duration_since(t).unwrap_or_else(|e| e.duration())
+    };
+    assert!(age(meta.modified) < std::time::Duration::from_secs(3600));
 
     // Ranges, including clipping past the end.
     assert_eq!(store.get_range(&k("a"), 0..1).await.unwrap(), data.slice(0..1));
@@ -64,6 +72,11 @@ pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     loop {
         let page = store.list(&list_prefix, after.as_deref(), 2).await.unwrap();
         assert!(page.objects.len() <= 2);
+        assert!(
+            page.objects
+                .iter()
+                .all(|o| age(o.modified) < std::time::Duration::from_secs(3600))
+        );
         seen.extend(page.objects.iter().map(|o| o.key.clone()));
         match page.next_start_after {
             Some(next) => after = Some(next),

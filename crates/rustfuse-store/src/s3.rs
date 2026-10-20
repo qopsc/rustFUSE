@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -194,6 +195,7 @@ impl ObjectStore for S3Store {
             Ok(out) => Ok(Some(ObjectMeta {
                 key: key.to_owned(),
                 size: out.content_length().unwrap_or(0).max(0) as u64,
+                modified: out.last_modified().and_then(|t| SystemTime::try_from(*t).ok()),
             })),
             Err(e) if http_status(&e) == Some(404) => Ok(None),
             Err(e) => Err(Error::backend(e)),
@@ -229,6 +231,7 @@ impl ObjectStore for S3Store {
                 Some(ObjectMeta {
                     key: self.strip_prefix(o.key()?).to_owned(),
                     size: o.size().unwrap_or(0).max(0) as u64,
+                    modified: o.last_modified().and_then(|t| SystemTime::try_from(*t).ok()),
                 })
             })
             .collect();

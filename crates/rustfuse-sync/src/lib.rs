@@ -7,6 +7,7 @@
 
 mod apply;
 pub mod fsmonitor;
+pub mod gc;
 mod git;
 mod ignore;
 mod index;

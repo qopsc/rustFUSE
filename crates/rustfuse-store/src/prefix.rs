@@ -54,6 +54,7 @@ impl ObjectStore for PrefixStore {
         Ok(self.inner.head(&self.key(key)).await?.map(|m| ObjectMeta {
             key: self.strip(m.key),
             size: m.size,
+            modified: m.modified,
         }))
     }
 
@@ -74,6 +75,7 @@ impl ObjectStore for PrefixStore {
                 .map(|m| ObjectMeta {
                     key: self.strip(m.key),
                     size: m.size,
+                    modified: m.modified,
                 })
                 .collect(),
             next_start_after: page.next_start_after.map(|k| self.strip(k)),

@@ -175,6 +175,21 @@ impl PackBuilder {
         Some(pack)
     }
 
+    /// Forgets the chunks stored in `packs` (they were deleted), so new
+    /// content with the same bytes is stored again. Returns their hashes.
+    pub fn forget_packs(&mut self, packs: &std::collections::HashSet<PackId>) -> Vec<ChunkHash> {
+        let gone: Vec<ChunkHash> = self
+            .known
+            .values()
+            .filter(|r| packs.contains(&r.pack))
+            .map(|r| r.hash)
+            .collect();
+        for h in &gone {
+            self.known.remove(h);
+        }
+        gone
+    }
+
     /// Every chunk this builder knows about.
     pub fn known(&self) -> impl Iterator<Item = &ChunkRef> {
         self.known.values()

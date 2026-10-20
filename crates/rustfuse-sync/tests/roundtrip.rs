@@ -201,6 +201,8 @@ struct Cluster {
     replicas: Vec<Replica>,
     offline: Vec<Arc<AtomicBool>>,
     hub: HubSpec,
+    /// The volume's objects, straight from the bucket.
+    volume: Arc<dyn ObjectStore>,
 }
 
 impl Cluster {
@@ -230,6 +232,7 @@ impl Cluster {
             replicas: Vec::new(),
             offline: Vec::new(),
             hub,
+            volume: Arc::new(PrefixStore::new(root.clone(), &format!("volumes/{volume}"))),
         };
         let mut populate = Some(populate);
         for i in 0..n {
@@ -1084,4 +1087,104 @@ async fn large_files_stream_and_reuse_local_chunks() {
     fs::set_permissions(src.join("sub/huge.bin"), fs::Permissions::from_mode(0o600)).unwrap();
     c.settle().await;
     assert_eq!(fs::read(c.dir(1).join("sub/huge.bin")).unwrap(), data);
+}
+
+/// Runs cleanup as if `days` had passed (plus `extra`).
+async fn gc_at(c: &Cluster, days: u64, extra: Duration) -> rustfuse_sync::gc::GcStats {
+    let opts = rustfuse_sync::gc::GcOptions {
+        now: SystemTime::now() + Duration::from_secs(days * 24 * 3600) + extra,
+        ..Default::default()
+    };
+    rustfuse_sync::gc::collect(c.volume.clone(), &opts).await.unwrap()
+}
+
+async fn pack_count(c: &Cluster) -> usize {
+    c.volume.list("pack/", None, 10_000).await.unwrap().objects.len()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_deletes_unused_packs_in_two_steps() {
+    let mut c = Cluster::new(3, sample_tree).await;
+    c.settle().await;
+    // Content that is created, synced and deleted again, in its own packs.
+    fs::write(c.dir(0).join("scratch.bin"), pseudo_random(3 << 20, 21)).unwrap();
+    c.settle().await;
+    fs::remove_file(c.dir(0).join("scratch.bin")).unwrap();
+    c.settle().await;
+    // Machine 2 lags behind: it misses a file that comes and goes.
+    fs::write(c.dir(0).join("brief.bin"), pseudo_random(2 << 20, 22)).unwrap();
+    c.sync(0).await;
+    fs::remove_file(c.dir(0).join("brief.bin")).unwrap();
+    c.sync(0).await;
+    c.sync(1).await;
+    let before = pack_count(&c).await;
+
+    // Recent content stays, used or not.
+    let st = gc_at(&c, 0, Duration::ZERO).await;
+    assert_eq!((st.marked, st.deleted), (0, 0));
+    // Old and unused: marked first, deleted only on a later run.
+    let st = gc_at(&c, 30, Duration::ZERO).await;
+    assert_eq!(st.marked, 2, "{st:?}");
+    assert_eq!(st.deleted, 0);
+    assert_eq!(pack_count(&c).await, before);
+    let st = gc_at(&c, 30, Duration::from_secs(600)).await;
+    assert_eq!((st.deleted, st.waiting), (0, 2), "too early: {st:?}");
+    let st = gc_at(&c, 30, Duration::from_secs(7200)).await;
+    assert_eq!(st.deleted, 2, "{st:?}");
+    assert_eq!(pack_count(&c).await, before - 2);
+    assert_eq!(gc_at(&c, 31, Duration::ZERO).await.marked, 0);
+
+    // Everyone still converges, and a new machine attaches.
+    c.settle().await;
+    let late = c._tmp.path().join("late");
+    let mut cfg = config("vol", 99);
+    cfg.hub = Some(c.hub.addr.clone());
+    Replica::attach(&late, cfg, c.volume.clone()).await.unwrap();
+    assert_same(c.dir(0), &late);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsent_changes_survive_cleanup_of_their_content() {
+    // Machine 1 goes through the hub, machine 2 straight to the bucket.
+    let mut c = Cluster::new(3, sample_tree).await;
+    let a = pseudo_random(3 << 20, 31);
+    let b = pseudo_random(3 << 20, 32);
+    fs::write(c.dir(0).join("a.bin"), &a).unwrap();
+    fs::write(c.dir(0).join("b.bin"), &b).unwrap();
+    c.settle().await;
+    fs::remove_file(c.dir(0).join("a.bin")).unwrap();
+    fs::remove_file(c.dir(0).join("b.bin")).unwrap();
+    c.sync(0).await;
+
+    // Offline for a month, machines 1 and 2 keep copies of the content the
+    // others deleted, or move it out of the way: their changes only point
+    // at the old packs.
+    for i in [1, 2] {
+        fs::copy(c.dir(i).join("a.bin"), c.dir(i).join(format!("keep-a{i}.bin"))).unwrap();
+    }
+    fs::rename(c.dir(1).join("b.bin"), c.dir(1).join("keep-b1.bin")).unwrap();
+    fs::copy(c.dir(2).join("b.bin"), c.dir(2).join("keep-b2.bin")).unwrap();
+    // Cleanup marks the old packs; machine 1 sends after the deletion,
+    // machine 2 while the packs are only marked.
+    gc_at(&c, 30, Duration::ZERO).await;
+    let (sent, _) = c.sync(2).await;
+    assert!(sent > 0);
+    let st = gc_at(&c, 30, Duration::from_secs(7200)).await;
+    assert!(st.deleted > 0, "{st:?}");
+    c.sync(1).await;
+    c.settle().await;
+    for i in 0..3 {
+        assert_eq!(fs::read(c.dir(i).join("keep-a1.bin")).unwrap(), a);
+        assert_eq!(fs::read(c.dir(i).join("keep-a2.bin")).unwrap(), a);
+        assert_eq!(fs::read(c.dir(i).join("keep-b1.bin")).unwrap(), b);
+        assert_eq!(fs::read(c.dir(i).join("keep-b2.bin")).unwrap(), b);
+    }
+    // Nothing anyone uses is left in a deleted or doomed pack.
+    let st = gc_at(&c, 30, Duration::from_secs(4 * 3600)).await;
+    assert_eq!(st.revived, 0, "{st:?}");
+    let late = c._tmp.path().join("late");
+    let mut cfg = config("vol", 99);
+    cfg.hub = Some(c.hub.addr.clone());
+    Replica::attach(&late, cfg, c.volume.clone()).await.unwrap();
+    assert_same(c.dir(0), &late);
 }

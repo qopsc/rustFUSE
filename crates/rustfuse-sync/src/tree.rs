@@ -235,6 +235,13 @@ impl Tree {
         out
     }
 
+    /// Replaces a node's content in place (same bytes, stored elsewhere).
+    pub fn set_content(&mut self, id: NodeId, content: rustfuse_types::Content) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.entry.content = content;
+        }
+    }
+
     /// Makes the given nodes (and their removal records) match `source`.
     /// The caller guarantees the trees differ on no other node.
     pub fn copy_from(&mut self, source: &Tree, ids: &HashSet<NodeId>) {
