@@ -57,6 +57,8 @@ pub struct Backing {
     hidden: Vec<Vec<u8>>,
     nodes: Mutex<Nodes>,
     fetch: Option<Fetch>,
+    /// Files held open through the mount, by real inode number.
+    open: Mutex<HashMap<u64, usize>>,
 }
 
 #[derive(Default)]
@@ -117,7 +119,33 @@ impl Backing {
             hidden: hidden.iter().map(|h| h.as_bytes().to_vec()).collect(),
             nodes: Mutex::new(Nodes::default()),
             fetch: None,
+            open: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Notes a file held open through the mount (see [`in_use`](Self::in_use)).
+    pub fn opened(&self, f: &File) {
+        if let Ok(m) = f.metadata() {
+            *self.open.lock().unwrap().entry(m.ino()).or_default() += 1;
+        }
+    }
+
+    pub fn closed(&self, f: &File) {
+        if let Ok(m) = f.metadata() {
+            let mut open = self.open.lock().unwrap();
+            if let Some(n) = open.get_mut(&m.ino()) {
+                *n -= 1;
+                if *n == 0 {
+                    open.remove(&m.ino());
+                }
+            }
+        }
+    }
+
+    /// Whether the file with this real inode number is held open through
+    /// the mount (NFS clients hold nothing open).
+    pub fn in_use(&self, ino: u64) -> bool {
+        self.open.lock().unwrap().contains_key(&ino)
     }
 
     /// Calls `fetch` on a file before opening or truncating it.
