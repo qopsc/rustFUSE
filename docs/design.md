@@ -400,6 +400,20 @@ nothing here), then later ones take 0.06–0.1 s.
   name the host. rustls with the aws-lc-rs provider, already used by the
   S3 client. Without a certificate the hub speaks plain TCP: keep it on a
   trusted network or a tunnel.
+- Metrics (Phase 5): `rustfuse hub --metrics addr` and `rustfuse sync
+  --metrics addr` serve Prometheus text over plain HTTP (`GET /metrics`),
+  from atomics with no extra dependencies. The hub reports open and total
+  connections by kind (`log`, `store`), refused connections, appends per
+  volume with their latency, each volume's log head, slow machines
+  dropped, and storage-proxy calls by op with latency, errors and bytes in
+  and out. A machine reports whether it is connected, its applied position
+  against the log head it last heard of, its outbox length, the last time
+  it was fully in sync (connected, caught up, nothing to send), what it
+  pushed, received, captured, read and uploaded, capture and apply
+  latency, and failures by stage. Lag is `rustfuse_hub_head_seq -
+  rustfuse_applied_seq`; a machine whose
+  `rustfuse_in_sync_timestamp_seconds` stops moving needs a look. Bind it
+  to localhost or a trusted network: it has no auth.
 - HA is optional; if the hub is down, every machine keeps working offline,
   and content waits in a local spool if the bucket is unreachable too.
 
@@ -442,7 +456,7 @@ crates/
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
-| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics, HA notes |
+| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
 ## 13. Decisions and open questions

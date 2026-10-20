@@ -29,6 +29,7 @@ use crate::apply::Applier;
 use crate::git::{GitTidy, Plan};
 use crate::ignore::Ignore;
 use crate::index::{Commit, Config, Counters, Index, StatKey};
+use crate::metrics::SyncMetrics;
 use crate::scan::{Change, Kind, ScanRoot, Scanner};
 use crate::tree::Tree;
 use crate::{Error, IoContext, Result, STATE_DIR};
@@ -103,6 +104,7 @@ pub struct Replica {
     git: Option<GitTidy>,
     /// Packs found in the bucket (and not marked for deletion), and when.
     checked_packs: HashMap<PackId, Instant>,
+    metrics: Arc<SyncMetrics>,
 }
 
 /// Creates the state folder, hidden from git (and tools honouring
@@ -219,6 +221,7 @@ impl Replica {
             volume: Volume::new(store),
             builder: Arc::new(Mutex::new(builder)),
             checked_packs: HashMap::new(),
+            metrics: Arc::default(),
         })
     }
 
@@ -242,6 +245,12 @@ impl Replica {
     /// Local changesets not yet accepted by the hub.
     pub fn outbox_len(&self) -> usize {
         self.outbox.len()
+    }
+
+    /// Counters and gauges for `/metrics`, updated as this replica works.
+    pub fn metrics(&self) -> Arc<SyncMetrics> {
+        self.metrics.position(self.counters.applied, self.outbox.len());
+        self.metrics.clone()
     }
 
     fn spool_dir(&self) -> PathBuf {
@@ -311,6 +320,7 @@ impl Replica {
     async fn apply_log(&mut self, batch: Vec<Changeset>) -> Result<()> {
         let t0 = Instant::now();
         let n = batch.len();
+        let before = self.counters.applied;
         let mut log_ids = Vec::new();
         let mut accepted = Vec::new();
         let mut chunks = Vec::new();
@@ -365,6 +375,9 @@ impl Replica {
             ms = t0.elapsed().as_millis() as u64,
             "applied changesets to the log"
         );
+        self.metrics.received_total.add(self.counters.applied - before);
+        self.metrics.apply_seconds.observe(t0.elapsed());
+        self.metrics.position(self.counters.applied, self.outbox.len());
         Ok(())
     }
 
@@ -511,6 +524,23 @@ impl Replica {
     /// stores new content and adds changesets to the outbox. Returns `None`
     /// when nothing changed.
     pub async fn capture(&mut self, paths: Option<Vec<PathBuf>>) -> Result<Option<CaptureStats>> {
+        let t0 = Instant::now();
+        let stats = self.capture_changes(paths).await?;
+        if let Some(s) = &stats {
+            let m = &self.metrics;
+            m.capture_seconds.observe(t0.elapsed());
+            m.captures_total.inc();
+            m.captured_ops_total.add(s.ops as u64);
+            m.bytes_read_total.add(s.bytes_read);
+            m.bytes_uploaded_total.add(s.bytes_uploaded);
+            m.packs_uploaded_total.add(s.packs as u64);
+            m.packs_spooled_total.add(s.packs_spooled as u64);
+            m.position(self.counters.applied, self.outbox.len());
+        }
+        Ok(stats)
+    }
+
+    async fn capture_changes(&mut self, paths: Option<Vec<PathBuf>>) -> Result<Option<CaptureStats>> {
         let roots = match paths {
             None => vec![ScanRoot {
                 node: NodeId::ROOT,
@@ -1097,6 +1127,7 @@ impl Replica {
                 n += 1;
             }
         }
+        self.metrics.pushed_total.add(n as u64);
         Ok(n)
     }
 
@@ -1110,6 +1141,7 @@ impl Replica {
         self.reconcile_with_capture().await?;
         let mut conn = self.connect(hub).await?;
         let head = conn.head();
+        self.metrics.hub_head.max(head as i64);
         let mut sent = HashSet::new();
         stats.pushed += self.push_outbox(&mut conn, &mut sent).await?;
         while self.counters.applied < head || !self.outbox.is_empty() {
@@ -1217,12 +1249,15 @@ impl Replica {
                             "connected to hub"
                         );
                         catch_up = c.head();
+                        self.metrics.hub_head.max(catch_up as i64);
+                        self.metrics.connected.set(1);
                         conn = Some(c);
                         sent.clear();
                         backoff = Duration::from_millis(500);
                         offline_reported = false;
                     }
                     Err(e) => {
+                        self.metrics.errors_total.get("connect").inc();
                         if !offline_reported {
                             warn!("hub unreachable, working offline: {e}");
                             offline_reported = true;
@@ -1236,7 +1271,9 @@ impl Replica {
                 && let Err(e) = self.push_outbox(c, &mut sent).await
             {
                 warn!("sending changes failed: {e}");
+                self.metrics.errors_total.get("push").inc();
                 conn = None;
+                self.metrics.connected.set(0);
             }
 
             let mut dirty: HashSet<PathBuf> = HashSet::new();
@@ -1272,7 +1309,10 @@ impl Replica {
                     let mut next = Some(ev);
                     while let Some(ev) = next {
                         match ev {
-                            Some(Ok(Event::Changeset(cs))) => batch.push(cs),
+                            Some(Ok(Event::Changeset(cs))) => {
+                                self.metrics.hub_head.max(cs.seq as i64);
+                                batch.push(cs);
+                            }
                             Some(Ok(Event::Pushed { .. })) => {}
                             Some(Err(e)) => { warn!("hub connection lost: {e}"); lost = true; break; }
                             None => { warn!("hub connection closed"); lost = true; break; }
@@ -1283,7 +1323,9 @@ impl Replica {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_attempt)), if conn.is_none() => {}
             }
             if lost {
+                self.metrics.errors_total.get("connect").inc();
                 conn = None;
+                self.metrics.connected.set(0);
                 next_attempt = Instant::now() + backoff;
             }
             // Capture first, so a burst of remote changes never overwrites
@@ -1296,9 +1338,13 @@ impl Replica {
                         report(s);
                         if tidy && let Err(e) = self.tidy_git().await {
                             warn!("git pass failed, will retry: {e}");
+                            self.metrics.errors_total.get("git").inc();
                         }
                     }
-                    Err(e) => warn!("capturing changes failed, will retry: {e}"),
+                    Err(e) => {
+                        warn!("capturing changes failed, will retry: {e}");
+                        self.metrics.errors_total.get("capture").inc();
+                    }
                 }
             }
             if !batch.is_empty() {
@@ -1308,13 +1354,16 @@ impl Replica {
                         debug!(changesets = n, applied = self.counters.applied, "applied");
                         if let Err(e) = self.tidy_git().await {
                             warn!("git pass failed, will retry: {e}");
+                            self.metrics.errors_total.get("git").inc();
                         }
                     }
                     Err(e @ (Error::Index(_) | Error::Corrupt(_))) => return Err(e),
                     Err(e) => {
                         // Reconnecting replays from the last applied changeset.
                         warn!("applying changes failed, will retry: {e}");
+                        self.metrics.errors_total.get("apply").inc();
                         conn = None;
+                        self.metrics.connected.set(0);
                         next_attempt = Instant::now() + backoff;
                     }
                 }

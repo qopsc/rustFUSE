@@ -40,6 +40,10 @@ enum Command {
         /// Private key (PEM) for `--tls-cert`.
         #[arg(long, env = "RUSTFUSE_HUB_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+        /// Serve Prometheus metrics over plain HTTP at this address
+        /// (`GET /metrics`), e.g. 127.0.0.1:9420.
+        #[arg(long, env = "RUSTFUSE_HUB_METRICS")]
+        metrics: Option<String>,
     },
     /// Create a volume from an existing directory and upload it.
     Init {
@@ -79,6 +83,10 @@ enum Command {
         /// Full rescan interval, to catch missed file events.
         #[arg(long, default_value_t = 600)]
         full_scan_secs: u64,
+        /// Serve Prometheus metrics over plain HTTP at this address
+        /// (`GET /metrics`), e.g. 127.0.0.1:9421. Not with `--once`.
+        #[arg(long, env = "RUSTFUSE_METRICS", conflicts_with = "once")]
+        metrics: Option<String>,
         #[command(flatten)]
         creds: Credentials,
         #[command(flatten)]
@@ -436,6 +444,23 @@ fn main() -> Result<()> {
         .block_on(run(cli))
 }
 
+/// Starts serving `/metrics` in the background.
+async fn serve_metrics<F>(addr: &str, render: F) -> Result<()>
+where
+    F: Fn() -> String + Send + Sync + 'static,
+{
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("listen on {addr} for metrics"))?;
+    println!("Metrics at http://{}/metrics.", listener.local_addr()?);
+    tokio::spawn(async move {
+        if let Err(e) = rustfuse_hub::metrics::serve(listener, render).await {
+            tracing::warn!("metrics endpoint stopped: {e}");
+        }
+    });
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -451,6 +476,7 @@ async fn run(cli: Cli) -> Result<()> {
             token,
             tls_cert,
             tls_key,
+            metrics,
         } => {
             let tls = match (&tls_cert, &tls_key) {
                 (Some(cert), Some(key)) => Some(rustfuse_hub::tls::server_config(cert, key)?),
@@ -466,6 +492,10 @@ async fn run(cli: Cli) -> Result<()> {
                 if tls.is_some() { " with TLS" } else { "" }
             );
             let hub = rustfuse_hub::Hub::new(root, token.get()?);
+            if let Some(addr) = metrics {
+                let m = hub.metrics().clone();
+                serve_metrics(&addr, move || m.render()).await?;
+            }
             tokio::select! {
                 res = hub.serve_with(listener, tls) => res?,
                 _ = tokio::signal::ctrl_c() => {}
@@ -517,6 +547,7 @@ async fn run(cli: Cli) -> Result<()> {
             once,
             debounce_ms,
             full_scan_secs,
+            metrics,
             creds,
             token,
         } => {
@@ -535,6 +566,10 @@ async fn run(cli: Cli) -> Result<()> {
                     r.applied()
                 );
             } else {
+                if let Some(addr) = metrics {
+                    let m = r.metrics();
+                    serve_metrics(&addr, move || m.render()).await?;
+                }
                 println!("Syncing {} with {} (Ctrl-C to stop)...", dir.display(), spec.addr);
                 tokio::select! {
                     res = r.run(&spec, Duration::from_millis(debounce_ms), Duration::from_secs(full_scan_secs)) => res?,
