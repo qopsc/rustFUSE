@@ -22,6 +22,13 @@ export RUSTFUSE_HUB_TOKEN=some-shared-secret
 # Next to rustFS:
 rustfuse hub
 
+# Optionally give each machine its own key instead of the shared token:
+# limit it to volumes, revoke it on its own. Leave RUSTFUSE_HUB_TOKEN unset
+# on the hub to accept keys only. On a machine, the key is its token.
+rustfuse key create --name laptop --volume project   # prints rfk_..._...
+rustfuse key list
+rustfuse key revoke <id>
+
 # First machine: upload an existing directory.
 rustfuse init ~/src/project --volume project --hub rustfs-host
 # Other machines: download it into an empty directory.

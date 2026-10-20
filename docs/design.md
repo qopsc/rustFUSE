@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–4 implemented, Phase 5 in progress** · 2026-10-19
+Status: **Phases 0–5 implemented** · 2026-10-20
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -389,9 +389,21 @@ nothing here), then later ones take 0.06–0.1 s.
   the hub address and token. On the 4.6 GB repository (§8.1), attaching
   through the hub took 12.4 s against 10.9 s direct, with 190 MB peak on
   the hub.
-- Auth: one shared token per hub, from `RUSTFUSE_HUB_TOKEN`; it also grants
-  storage access to every volume behind the hub. Per-machine keys may come
-  later in Phase 5.
+- Auth: a machine presents a token, either the hub's shared token
+  (`RUSTFUSE_HUB_TOKEN` on the hub, which opens every volume) or its own
+  key.
+  - Per-machine keys (Phase 5): `rustfuse key create --name laptop
+    [--volume v]` prints a token `rfk_<id>_<secret>` once.
+  - The bucket keeps `keys/<id>` (JSON: name, volumes, BLAKE3 of the
+    256-bit secret) next to `volumes/`. Every hub of the bucket sees the
+    same keys, and the storage proxy, confined to `volumes/<name>/`, can't
+    reach them.
+  - A key limited to volumes opens only those.
+  - `rustfuse key revoke <id>` deletes it. Hubs re-read a key after 30
+    seconds, so it stops working within that time, and open log and
+    storage connections that use it are closed.
+  - A hub started without a shared token accepts only keys. A machine
+    simply uses its key as its `RUSTFUSE_HUB_TOKEN`.
 - TLS (Phase 4): `rustfuse hub --tls-cert hub.pem --tls-key hub.key`;
   machines use `--hub tls://host[:port]`. They trust the system's roots, or
   the certificates in `--hub-ca` (kept in the machine's config). A
@@ -441,7 +453,8 @@ over the same bucket and letting machines reach whichever is up.
   Every connect, including the storage proxy's, tries each address in
   order with a 5 s timeout. Give each machine the nearest hub first. A DNS
   name or TCP load balancer in front of the hubs works as well. All hubs
-  must share `RUSTFUSE_HUB_TOKEN`, and with TLS each hub's certificate must
+  must share `RUSTFUSE_HUB_TOKEN` if one is used (keys live in the bucket
+  and need nothing), and with TLS each hub's certificate must
   name its own host (or be listed in `--hub-ca`).
 - **What failover costs.** A machine whose hub goes away logs the lost
   connection, reconnects to the next address with the usual backoff
@@ -507,7 +520,7 @@ crates/
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
-| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**) |
+| **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
 ## 13. Decisions and open questions

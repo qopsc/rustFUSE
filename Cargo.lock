@@ -2195,7 +2195,9 @@ name = "rustfuse-hub"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
+ "getrandom 0.4.3",
  "postcard",
  "rcgen",
  "rustfuse-store",

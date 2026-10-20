@@ -327,3 +327,55 @@ async fn resent_changesets_are_not_appended_twice() {
     let log = Volume::new(Arc::new(PrefixStore::new(root, "volumes/v")));
     assert_eq!(log.head().await.unwrap(), 2);
 }
+
+#[tokio::test]
+async fn per_machine_keys() {
+    use rustfuse_hub::keys;
+    use std::time::Duration;
+    let root: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    for v in ["v", "w"] {
+        Volume::new(Arc::new(PrefixStore::new(root.clone(), &format!("volumes/{v}"))))
+            .create()
+            .await
+            .unwrap();
+    }
+    // No shared token: only keys work. Keys are re-read every 200 ms.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let ttl = Duration::from_millis(200);
+    tokio::spawn(Hub::with_key_ttl(root.clone(), String::new(), ttl).serve(listener));
+
+    let (laptop, token) = keys::create(&*root, "laptop", vec!["v".into()]).await.unwrap();
+    let (_, any) = keys::create(&*root, "server", vec![]).await.unwrap();
+    assert!(HubClient::connect(&addr, "v", "", 0).await.is_err());
+    assert!(HubClient::connect(&addr, "v", "secret", 0).await.is_err());
+    let mut c = HubClient::connect(&addr, "v", &token, 0).await.unwrap();
+    let err = HubClient::connect(&addr, "w", &token, 0).await.err().unwrap();
+    assert!(err.to_string().contains("does not open volume w"), "{err}");
+    assert!(HubClient::connect(&addr, "w", &any, 0).await.is_ok());
+    let store = HubStore::connect(&addr, None, "v", &token).await.unwrap();
+    assert!(store.head("volume.json").await.unwrap().is_some());
+    // The storage proxy cannot reach the keys.
+    assert!(store.get("../../keys/x").await.is_err());
+    c.push(&cs(1, 1)).await.unwrap();
+    assert_eq!(next_changeset(&mut c).await.seq, 1);
+
+    // Revoking closes the open connections and refuses new ones.
+    assert!(keys::revoke(&*root, &laptop.id).await.unwrap());
+    tokio::time::sleep(ttl * 3).await;
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match c.next().await {
+                Some(Ok(_)) => continue,
+                other => return other.map(|r| r.map(|_| ())),
+            }
+        }
+    })
+    .await
+    .expect("log connection closed");
+    assert!(matches!(closed, None | Some(Err(_))), "{closed:?}");
+    // A storage call reconnects and is refused.
+    assert!(store.head("volume.json").await.is_err());
+    assert!(HubClient::connect(&addr, "v", &token, 0).await.is_err());
+    assert!(HubClient::connect(&addr, "v", &any, 0).await.is_ok());
+}

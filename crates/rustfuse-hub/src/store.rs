@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::client::connect_stream;
 use crate::codec::{encode_plain, read_frame, read_plain, write_frame};
+use crate::keys::KeyCheck;
 use crate::server::HubMetrics;
 use crate::{Error, ObjectError, ObjectOp, ObjectReply, ObjectRequest, ObjectResponse, Request, Response};
 
@@ -286,6 +287,7 @@ pub(crate) async fn serve<R, W>(
     mut rd: R,
     mut wr: W,
     metrics: Arc<HubMetrics>,
+    mut check: Option<KeyCheck>,
 ) -> crate::Result<()>
 where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
@@ -305,6 +307,12 @@ where
     // Bounds the calls (and so the memory) in flight per connection.
     let permits = Arc::new(tokio::sync::Semaphore::new(QUEUE));
     while let Some(req) = read_plain::<_, ObjectRequest>(&mut rd).await? {
+        if let Some(c) = check.as_mut()
+            && !c.ok().await
+        {
+            debug!(key = c.id, "key revoked; closing storage connection");
+            break;
+        }
         let permit = permits.clone().acquire_owned().await.expect("never closed");
         let store = store.clone();
         let frames = frames.clone();
