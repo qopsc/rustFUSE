@@ -379,3 +379,42 @@ async fn per_machine_keys() {
     assert!(HubClient::connect(&addr, "v", &token, 0).await.is_err());
     assert!(HubClient::connect(&addr, "v", &any, 0).await.is_ok());
 }
+
+#[tokio::test]
+async fn lists_volumes_a_token_opens() {
+    let root: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    // Names sorting just before and after another's objects ('-' and '.'
+    // sort before '/', '0' after it).
+    for name in ["app", "app-b", "app.c", "app0", "zeta"] {
+        let v = Volume::new(Arc::new(PrefixStore::new(
+            root.clone(),
+            &format!("volumes/{name}"),
+        )));
+        v.create().await.unwrap();
+        v.put_changeset(&cs(1, 1)).await.unwrap();
+    }
+    // Objects that are not volumes are left out.
+    root.put("volumes/stray", bytes::Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    root.put(
+        "volumes/partial/log/00000000000000000001",
+        bytes::Bytes::from_static(b"x"),
+    )
+    .await
+    .unwrap();
+    let all = vec!["app", "app-b", "app.c", "app0", "zeta"];
+    assert_eq!(rustfuse_hub::list_volumes(&*root).await.unwrap(), all);
+
+    let addr = start(root.clone()).await;
+    assert_eq!(rustfuse_hub::volumes(&addr, None, "secret").await.unwrap(), all);
+    let (_, token) = rustfuse_hub::keys::create(&*root, "laptop", vec!["app0".into(), "gone".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        rustfuse_hub::volumes(&addr, None, &token).await.unwrap(),
+        vec!["app0"]
+    );
+    let err = rustfuse_hub::volumes(&addr, None, "wrong").await.err().unwrap();
+    assert!(err.to_string().contains("invalid token"), "{err}");
+}

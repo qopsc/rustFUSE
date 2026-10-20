@@ -33,6 +33,10 @@ final class WireTests: XCTestCase {
             .modify(id: a1, source: "/staging/2", mode: 0o755, mtimeNs: -5),
             .delete(id: a1, recursive: true),
             .delete(id: "p746172676574"),
+            .usage,
+            .keep(id: a1, keep: true),
+            .keep(id: rootID, keep: false),
+            .free(id: "p746172676574"),
         ]
         let expected = samples["requests"]!
         XCTAssertEqual(requests.count, expected.count)
@@ -49,11 +53,11 @@ final class WireTests: XCTestCase {
         let file = Item(
             id: a1, parent: rootID, name: "a.txt", kind: .file, size: 12, mode: 0o644,
             mtimeNs: 1_700_000_000_123_456_789, target: nil, contentVersion: "1a.2/12/1700000000123456789",
-            metaVersion: "1a.2/1b.2/644/root/a.txt", downloaded: false, synced: true)
+            metaVersion: "1a.2/1b.2/644/root/a.txt", downloaded: false, synced: true, pinned: false)
         let link = Item(
             id: "n000000000000000000000000000000a2", parent: rootID, name: "link", kind: .symlink, size: 5,
             mode: 0o777, mtimeNs: 0, target: "a.txt", contentVersion: "1c.2/5/0",
-            metaVersion: "1c.2/1c.2/777/root/link", downloaded: true, synced: true)
+            metaVersion: "1c.2/1c.2/777/root/link", downloaded: true, synced: true, pinned: true)
         XCTAssertEqual(
             decoded,
             [
@@ -64,6 +68,12 @@ final class WireTests: XCTestCase {
                 .changes(updated: [], deleted: ["n000000000000000000000000000000a3"], anchor: "00000000000000ff-14"),
                 .path("/volume/a.txt"),
                 .done,
+                .usage(
+                    Usage(
+                        files: 120, total: 9_000_000_000, local: 2_500_000_000, git: 1_500_000_000,
+                        pinned: 400_000_000, cached: 600_000_000),
+                    limit: 21_474_836_480, lazy: true),
+                .usage(Usage(files: 0, total: 0, local: 0, git: 0, pinned: 0, cached: 0), limit: nil, lazy: false),
                 .error(.anchorExpired, "the anchor is from an earlier run"),
             ])
     }

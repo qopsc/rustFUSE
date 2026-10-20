@@ -14,6 +14,7 @@ mod index;
 pub mod lazy;
 pub mod metrics;
 pub mod provider;
+pub mod remote;
 mod replica;
 mod scan;
 mod tree;

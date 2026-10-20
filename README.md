@@ -106,6 +106,18 @@ nobody opened in the last minute, and that have not been changed since
 they were fetched, are emptied again, least recently used first, and
 fetched once more when next opened.
 
+To see what a hub holds without syncing anything:
+
+```sh
+rustfuse volumes --hub hub.example:7420             # volumes the token opens
+rustfuse ls --volume project --hub hub.example:7420 src
+rustfuse get --volume project --hub hub.example:7420 src/docs ./docs
+```
+
+`ls` and `get` read the volume's latest state from the bucket (through the
+hub, or directly with `--bucket`) and write nothing back; add `--json` for
+scripts.
+
 ### Git
 
 - Commits, branches, stashes and worktrees replicate; `git fsck` stays clean.

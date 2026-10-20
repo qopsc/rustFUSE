@@ -12,16 +12,22 @@
     {"op": "modify", "id": "n000000000000000000000000000000a1", "parent": "root", "name": "b.txt"},
     {"op": "modify", "id": "n000000000000000000000000000000a1", "source": "/staging/2", "mode": 493, "mtime_ns": -5},
     {"op": "delete", "id": "n000000000000000000000000000000a1", "recursive": true},
-    {"op": "delete", "id": "p746172676574", "recursive": false}
+    {"op": "delete", "id": "p746172676574", "recursive": false},
+    {"op": "usage"},
+    {"op": "keep", "id": "n000000000000000000000000000000a1", "keep": true},
+    {"op": "keep", "id": "root", "keep": false},
+    {"op": "free", "id": "p746172676574"}
   ],
   "responses": [
-    {"result": "item", "item": {"id": "n000000000000000000000000000000a1", "parent": "root", "name": "a.txt", "kind": "file", "size": 12, "mode": 420, "mtime_ns": 1700000000123456789, "content_version": "1a.2/12/1700000000123456789", "meta_version": "1a.2/1b.2/644/root/a.txt", "downloaded": false, "synced": true}},
-    {"result": "list", "items": [{"id": "n000000000000000000000000000000a2", "parent": "root", "name": "link", "kind": "symlink", "size": 5, "mode": 511, "mtime_ns": 0, "target": "a.txt", "content_version": "1c.2/5/0", "meta_version": "1c.2/1c.2/777/root/link", "downloaded": true, "synced": true}], "next": "link"},
+    {"result": "item", "item": {"id": "n000000000000000000000000000000a1", "parent": "root", "name": "a.txt", "kind": "file", "size": 12, "mode": 420, "mtime_ns": 1700000000123456789, "content_version": "1a.2/12/1700000000123456789", "meta_version": "1a.2/1b.2/644/root/a.txt", "downloaded": false, "synced": true, "pinned": false}},
+    {"result": "list", "items": [{"id": "n000000000000000000000000000000a2", "parent": "root", "name": "link", "kind": "symlink", "size": 5, "mode": 511, "mtime_ns": 0, "target": "a.txt", "content_version": "1c.2/5/0", "meta_version": "1c.2/1c.2/777/root/link", "downloaded": true, "synced": true, "pinned": true}], "next": "link"},
     {"result": "list", "items": []},
     {"result": "anchor", "anchor": "00000000000000ff-13"},
     {"result": "changes", "updated": [], "deleted": ["n000000000000000000000000000000a3"], "anchor": "00000000000000ff-14"},
     {"result": "path", "path": "/volume/a.txt"},
     {"result": "done"},
+    {"result": "usage", "usage": {"files": 120, "total": 9000000000, "local": 2500000000, "git": 1500000000, "pinned": 400000000, "cached": 600000000}, "limit": 21474836480, "lazy": true},
+    {"result": "usage", "usage": {"files": 0, "total": 0, "local": 0, "git": 0, "pinned": 0, "cached": 0}, "lazy": false},
     {"result": "error", "code": "anchor_expired", "message": "the anchor is from an earlier run"}
   ]
 }

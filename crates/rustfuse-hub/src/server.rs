@@ -385,6 +385,7 @@ impl Hub {
         let (volume, token, after) = match read_frame(&mut rd).await? {
             Some(Request::Hello { volume, token, after }) => (volume, token, Some(after)),
             Some(Request::Store { volume, token }) => (volume, token, None),
+            Some(Request::Volumes { token }) => return self.list_volumes(&token, &mut wr).await,
             _ => return Err(Error::Protocol("expected hello".into())),
         };
         if !valid_volume_name(&volume) {
@@ -494,7 +495,7 @@ impl Hub {
                             }
                         }
                     }
-                    Some(Ok(Request::Hello { .. } | Request::Store { .. })) => {
+                    Some(Ok(Request::Hello { .. } | Request::Store { .. } | Request::Volumes { .. })) => {
                         return Err(Error::Protocol("unexpected hello".into()));
                     }
                 },
@@ -526,6 +527,40 @@ impl Drop for AbortOnDrop {
 }
 
 impl Hub {
+    /// Answers [`Request::Volumes`]: every volume for the shared token,
+    /// those a per-machine key opens for a key.
+    async fn list_volumes<W: tokio::io::AsyncWrite + Unpin>(&self, token: &str, wr: &mut W) -> Result<()> {
+        let shared = !self.token.is_empty() && constant_time_eq(token.as_bytes(), self.token.as_bytes());
+        let key = if shared {
+            None
+        } else {
+            match self.keys.verify(token).await {
+                Ok(Some(k)) => Some(k),
+                Ok(None) => {
+                    self.metrics.refused_total.inc();
+                    write_frame(wr, &Response::Error("invalid token".into())).await?;
+                    return Err(Error::Refused("invalid token".into()));
+                }
+                Err(e) => {
+                    let msg = format!("cannot check the key: {e}");
+                    write_frame(wr, &Response::Error(msg.clone())).await?;
+                    return Err(Error::Refused(msg));
+                }
+            }
+        };
+        let mut names = match crate::log::list_volumes(self.root.as_ref()).await {
+            Ok(n) => n,
+            Err(e) => {
+                write_frame(wr, &Response::Error(e.to_string())).await?;
+                return Err(e);
+            }
+        };
+        if let Some(k) = key {
+            names.retain(|v| k.allows(v));
+        }
+        write_frame(wr, &Response::Volumes(names)).await
+    }
+
     /// Checks a token for `volume`: `None` for the shared token, the key
     /// id for a per-machine key, or why it is refused.
     async fn authorize(&self, token: &str, volume: &str) -> std::result::Result<Option<String>, String> {

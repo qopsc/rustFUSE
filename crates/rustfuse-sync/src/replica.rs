@@ -109,6 +109,8 @@ pub struct Replica {
     lazy: bool,
     /// Nodes changed on disk this run, for the File Provider.
     changes: crate::provider::ChangeLog,
+    /// What the user asked to keep downloaded (lazy directories).
+    pins: Option<Arc<crate::lazy::Pins>>,
 }
 
 /// Creates the state folder, hidden from git (and tools honouring
@@ -250,6 +252,7 @@ impl Replica {
             checked_packs: HashMap::new(),
             metrics: Arc::default(),
             changes: crate::provider::ChangeLog::new(),
+            pins: None,
         })
     }
 
@@ -273,6 +276,20 @@ impl Replica {
     /// The synced directory (canonical).
     pub fn root_dir(&self) -> &Path {
         &self.root
+    }
+
+    /// Shares the pins of a lazy directory's [`Hydrator`](crate::lazy::Hydrator)
+    /// with the File Provider answers.
+    pub fn set_pins(&mut self, pins: Arc<crate::lazy::Pins>) {
+        self.pins = Some(pins);
+    }
+
+    pub(crate) fn pins(&self) -> Option<&crate::lazy::Pins> {
+        self.pins.as_deref()
+    }
+
+    pub(crate) fn change_log_mut(&mut self) -> &mut crate::provider::ChangeLog {
+        &mut self.changes
     }
 
     pub(crate) fn change_log(&self) -> &crate::provider::ChangeLog {

@@ -69,6 +69,30 @@ pub enum Event {
     Pushed { local: u64, seq: u64 },
 }
 
+/// The volumes in the hub's bucket that `token` opens, by name.
+pub async fn volumes(
+    addr: &str,
+    tls: Option<&Arc<rustls::ClientConfig>>,
+    token: &str,
+) -> Result<Vec<String>> {
+    let (mut rd, mut wr) = connect_stream(addr, tls).await?;
+    write_frame(
+        &mut wr,
+        &Request::Volumes {
+            token: token.to_owned(),
+        },
+    )
+    .await?;
+    match read_frame(&mut rd).await? {
+        Some(Response::Volumes(v)) => Ok(v),
+        Some(Response::Error(e)) => Err(Error::Refused(e)),
+        Some(other) => Err(Error::Protocol(format!("unexpected {other:?}"))),
+        None => Err(Error::Protocol(
+            "hub closed the connection (is it older than this machine's rustfuse?)".into(),
+        )),
+    }
+}
+
 /// A connection to the hub for one volume.
 pub struct HubClient {
     wr: Writer,

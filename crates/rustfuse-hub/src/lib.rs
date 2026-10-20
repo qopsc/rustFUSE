@@ -28,8 +28,8 @@ pub mod tls;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-pub use client::{Event, HubClient};
-pub use log::Volume;
+pub use client::{Event, HubClient, volumes};
+pub use log::{Volume, list_volumes};
 pub use server::{Hub, HubMetrics};
 pub use store::HubStore;
 
@@ -80,6 +80,9 @@ pub enum Request {
     /// [`ObjectResponse`] frames without zstd (the data is already
     /// compressed), any number in flight.
     Store { volume: String, token: String },
+    /// First and only message: list the volumes this token opens.
+    /// Answered with [`Response::Volumes`].
+    Volumes { token: String },
 }
 
 /// One object-store call over a storage connection; keys are relative to
@@ -163,6 +166,8 @@ pub enum Response {
     Error(String),
     /// A storage connection is open.
     StoreReady,
+    /// The volumes in the bucket that the token opens, by name.
+    Volumes(Vec<String>),
 }
 
 /// Volume names become bucket key segments, so keep them plain.

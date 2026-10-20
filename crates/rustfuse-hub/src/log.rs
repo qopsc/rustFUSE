@@ -35,6 +35,39 @@ fn snap_key(seq: u64) -> String {
     format!("snap/{seq:020}")
 }
 
+/// Names of the volumes under `root` (the bucket prefix holding
+/// `volumes/`), sorted. One listing call per volume: each skips past the
+/// previous volume's objects.
+pub async fn list_volumes(root: &dyn ObjectStore) -> Result<Vec<String>> {
+    const PREFIX: &str = "volumes/";
+    let mut out = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = root.list(PREFIX, after.as_deref(), 1).await?;
+        let Some(obj) = page.objects.first() else {
+            out.sort();
+            return Ok(out);
+        };
+        let rest = &obj.key[PREFIX.len().min(obj.key.len())..];
+        let Some((name, _)) = rest.split_once('/') else {
+            // A stray object right under `volumes/`.
+            after = Some(obj.key.clone());
+            continue;
+        };
+        if crate::valid_volume_name(name)
+            && root
+                .head(&format!("{PREFIX}{name}/{VOLUME_KEY}"))
+                .await?
+                .is_some()
+        {
+            out.push(name.to_owned());
+        }
+        // Volume names are ASCII and every key below them is too, so this
+        // sorts after all of this volume's objects.
+        after = Some(format!("{PREFIX}{name}/\u{7f}"));
+    }
+}
+
 fn seq_of(key: &str) -> Option<u64> {
     key.rsplit('/').next()?.parse().ok()
 }

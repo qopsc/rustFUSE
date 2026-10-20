@@ -83,10 +83,15 @@ enum Command {
         /// Sync once and exit instead of running continuously.
         #[arg(long, conflicts_with = "metrics")]
         once: bool,
-        /// Answer the macOS File Provider extension on this Unix socket
-        /// (used by the rustfuse Mac app; `docs/design.md` §2.2).
+        /// Answer the rustfuse Mac app and its File Provider extension on
+        /// this Unix socket (`docs/design.md` §2.2).
         #[arg(long, conflicts_with = "once")]
         provider_socket: Option<PathBuf>,
+        /// For a directory attached with `--lazy`: keep at most this much
+        /// fetched content (e.g. 20G), dropping files not opened lately
+        /// back to placeholders. Without it, fetched files stay.
+        #[arg(long, value_parser = parse_size, conflicts_with = "once")]
+        cache_size: Option<u64>,
         #[command(flatten)]
         opts: SyncOpts,
     },
@@ -115,6 +120,10 @@ enum Command {
         /// back to placeholders. Without it, fetched files stay.
         #[arg(long, value_parser = parse_size)]
         cache_size: Option<u64>,
+        /// Answer the rustfuse Mac app on this Unix socket (usage, keep
+        /// downloaded, free up space).
+        #[arg(long, conflicts_with = "no_sync")]
+        provider_socket: Option<PathBuf>,
         #[command(flatten)]
         opts: SyncOpts,
     },
@@ -137,6 +146,52 @@ enum Command {
         cache_size: Option<u64>,
         #[command(flatten)]
         opts: SyncOpts,
+    },
+    /// List the volumes in the bucket that the hub token opens (through
+    /// the hub, or straight from the bucket with --bucket).
+    Volumes {
+        /// Print JSON (an array of names).
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        hub: HubArgs,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+    },
+    /// List a folder of a volume as the bucket holds it, without a synced
+    /// directory.
+    Ls {
+        #[arg(long)]
+        volume: String,
+        /// Folder inside the volume; the top by default.
+        path: Option<PathBuf>,
+        /// Print JSON (`{"seq": .., "entries": [..]}`).
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        hub: HubArgs,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
+    },
+    /// Download a file or folder of a volume from the bucket, without a
+    /// synced directory.
+    Get {
+        #[arg(long)]
+        volume: String,
+        /// File or folder inside the volume.
+        path: PathBuf,
+        /// Where to put it; must not exist yet.
+        dest: PathBuf,
+        #[command(flatten)]
+        hub: HubArgs,
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(flatten)]
+        creds: Credentials,
     },
     /// Show the volume, sync position and local changes not yet captured.
     Status { dir: PathBuf },
@@ -438,6 +493,20 @@ fn mib(bytes: u64) -> String {
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// A volume's tree read from the bucket (through the hub unless
+/// `--bucket` is given).
+async fn remote_tree(
+    volume: String,
+    hub: &HubArgs,
+    store: &StoreArgs,
+    creds: &Credentials,
+) -> Result<rustfuse_sync::remote::RemoteTree> {
+    let spec = hub.spec()?;
+    let config = store.config(volume, hub)?;
+    let s = volume_store(&config, creds, &spec).await?;
+    Ok(rustfuse_sync::remote::RemoteTree::load(s).await?)
+}
+
 /// One sync round after init/attach; failing it is not fatal, since `sync`
 /// catches up later.
 async fn first_sync(r: &mut Replica, hub: &HubSpec) {
@@ -572,6 +641,7 @@ async fn prepare_serving(
     dir: &Path,
     no_sync: bool,
     cache_size: Option<u64>,
+    provider_socket: Option<PathBuf>,
     opts: &SyncOpts,
 ) -> Result<(
     Arc<rustfuse_mount::Backing>,
@@ -614,9 +684,32 @@ async fn prepare_serving(
         }));
     }
     let backing = Arc::new(backing);
-    match (cache_size, hydrator) {
+    let b = backing.clone();
+    let in_use: InUse = Arc::new(move |ino| b.in_use(ino));
+    let sync = serve_sync(dir, r, spec, opts, hydrator, cache_size, in_use, provider_socket).await?;
+    Ok((backing, Some(sync)))
+}
+
+/// Files a mount has open, by inode.
+type InUse = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
+/// Starts syncing `dir` with what runs beside it: keeping fetched content
+/// within `cache_size`, and the Mac app's socket. The future ends when any
+/// of them fails.
+#[allow(clippy::too_many_arguments)]
+async fn serve_sync(
+    dir: &Path,
+    mut r: Replica,
+    spec: HubSpec,
+    opts: &SyncOpts,
+    hydrator: Option<Arc<rustfuse_sync::lazy::Hydrator>>,
+    cache_size: Option<u64>,
+    in_use: InUse,
+    provider_socket: Option<PathBuf>,
+) -> Result<impl std::future::Future<Output = Result<()>> + use<>> {
+    match (cache_size, &hydrator) {
         (Some(budget), Some(h)) => {
-            tokio::spawn(keep_within(budget, h, backing.clone()));
+            tokio::spawn(keep_within(budget, h.clone(), in_use.clone()));
         }
         (Some(_), None) => bail!(
             "--cache-size needs a directory attached with --lazy; {} holds every file",
@@ -624,21 +717,45 @@ async fn prepare_serving(
         ),
         _ => {}
     }
-    let sync = start_sync(dir, r, spec, opts, None).await?;
-    Ok((backing, Some(sync)))
+    if let Some(h) = &hydrator {
+        r.set_pins(h.pins());
+    }
+    let mut calls = None;
+    let mut provider = None;
+    if let Some(sock) = provider_socket {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        calls = Some(rx);
+        println!("Answering the Mac app on {}.", sock.display());
+        let serving = rustfuse_sync::provider::Serving {
+            root: dir.canonicalize().with_context(|| format!("{}", dir.display()))?,
+            hydrator,
+            cache_size,
+            in_use: Some(in_use),
+        };
+        provider = Some(rustfuse_sync::provider::serve(sock, tx, serving));
+    }
+    let sync = start_sync(dir, r, spec, opts, calls).await?;
+    Ok(async move {
+        let provider = async move {
+            match provider {
+                Some(p) => p.await.context("Mac app socket"),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            res = sync => res,
+            res = provider => res,
+        }
+    })
 }
 
 /// Keeps fetched content in a lazy directory within `budget` bytes.
-async fn keep_within(
-    budget: u64,
-    h: Arc<rustfuse_sync::lazy::Hydrator>,
-    backing: Arc<rustfuse_mount::Backing>,
-) {
+async fn keep_within(budget: u64, h: Arc<rustfuse_sync::lazy::Hydrator>, in_use: InUse) {
     let mut every = tokio::time::interval(Duration::from_secs(30));
     loop {
         every.tick().await;
-        let (h, b) = (h.clone(), backing.clone());
-        match tokio::task::spawn_blocking(move || h.evict(budget, |ino| b.in_use(ino))).await {
+        let (h, in_use) = (h.clone(), in_use.clone());
+        match tokio::task::spawn_blocking(move || h.evict(budget, |ino| in_use(ino))).await {
             Ok(Ok(e)) if e.files > 0 => tracing::info!(
                 files = e.files,
                 mib = e.bytes >> 20,
@@ -694,6 +811,7 @@ async fn mount(
     fuse: &rustfuse_mount::FuseOpts,
     no_sync: bool,
     cache_size: Option<u64>,
+    provider_socket: Option<PathBuf>,
     opts: &SyncOpts,
 ) -> Result<()> {
     if !rustfuse_mount::FUSE {
@@ -702,7 +820,7 @@ async fn mount(
              or install macFUSE (https://macfuse.github.io) and build with `--features macfuse`"
         );
     }
-    let (backing, sync) = prepare_serving(dir, no_sync, cache_size, opts).await?;
+    let (backing, sync) = prepare_serving(dir, no_sync, cache_size, provider_socket, opts).await?;
     let mut fuse = fuse.clone();
     if fuse.volname.is_none() {
         fuse.volname = dir.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -726,7 +844,7 @@ async fn serve_nfs(
     cache_size: Option<u64>,
     opts: &SyncOpts,
 ) -> Result<()> {
-    let (backing, sync) = prepare_serving(dir, no_sync, cache_size, opts).await?;
+    let (backing, sync) = prepare_serving(dir, no_sync, cache_size, None, opts).await?;
     let server = rustfuse_mount::NfsServer::bind(backing, listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
@@ -876,6 +994,7 @@ async fn run(cli: Cli) -> Result<()> {
             dir,
             once,
             provider_socket,
+            cache_size,
             opts,
         } => {
             if once {
@@ -889,32 +1008,30 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 let (r, spec) = open_replica(&dir, &opts).await?;
-                let mut calls = None;
-                let mut provider = None;
-                if let Some(sock) = provider_socket {
-                    let hydrator = if rustfuse_sync::lazy::is_lazy(&dir) {
-                        Some(Arc::new(rustfuse_sync::lazy::Hydrator::new(
-                            &dir,
-                            r.store().clone(),
-                        )?))
-                    } else {
-                        None
-                    };
-                    let (tx, rx) = tokio::sync::mpsc::channel(64);
-                    calls = Some(rx);
-                    println!("Answering the File Provider on {}.", sock.display());
-                    provider = Some(rustfuse_sync::provider::serve(sock, tx, hydrator));
-                }
-                let provider = async move {
-                    match provider {
-                        Some(p) => p.await.context("File Provider socket"),
-                        None => std::future::pending().await,
-                    }
+                let hydrator = if rustfuse_sync::lazy::is_lazy(&dir) {
+                    Some(Arc::new(rustfuse_sync::lazy::Hydrator::new(
+                        &dir,
+                        r.store().clone(),
+                    )?))
+                } else {
+                    None
                 };
-                let sync = start_sync(&dir, r, spec, &opts, calls).await?;
+                // Programs open files in the directory itself: none is
+                // known to be open, so eviction relies on recent use.
+                let in_use: InUse = Arc::new(|_| false);
+                let sync = serve_sync(
+                    &dir,
+                    r,
+                    spec,
+                    &opts,
+                    hydrator,
+                    cache_size,
+                    in_use,
+                    provider_socket,
+                )
+                .await?;
                 tokio::select! {
                     res = sync => res?,
-                    res = provider => res?,
                     _ = tokio::signal::ctrl_c() => {}
                 }
             }
@@ -926,6 +1043,7 @@ async fn run(cli: Cli) -> Result<()> {
             fskit,
             no_sync,
             cache_size,
+            provider_socket,
             opts,
         } => {
             let fuse = rustfuse_mount::FuseOpts {
@@ -933,7 +1051,16 @@ async fn run(cli: Cli) -> Result<()> {
                 fskit,
                 volname: None,
             };
-            mount(&dir, &mountpoint, &fuse, no_sync, cache_size, &opts).await?
+            mount(
+                &dir,
+                &mountpoint,
+                &fuse,
+                no_sync,
+                cache_size,
+                provider_socket,
+                &opts,
+            )
+            .await?
         }
         Command::Nfs {
             dir,
@@ -942,6 +1069,75 @@ async fn run(cli: Cli) -> Result<()> {
             cache_size,
             opts,
         } => serve_nfs(&dir, &listen, no_sync, cache_size, &opts).await?,
+        Command::Volumes {
+            json,
+            hub,
+            store,
+            creds,
+        } => {
+            let names = if store.bucket.is_some() {
+                let root = store.connect(&creds, &store.prefix).await?;
+                rustfuse_hub::list_volumes(&root).await?
+            } else {
+                let spec = hub.spec()?;
+                rustfuse_hub::volumes(&spec.addr, spec.tls.as_ref(), &spec.token)
+                    .await
+                    .with_context(|| format!("list volumes at {}", spec.addr))?
+            };
+            if json {
+                println!("{}", serde_json::to_string(&names)?);
+            } else if names.is_empty() {
+                println!("No volumes.");
+            } else {
+                for n in names {
+                    println!("{n}");
+                }
+            }
+        }
+        Command::Ls {
+            volume,
+            path,
+            json,
+            hub,
+            store,
+            creds,
+        } => {
+            let tree = remote_tree(volume, &hub, &store, &creds).await?;
+            let entries = tree.list(&path.unwrap_or_default())?;
+            if json {
+                let out = serde_json::json!({ "seq": tree.seq(), "entries": entries });
+                println!("{out}");
+            } else {
+                for e in entries {
+                    let (kind, suffix) = match e.kind {
+                        rustfuse_sync::provider::Kind::Dir => ('d', "/".to_owned()),
+                        rustfuse_sync::provider::Kind::Symlink => {
+                            ('l', format!(" -> {}", e.target.unwrap_or_default()))
+                        }
+                        rustfuse_sync::provider::Kind::File => ('-', String::new()),
+                    };
+                    println!("{kind} {:o} {:>12}  {}{suffix}", e.mode, e.size, e.name);
+                }
+            }
+        }
+        Command::Get {
+            volume,
+            path,
+            dest,
+            hub,
+            store,
+            creds,
+        } => {
+            let tree = remote_tree(volume, &hub, &store, &creds).await?;
+            let d = tree.download(&path, &dest).await?;
+            println!(
+                "Downloaded {} files ({}) and {} folders to {}.",
+                d.files,
+                mib(d.bytes),
+                d.dirs,
+                dest.display()
+            );
+        }
         Command::Status { dir } => {
             let config = Replica::config_of(&dir)?;
             // Status only reads local state; no store access needed.
