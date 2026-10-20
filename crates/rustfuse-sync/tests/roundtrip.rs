@@ -1873,11 +1873,15 @@ async fn keep_downloaded_free_up_space_and_usage() {
     let big_id = format!("n{:032x}", r.tree().resolve(Path::new(big)).unwrap().0);
     let big_item = item(ask(&mut r, provider::Request::Item { id: big_id }).await);
     assert!(big_item.pinned, "inside a pinned folder");
-    // The folder is fetched in the background, a file at a time.
+    // The folder is fetched in the background, a file at a time; a file
+    // is done once its fill is noted (after its content is written).
     let fetched = || {
-        [big, medium]
-            .iter()
-            .all(|f| fs::read(lazy.join(f)).unwrap() == fs::read(src.join(f)).unwrap())
+        let notes = fs::read_dir(lazy.join(STATE_DIR).join("lazy"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".filled"))
+            .count();
+        notes == 2
     };
     for _ in 0..1000 {
         if fetched() {
@@ -1911,6 +1915,9 @@ async fn keep_downloaded_free_up_space_and_usage() {
     );
     assert!(fs::read(lazy.join(big)).unwrap().iter().all(|&b| b == 0));
     assert!(fs::read(lazy.join(medium)).unwrap().iter().all(|&b| b == 0));
+    // A fetch still running for the folder stops once it is freed.
+    assert_eq!(h.hydrate_all(Path::new("src/nested")).await.unwrap(), 0);
+    assert!(fs::read(lazy.join(big)).unwrap().iter().all(|&b| b == 0));
     assert!(
         !item(
             ask(

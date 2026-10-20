@@ -346,11 +346,15 @@ impl Hydrator {
     }
 
     /// Fills in every placeholder at or below `rel` (relative to the
-    /// root), as for a folder just pinned. Returns how many were fetched.
+    /// root), as for a folder just pinned. Stops once `rel` is no longer
+    /// pinned (freed meanwhile). Returns how many were fetched.
     pub async fn hydrate_all(&self, rel: &Path) -> Result<usize> {
         let mut n = 0;
         let mut stack = vec![self.root.join(rel)];
         while let Some(path) = stack.pop() {
+            if !self.pins.covers(rel) {
+                break;
+            }
             let Ok(m) = fs::symlink_metadata(&path) else {
                 continue;
             };
