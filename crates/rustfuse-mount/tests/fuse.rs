@@ -1,13 +1,12 @@
 //! Mounts a directory through FUSE and works on it like a user would.
-//! Skipped where FUSE mounts are not possible (no /dev/fuse, not allowed).
-
-#![cfg(target_os = "linux")]
+//! Skipped where FUSE mounts are not possible (no /dev/fuse or macFUSE,
+//! not allowed, or a build without FUSE).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
-use rustfuse_mount::{Backing, mount_fuse};
+use rustfuse_mount::{Backing, FuseOpts, mount_fuse};
 
 #[test]
 fn files_written_through_the_mount_land_in_the_directory() {
@@ -16,7 +15,7 @@ fn files_written_through_the_mount_land_in_the_directory() {
     fs::create_dir(dir.path().join(".rustfuse")).unwrap();
     fs::write(dir.path().join("old.txt"), "old").unwrap();
     let backing = Arc::new(Backing::new(dir.path(), &[".rustfuse"]).unwrap());
-    let m = match mount_fuse(backing, mnt.path(), false) {
+    let m = match mount_fuse(backing, mnt.path(), &FuseOpts::default()) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("skipping: cannot mount FUSE here: {e}");

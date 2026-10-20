@@ -8,6 +8,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# FUSE mounts on macOS through macFUSE, which must be installed to build
+# and run with it (Linux always has FUSE).
+macfuse = ["rustfuse-mount/macfuse"]
+
 [dependencies]
 anyhow = "1.0.104"
 bytes = "1.12.1"

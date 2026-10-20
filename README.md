@@ -79,6 +79,9 @@ keeps it in sync, and writes through it sync like edits in the directory:
 ```sh
 # Linux, FUSE:
 rustfuse mount ~/src/project /mnt/project
+# macOS with macFUSE (build with `cargo install --path crates/rustfuse --features macfuse`);
+# --fskit uses its FSKit backend, which needs no kernel extension:
+rustfuse mount ~/src/project /Volumes/project --fskit
 # Any OS with an NFS client (macOS needs nothing extra), or other machines:
 rustfuse nfs ~/src/project --listen 127.0.0.1:20490
 sudo mount -t nfs -o vers=3,tcp,port=20490,mountport=20490,locallocks 127.0.0.1:/ /Volumes/project   # macOS
