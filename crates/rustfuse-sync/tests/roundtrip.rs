@@ -1188,3 +1188,64 @@ async fn unsent_changes_survive_cleanup_of_their_content() {
     Replica::attach(&late, cfg, c.volume.clone()).await.unwrap();
     assert_same(c.dir(0), &late);
 }
+
+async fn pack_bytes(c: &Cluster) -> u64 {
+    let page = c.volume.list("pack/", None, 10_000).await.unwrap();
+    page.objects.iter().map(|o| o.size).sum()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_moves_used_chunks_and_old_references_still_work() {
+    let keep = pseudo_random(1 << 20, 41);
+    let (k, d) = (keep.clone(), pseudo_random(10 << 20, 42));
+    // Both files land in the same pack.
+    let mut c = Cluster::new(3, move |root: &Path| {
+        sample_tree(root);
+        fs::write(root.join("keep.bin"), &k).unwrap();
+        fs::write(root.join("drop.bin"), &d).unwrap();
+    })
+    .await;
+    fs::remove_file(c.dir(0).join("drop.bin")).unwrap();
+    c.sync(0).await;
+    c.sync(1).await;
+    // Machine 2 lags. Machine 0 copies the file it keeps while offline:
+    // the copy reuses the stored chunks, so its change points into the
+    // old pack.
+    fs::copy(c.dir(0).join("keep.bin"), c.dir(0).join("keep-copy.bin")).unwrap();
+    let before = pack_bytes(&c).await;
+
+    let st = gc_at(&c, 30, Duration::ZERO).await;
+    assert_eq!(st.compacted, 1, "{st:?}");
+    assert!(st.compacted_to < st.compacted_from / 2, "{st:?}");
+    let st = gc_at(&c, 30, Duration::from_secs(7200)).await;
+    assert_eq!(st.deleted, 1, "{st:?}");
+    assert!(pack_bytes(&c).await < before - (8 << 20));
+    // A restarted machine 0 (its pack checks start over) sends the copy.
+    let store = c.replicas[0].store().clone();
+    let dir = c.dir(0).to_path_buf();
+    drop(c.replicas.remove(0));
+    c.replicas.insert(0, Replica::open(&dir, store).unwrap());
+
+    // The snapshot and the log still name the old pack; everyone reads
+    // through the forwarding table.
+    c.settle().await;
+    for i in 0..3 {
+        assert_eq!(fs::read(c.dir(i).join("keep.bin")).unwrap(), keep);
+        assert_eq!(fs::read(c.dir(i).join("keep-copy.bin")).unwrap(), keep);
+        assert!(!c.dir(i).join("drop.bin").exists());
+    }
+    let late = c._tmp.path().join("late");
+    let mut cfg = config("vol", 99);
+    cfg.hub = Some(c.hub.addr.clone());
+    Replica::attach(&late, cfg, c.volume.clone()).await.unwrap();
+    assert_same(c.dir(0), &late);
+
+    // Settled: nothing more to do, and the forwarding table stays while
+    // anything names the old pack.
+    let st = gc_at(&c, 31, Duration::ZERO).await;
+    assert_eq!(
+        (st.compacted, st.marked, st.deleted, st.forwards_deleted),
+        (0, 0, 0, 0),
+        "{st:?}"
+    );
+}

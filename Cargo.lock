@@ -2181,6 +2181,7 @@ dependencies = [
  "fastcdc",
  "futures",
  "getrandom 0.4.3",
+ "postcard",
  "rustfuse-store",
  "rustfuse-types",
  "thiserror",

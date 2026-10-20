@@ -99,6 +99,10 @@ enum Command {
         /// packs written within it.
         #[arg(long, default_value_t = 14)]
         retention_days: u64,
+        /// Minutes between marking a pack and deleting it; machines trust a
+        /// pack check for five, so keep this well above that.
+        #[arg(long, default_value_t = 60)]
+        delay_minutes: u64,
         /// Only report what would be deleted.
         #[arg(long)]
         dry_run: bool,
@@ -587,6 +591,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Gc {
             volume,
             retention_days,
+            delay_minutes,
             dry_run,
             store,
             creds,
@@ -603,24 +608,38 @@ async fn run(cli: Cli) -> Result<()> {
             let s: Arc<dyn ObjectStore> = Arc::new(store.connect(&creds, &prefix).await?);
             let opts = rustfuse_sync::gc::GcOptions {
                 retention: Duration::from_secs(retention_days * 24 * 3600),
+                delay: Duration::from_secs(delay_minutes * 60),
                 dry_run,
                 ..Default::default()
             };
             let st = rustfuse_sync::gc::collect(s, &opts).await?;
-            let verb = if dry_run { "would delete" } else { "deleted" };
+            let (marked, compacted) = if dry_run {
+                ("would mark", "would compact")
+            } else {
+                ("marked", "compacted")
+            };
             println!(
-                "{} packs ({}), {} in use. Marked {} unused, {} {} ({}), {} waiting, {} back in use; {} old snapshots {}.",
+                "{} packs ({}), {} in use.",
                 st.packs,
                 mib(st.pack_bytes),
-                st.used_packs,
+                st.used_packs
+            );
+            println!(
+                "{marked} {} unused and {compacted} {} sparse ({} -> {}) for deletion in a later run.",
                 st.marked,
-                verb,
+                st.compacted,
+                mib(st.compacted_from),
+                mib(st.compacted_to)
+            );
+            println!(
+                "{} {} marked earlier ({}); {} still waiting, {} in use again; {} old snapshots, {} forwarding tables.",
+                if dry_run { "Would delete" } else { "Deleted" },
                 st.deleted,
                 mib(st.deleted_bytes),
                 st.waiting,
                 st.revived,
                 st.snapshots_deleted,
-                verb,
+                st.forwards_deleted,
             );
         }
         Command::Bench(args) => bench::bench(args).await?,

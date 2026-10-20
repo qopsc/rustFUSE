@@ -154,8 +154,7 @@ replicas converge to the same result).
   larger threshold costs memory on trees with many small files (§8.1).
 - Chunks are batched into **pack objects** (~8–32 MiB) per push, with an
   index, so a 100k-file repo is not 100k S3 PUTs. Packs are immutable;
-  cleanup deletes unused ones (§5.5) and compaction (Phase 5) will
-  rewrite sparse ones.
+  cleanup deletes unused ones and compacts sparse ones (§5.5).
 - Optional zstd compression and client-side encryption per chunk.
 - Each daemon keeps a local **chunk cache** so applying remote ops for
   content it already has costs nothing.
@@ -193,6 +192,20 @@ the hour, so the deleting run sees it and keeps the pack.
 
 A machine catching up applies the whole log before it updates the disk, so
 it never fetches files that are gone again by the time it is up to date.
+
+**Compaction.** A pack written before the retention window whose used
+chunks fill less than half of it (and at least 1 MiB is unused) is
+compacted: its used chunks are copied, verified, into a new pack, a
+forwarding table `fwd/<pack>` records where each chunk went (by its old
+offset), and only then the old pack gets a tombstone like an unused one.
+Nothing that names the old pack is rewritten: readers that find it gone
+follow the table (up to 8 hops, for a pack compacted again), cleanup counts
+the new pack as used, and a machine checking its unsent changes points them
+at the new place. A table is dropped once its pack is gone and nothing
+names it directly. Measured on a 700 MB repository (24k loose objects,
+then `git gc`): the bucket held 199 MiB after syncing the gc; one run
+compacted 7 packs (112 MiB into 30 MiB) in 1.4 s, and the next deleted
+the originals, leaving 117 MiB.
 
 ## 6. Change capture and apply
 
@@ -429,7 +442,7 @@ crates/
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
-| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots (**done**), compaction of sparse packs, metrics, HA notes |
+| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics, HA notes |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
 ## 13. Decisions and open questions
