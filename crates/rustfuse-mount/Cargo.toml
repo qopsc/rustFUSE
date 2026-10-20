@@ -1,0 +1,26 @@
+[package]
+name = "rustfuse-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Serves a synced rustFUSE directory as a FUSE or NFS mount"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+nfsserve = "0.11.0"
+rustix = { version = "1.1.5", features = ["fs", "std"] }
+tokio = { version = "1.53.3", features = ["rt", "net", "sync"] }
+tracing = "0.1.44"
+
+# FUSE is Linux-only: on macOS it needs the macFUSE kernel extension, so
+# macOS mounts go through the built-in NFS client instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.18.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "process", "time"] }
