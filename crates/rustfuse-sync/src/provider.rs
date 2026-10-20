@@ -688,6 +688,29 @@ fn set_attrs(path: &Path, kind: Kind, mode: Option<u32>, mtime_ns: Option<i64>) 
 /// A request and where its answer goes.
 pub type Call = (Request, oneshot::Sender<Response>);
 
+/// `path` relative to `root`, when one of them is reached through a
+/// symlink and the other is not (macOS: `/var` is `/private/var`).
+fn relative_to(root: &Path, path: &Path) -> PathBuf {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.to_owned();
+    }
+    let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    // The item itself may be a symlink: resolve only its parent.
+    let canon = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| path.to_owned()),
+        _ => fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()),
+    };
+    if canon == canon_root {
+        return PathBuf::new();
+    }
+    canon
+        .strip_prefix(&canon_root)
+        .map(Path::to_owned)
+        .unwrap_or_else(|_| path.to_owned())
+}
+
 /// What the socket server needs beside the sync loop.
 #[derive(Clone)]
 pub struct Serving {
@@ -775,7 +798,7 @@ async fn answer(req: Request, calls: &mpsc::Sender<Call>, serving: &Serving) -> 
         }
         return resp;
     }
-    let rel = path.strip_prefix(&serving.root).unwrap_or(path).to_owned();
+    let rel = relative_to(&serving.root, path);
     if keep {
         // A folder can take long to fetch: answer now, fetch behind.
         let h = h.clone();

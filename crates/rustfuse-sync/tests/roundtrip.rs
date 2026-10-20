@@ -1826,8 +1826,11 @@ async fn keep_downloaded_free_up_space_and_usage() {
 
     let sock = c._tmp.path().join("pins.sock");
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    // Served through a symlink, as on macOS where /var is /private/var.
+    let link = c._tmp.path().join("lazy-link");
+    symlink(&lazy, &link).unwrap();
     let serving = provider::Serving {
-        root: lazy.clone(),
+        root: link,
         hydrator: Some(h.clone()),
         cache_size: Some(20 << 30),
         in_use: None,
