@@ -182,7 +182,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     /// requests be used from any thread, but its Objective-C API does not
     /// say so to Swift, so they are handed over unchecked.
     private func run(_ fail: @escaping (Error) -> Void, _ work: @escaping () throws -> Void) -> Progress {
-        nonisolated(unsafe) let progress = Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
         nonisolated(unsafe) let work = work
         nonisolated(unsafe) let fail = fail
         DispatchQueue.global(qos: .userInitiated).async {
