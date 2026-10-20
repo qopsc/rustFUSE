@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–5 implemented; Phase 6 started (read/write FUSE and NFS mounts)** · 2026-10-20
+Status: **Phases 0–5 implemented; Phase 6: read/write FUSE and NFS mounts, lazy directories** · 2026-10-20
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -76,8 +76,32 @@ deleted or renamed it) answers ENOENT, and an NFS handle to it ESTALE.
 NFS has no authentication: anyone who can reach the port can read and write
 the volume, so it listens on loopback by default. Writes are answered
 FILE_SYNC; the server does not implement COMMIT or LINK, which clients
-handle. Lazy hydration (fetching file content on first read instead of
-keeping the full copy) is the next step.
+handle.
+
+**Lazy directories.** `rustfuse attach --lazy` leaves file content in the
+bucket until a mount first opens the file (`rustfuse-sync/src/lazy.rs`).
+The applier writes a *placeholder* for each chunked file: a sparse file of
+the right size, mode and modification time, marked with the extended
+attribute `user.rustfuse.lazy`, which names a record in `.rustfuse/lazy/`
+holding the file's chunk list. `stat`, and so `git status`, sees the real
+size and time without a download. Git's own data (`.git/`) and small inline
+files are always written in full, since git and the git pass read them
+directly.
+
+Before opening a file (or truncating it), the mount asks the hydrator to
+fill it in: it fetches the chunks and writes them into the placeholder
+through an open descriptor, restores the modification time and removes the
+attribute. The applier always renames a new version into place, so a
+placeholder filled in at the same time as a newer version arrives never
+overwrites it. When capturing, a file still marked as a placeholder counts
+as holding its recorded content, so changing a placeholder's metadata
+never syncs zeros. Records nothing points at any more are pruned when the
+directory is opened.
+
+A lazy directory must be used through its mount: read directly, files not
+fetched yet look empty, and its sync must run in the mount's process. After
+a diverged branch, the git pass cannot compare placeholder files with
+either commit, so it leaves them as they are instead of restoring them.
 
 ## 3. Prior art
 
@@ -550,7 +574,7 @@ crates/
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
 | **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
-| **6. Optional mount** | Read/write FUSE (Linux) and NFS (Linux, macOS) frontends over the replica, §2.1 (**done**); lazy hydration (fetch content on first read) next |
+| **6. Optional mount** | Read/write FUSE (Linux) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1 (**done**). Possible later: dropping fetched content again to free space |
 
 ## 13. Decisions and open questions
 

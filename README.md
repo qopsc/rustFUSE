@@ -87,6 +87,16 @@ sudo mount -t nfs -o vers=3,tcp,port=20490,mountport=20490,nolock 127.0.0.1:/ /m
 
 NFS has no authentication; listen on a trusted network only.
 
+To avoid downloading a large volume up front, attach it lazily and use it
+only through a mount: files keep their real size and date, and content is
+fetched the first time something opens a file (git data always comes in
+full, so `git status` and `git log` need no downloads):
+
+```sh
+rustfuse attach --lazy ~/.rustfuse/project --volume project
+rustfuse mount ~/.rustfuse/project ~/src/project
+```
+
 ### Git
 
 - Commits, branches, stashes and worktrees replicate; `git fsck` stays clean.

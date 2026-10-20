@@ -32,6 +32,8 @@ const WINDOW_BYTES: u64 = 64 << 20;
 pub struct Applier<'a> {
     pub root: &'a Path,
     pub store: Arc<dyn ObjectStore>,
+    /// Write placeholders instead of fetching content (`crate::lazy`).
+    pub lazy: bool,
 }
 
 fn remove_any(path: &Path) -> std::io::Result<()> {
@@ -161,6 +163,10 @@ impl Applier<'_> {
         let mut batch: Vec<(&NodeChange, PathBuf)> = Vec::new();
         let mut batch_bytes = 0u64;
         for item in to_fetch {
+            if self.lazy && !crate::lazy::always_full(item.1.strip_prefix(self.root).unwrap_or(&item.1)) {
+                stats.push(self.write_placeholder(item.0, &item.1)?);
+                continue;
+            }
             let size = match &item.0.new.as_ref().unwrap().content {
                 Content::File { size, .. } => *size,
                 _ => 0,
@@ -331,6 +337,23 @@ impl Applier<'_> {
         }
         let f = out.into_inner().map_err(|e| e.into_error()).at(&tmp)?;
         tracing::debug!(path = %target.display(), reused, fetched, "apply: wrote large file");
+        f.set_modified(entry.mtime.into()).at(&tmp)?;
+        drop(f);
+        set_mode(&tmp, entry.mode).at(&tmp)?;
+        if fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+            fs::remove_dir_all(target).at(target)?;
+        }
+        fs::rename(&tmp, target).at(target)?;
+        Ok((c.node, stat_of(target)))
+    }
+
+    /// Writes a placeholder (`crate::lazy`) instead of the content.
+    fn write_placeholder(&self, c: &NodeChange, target: &Path) -> Result<(NodeId, Option<StatKey>)> {
+        let entry = c.new.as_ref().unwrap();
+        let dir = target.parent().unwrap_or(self.root);
+        let tmp = temp_path(dir, c.node);
+        crate::lazy::write_placeholder(self.root, &tmp, c.node, &entry.content)?;
+        let f = fs::File::open(&tmp).at(&tmp)?;
         f.set_modified(entry.mtime.into()).at(&tmp)?;
         drop(f);
         set_mode(&tmp, entry.mode).at(&tmp)?;

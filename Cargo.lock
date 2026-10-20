@@ -2440,6 +2440,7 @@ dependencies = [
  "rustfuse-hub",
  "rustfuse-store",
  "rustfuse-types",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
