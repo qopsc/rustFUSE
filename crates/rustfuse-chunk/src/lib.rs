@@ -40,6 +40,47 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Forwarding hops followed before giving up (a pack compacted again
+/// after its chunks moved).
+const MAX_HOPS: usize = 8;
+
+/// Where the chunks of a compacted pack went, by their old offset. Stored
+/// as `fwd/<pack>` before the pack is deleted, so references written
+/// earlier (in the log, snapshots, unsent changesets) still resolve.
+pub type Forward = HashMap<u64, ChunkRef>;
+
+pub fn forward_key(pack: PackId) -> String {
+    format!("fwd/{:032x}", pack.0)
+}
+
+pub fn encode_forward(f: &Forward) -> Bytes {
+    let mut entries: Vec<(&u64, &ChunkRef)> = f.iter().collect();
+    entries.sort_by_key(|(o, _)| **o);
+    Bytes::from(postcard::to_allocvec(&entries).expect("serialization cannot fail"))
+}
+
+/// The forwarding table of `pack`, if it was compacted.
+pub async fn load_forward(store: &dyn ObjectStore, pack: PackId) -> Result<Option<Forward>> {
+    let raw = match store.get(&forward_key(pack)).await {
+        Ok(raw) => raw,
+        Err(rustfuse_store::Error::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let entries: Vec<(u64, ChunkRef)> = postcard::from_bytes(&raw).map_err(|e| {
+        Error::Store(rustfuse_store::Error::Backend(
+            format!("{}: {e}", forward_key(pack)).into(),
+        ))
+    })?;
+    Ok(Some(entries.into_iter().collect()))
+}
+
+/// A new, random pack id (for packs written by cleanup).
+pub fn random_pack_id() -> PackId {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("no system randomness");
+    PackId(u128::from_le_bytes(b))
+}
+
 pub fn hash(data: &[u8]) -> ChunkHash {
     ChunkHash(*blake3::hash(data).as_bytes())
 }
@@ -217,8 +258,41 @@ pub fn decode(r: &ChunkRef, stored: &[u8]) -> Result<Bytes> {
 }
 
 /// Fetches and verifies chunks, merging nearby reads from the same pack
-/// into single ranged requests.
+/// into single ranged requests. Chunks of a compacted pack are read from
+/// where they moved ([`Forward`]).
 pub async fn fetch(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<HashMap<ChunkHash, Bytes>> {
+    let mut out = HashMap::new();
+    let mut todo = refs.to_vec();
+    for _ in 0..=MAX_HOPS {
+        let (got, gone) = fetch_once(store.clone(), &todo).await?;
+        out.extend(got);
+        if gone.is_empty() {
+            return Ok(out);
+        }
+        todo.clear();
+        for (pack, members) in gone {
+            let Some(fwd) = load_forward(store.as_ref(), pack).await? else {
+                return Err(rustfuse_store::Error::NotFound(pack.object_key()).into());
+            };
+            for c in members {
+                match fwd.get(&c.offset) {
+                    Some(n) if n.hash == c.hash => todo.push(*n),
+                    _ => return Err(rustfuse_store::Error::NotFound(pack.object_key()).into()),
+                }
+            }
+        }
+    }
+    Err(Error::Store(rustfuse_store::Error::Backend(
+        "too many forwarding hops".into(),
+    )))
+}
+
+/// Chunks fetched, and those whose pack is gone (by pack).
+type Fetched = (HashMap<ChunkHash, Bytes>, Vec<(PackId, Vec<ChunkRef>)>);
+/// One ranged read: its chunks, or the pack and chunks it found gone.
+type RangeRead = Result<Vec<(ChunkHash, Bytes)>, (PackId, Vec<ChunkRef>)>;
+
+async fn fetch_once(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<Fetched> {
     let mut by_pack: HashMap<PackId, Vec<ChunkRef>> = HashMap::new();
     for r in refs {
         by_pack.entry(r.pack).or_default().push(*r);
@@ -241,11 +315,15 @@ pub async fn fetch(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<Has
         }
     }
 
-    let results: Vec<Vec<(ChunkHash, Bytes)>> = stream::iter(ranges)
+    let results: Vec<RangeRead> = stream::iter(ranges)
         .map(|(pack, start, end, members)| {
             let store = store.clone();
             async move {
-                let data = store.get_range(&pack.object_key(), start..end).await?;
+                let data = match store.get_range(&pack.object_key(), start..end).await {
+                    Ok(d) => d,
+                    Err(rustfuse_store::Error::NotFound(_)) => return Ok(Err((pack, members))),
+                    Err(e) => return Err(e.into()),
+                };
                 let mut out = Vec::with_capacity(members.len());
                 for c in members {
                     let lo = (c.offset - start) as usize;
@@ -255,13 +333,21 @@ pub async fn fetch(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<Has
                         .ok_or_else(|| Error::Corrupt(c.hash, "pack too short".into()))?;
                     out.push((c.hash, decode(&c, stored)?));
                 }
-                Ok::<_, Error>(out)
+                Ok::<_, Error>(Ok(out))
             }
         })
         .buffer_unordered(FETCH_CONCURRENCY)
         .try_collect()
         .await?;
-    Ok(results.into_iter().flatten().collect())
+    let mut got = HashMap::new();
+    let mut gone: HashMap<PackId, Vec<ChunkRef>> = HashMap::new();
+    for r in results {
+        match r {
+            Ok(chunks) => got.extend(chunks),
+            Err((pack, members)) => gone.entry(pack).or_default().extend(members),
+        }
+    }
+    Ok((got, gone.into_iter().collect()))
 }
 
 #[cfg(test)]

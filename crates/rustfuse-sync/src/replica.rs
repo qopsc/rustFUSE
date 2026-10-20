@@ -816,6 +816,25 @@ impl Replica {
     /// the bucket and not about to be deleted by cleanup ([`crate::gc`]);
     /// content in packs that are gone is uploaded again from the files.
     async fn check_outbox_content(&mut self, sent: &HashSet<u64>) -> Result<()> {
+        // Compacted packs forward to new ones, which are checked in turn.
+        for _ in 0..8 {
+            let missing = self.unavailable_packs(sent).await?;
+            if missing.is_empty() {
+                return Ok(());
+            }
+            if !self.follow_moves(&missing).await? {
+                warn!(
+                    packs = missing.len(),
+                    "content of unsent changes was removed by cleanup; uploading it again"
+                );
+                return self.repair_outbox(&missing).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Packs unsent changesets use that are gone or marked for deletion.
+    async fn unavailable_packs(&mut self, sent: &HashSet<u64>) -> Result<HashSet<PackId>> {
         let now = Instant::now();
         let packs: HashSet<PackId> = self
             .outbox
@@ -830,7 +849,7 @@ impl Replica {
             })
             .collect();
         if packs.is_empty() {
-            return Ok(());
+            return Ok(HashSet::new());
         }
         let store = self.store().clone();
         let found: Vec<(PackId, bool)> = futures::stream::iter(packs)
@@ -853,14 +872,92 @@ impl Replica {
                 missing.insert(p);
             }
         }
-        if missing.is_empty() {
-            return Ok(());
+        Ok(missing)
+    }
+
+    /// Points references into compacted `packs` at where their chunks moved
+    /// (`rustfuse_chunk::Forward`), in unsent changesets, the disk tree and
+    /// the known chunks. Returns whether anything moved.
+    async fn follow_moves(&mut self, packs: &HashSet<PackId>) -> Result<bool> {
+        let mut forwards = HashMap::new();
+        for p in packs {
+            if let Some(f) = rustfuse_chunk::load_forward(self.store().as_ref(), *p).await? {
+                forwards.insert(*p, f);
+            }
         }
-        warn!(
-            packs = missing.len(),
-            "content of unsent changes was removed by cleanup; uploading it again"
+        let remap = |content: &mut Content| -> bool {
+            let Content::File { chunks, .. } = content else {
+                return false;
+            };
+            let mut moved = false;
+            for r in chunks.iter_mut() {
+                if let Some(n) = forwards.get(&r.pack).and_then(|f| f.get(&r.offset))
+                    && n.hash == r.hash
+                {
+                    *r = *n;
+                    moved = true;
+                }
+            }
+            moved
+        };
+        let mut changed = Vec::new();
+        for cs in self.outbox.iter_mut() {
+            let mut touched = false;
+            for op in cs.ops.iter_mut() {
+                if let Op::Upsert { entry, .. } = op {
+                    touched |= remap(&mut entry.content);
+                }
+            }
+            if touched {
+                changed.push(cs.local);
+            }
+        }
+        let mut disk_ids = Vec::new();
+        let ids: Vec<NodeId> = self.tree.iter().map(|(id, _)| *id).collect();
+        for id in ids {
+            let mut content = self.tree.get(id).map(|e| e.content.clone());
+            if let Some(c) = content.as_mut()
+                && remap(c)
+            {
+                self.tree.set_content(id, content.unwrap());
+                disk_ids.push(id);
+            }
+        }
+        let moved: Vec<ChunkRef> = forwards.values().flat_map(|f| f.values().copied()).collect();
+        // Chunks of those packs that did not move are gone: never reuse them.
+        let forgotten = {
+            let mut b = self.builder.lock().unwrap();
+            let forgotten = b.forget_packs(&forwards.keys().copied().collect());
+            for r in &moved {
+                b.insert_known(*r);
+            }
+            forgotten
+        };
+        if changed.is_empty() && disk_ids.is_empty() {
+            self.index.commit(Commit {
+                chunks: moved,
+                chunks_remove: forgotten,
+                ..Commit::default()
+            })?;
+            return Ok(false);
+        }
+        debug!(
+            changesets = changed.len(),
+            files = disk_ids.len(),
+            "followed compacted packs"
         );
-        self.repair_outbox(&missing).await
+        self.index.commit(Commit {
+            disk: Some((&self.tree, disk_ids)),
+            outbox_put: self
+                .outbox
+                .iter()
+                .filter(|cs| changed.contains(&cs.local))
+                .collect(),
+            chunks: moved,
+            chunks_remove: forgotten,
+            ..Commit::default()
+        })?;
+        Ok(true)
     }
 
     /// Re-uploads the content of unsent changesets that lives in `missing`

@@ -46,7 +46,8 @@ rustfuse sync ~/src/project
 rustfuse status ~/src/project
 rustfuse conflicts ~/src/project
 
-# Next to the hub, e.g. daily: delete stored content nobody needs any more.
+# Next to the hub, e.g. daily: delete stored content nobody needs any more
+# and compact packs that are mostly unused.
 rustfuse gc --volume project
 ```
 

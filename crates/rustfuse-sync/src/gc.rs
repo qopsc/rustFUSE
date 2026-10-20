@@ -12,6 +12,12 @@
 //! (see `Replica::check_outbox_content`). A changeset checked before a
 //! tombstone was written reaches the log well within `delay`, and the run
 //! that would delete the pack then sees it and keeps the pack.
+//!
+//! A pack that is still used but mostly holds dead chunks is compacted: its
+//! used chunks are copied into a new pack, a forwarding table
+//! `fwd/<pack>` records where each went, and the old pack is marked like an
+//! unused one. Readers that find a pack gone follow its forwarding table
+//! (`rustfuse_chunk::fetch`), so references written before stay valid.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,8 +25,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
+use rustfuse_chunk::Forward;
 use rustfuse_store::{ObjectMeta, ObjectStore};
-use rustfuse_types::{Content, Op, PackId};
+use rustfuse_types::{ChunkRef, Content, Op, PackId};
 use tracing::{debug, info};
 
 use crate::tree::Tree;
@@ -28,6 +35,12 @@ use crate::{Error, Result, Volume};
 
 /// Snapshots kept; machines only ever read the latest.
 const KEEP_SNAPSHOTS: usize = 2;
+/// Packs whose used chunks fill less than this share are compacted...
+const COMPACT_BELOW: f64 = 0.5;
+/// ...when that frees at least this much.
+const COMPACT_MIN_GAIN: u64 = 1 << 20;
+/// Forwarding hops followed (a pack compacted again).
+const MAX_HOPS: usize = 8;
 const CONCURRENCY: usize = 16;
 
 pub const TOMBSTONE_PREFIX: &str = "gc/dead/";
@@ -81,6 +94,13 @@ pub struct GcStats {
     /// Marked packs still waiting for their deletion run.
     pub waiting: usize,
     pub snapshots_deleted: usize,
+    /// Packs whose used chunks were copied into new packs this run.
+    pub compacted: usize,
+    /// Their size, and the size of the packs written instead.
+    pub compacted_from: u64,
+    pub compacted_to: u64,
+    /// Forwarding tables dropped because nothing points at their pack.
+    pub forwards_deleted: usize,
 }
 
 /// Runs one cleanup pass over the volume `store` is scoped to.
@@ -88,7 +108,10 @@ pub async fn collect(store: Arc<dyn ObjectStore>, opts: &GcOptions) -> Result<Gc
     let volume = Volume::new(store.clone());
     volume.check().await?;
     let cutoff = opts.now.checked_sub(opts.retention).unwrap_or(UNIX_EPOCH);
-    let used = used_packs(&volume, cutoff).await?;
+    let refs = used_refs(&volume, cutoff).await?;
+    let forwards = load_forwards(store.as_ref()).await?;
+    let live = follow_forwards(&refs, &forwards);
+    let used: HashSet<PackId> = live.keys().copied().collect();
     let packs = list(store.as_ref(), "pack/").await?;
     let tombstones = list(store.as_ref(), TOMBSTONE_PREFIX).await?;
     let mut stats = GcStats {
@@ -134,6 +157,36 @@ pub async fn collect(store: Arc<dyn ObjectStore>, opts: &GcOptions) -> Result<Gc
     stats.marked = marks.len();
     stats.waiting += marks.len();
 
+    // Old packs mostly full of unused chunks: copy the used ones out.
+    let mut sparse: Vec<(PackId, u64)> = sizes
+        .iter()
+        .filter(|(p, m)| !marked.contains(p) && m.modified.is_some_and(|t| t < cutoff))
+        .filter_map(|(p, m)| {
+            let used_bytes: u64 = live.get(p)?.values().map(|r| u64::from(r.stored_len)).sum();
+            debug!(pack = ?p, used_bytes, size = m.size, "pack use");
+            let sparse = (used_bytes as f64) < m.size as f64 * COMPACT_BELOW
+                && m.size - used_bytes >= COMPACT_MIN_GAIN;
+            sparse.then_some((*p, m.size))
+        })
+        .collect();
+    sparse.sort();
+    stats.compacted = sparse.len();
+    stats.compacted_from = sparse.iter().map(|(_, size)| size).sum();
+    stats.compacted_to = sparse
+        .iter()
+        .map(|(p, _)| live[p].values().map(|r| u64::from(r.stored_len)).sum::<u64>())
+        .sum();
+    stats.waiting += sparse.len();
+
+    // Forwarding tables of deleted packs nothing points at any more.
+    let direct: HashSet<PackId> = refs.keys().map(|(p, _)| *p).collect();
+    let stale_forwards: Vec<PackId> = forwards
+        .keys()
+        .filter(|p| !sizes.contains_key(p) && !direct.contains(p))
+        .copied()
+        .collect();
+    stats.forwards_deleted = stale_forwards.len();
+
     let snaps = list(store.as_ref(), "snap/").await?;
     let old_snaps: Vec<String> = snaps
         .iter()
@@ -143,8 +196,8 @@ pub async fn collect(store: Arc<dyn ObjectStore>, opts: &GcOptions) -> Result<Gc
         .collect();
     stats.snapshots_deleted = old_snaps.len();
 
+    let stamp = Bytes::from(millis(opts.now).to_string());
     if !opts.dry_run {
-        let stamp = Bytes::from(millis(opts.now).to_string());
         run_all(marks.iter().map(|p| {
             let (store, key, stamp) = (store.clone(), tombstone_key(*p), stamp.clone());
             async move { store.put(&key, stamp).await }
@@ -169,15 +222,22 @@ pub async fn collect(store: Arc<dyn ObjectStore>, opts: &GcOptions) -> Result<Gc
             async move { store.delete(&key).await }
         }))
         .await?;
+        run_all(stale_forwards.into_iter().map(|p| {
+            let store = store.clone();
+            async move { store.delete(&rustfuse_chunk::forward_key(p)).await }
+        }))
+        .await?;
+        compact(store.as_ref(), &sparse, &live, &forwards, &stamp).await?;
     }
     info!(?stats, dry_run = opts.dry_run, "cleanup done");
     Ok(stats)
 }
 
-/// Packs used by the current state (files that exist) or by any changeset
-/// from after `cutoff`.
-async fn used_packs(volume: &Volume, cutoff: SystemTime) -> Result<HashSet<PackId>> {
-    let mut used = HashSet::new();
+/// Chunk references (by pack and offset) used by the current state (files
+/// that exist) or by any changeset from after `cutoff`, as written: some
+/// may point into packs that were compacted since.
+async fn used_refs(volume: &Volume, cutoff: SystemTime) -> Result<HashMap<(PackId, u64), ChunkRef>> {
+    let mut used = HashMap::new();
     let (mut tree, start) = match volume.latest_snapshot().await? {
         Some(s) => (Tree::from_snapshot(&s), s.seq),
         None => (Tree::default(), 0),
@@ -207,21 +267,112 @@ async fn used_packs(volume: &Volume, cutoff: SystemTime) -> Result<HashSet<PackI
     }
     for (_, n) in tree.iter() {
         if let Content::File { chunks, .. } = &n.entry.content {
-            used.extend(chunks.iter().map(|c| c.pack));
+            add_chunks(&mut used, chunks);
         }
     }
-    debug!(packs = used.len(), "packs in use");
+    debug!(chunks = used.len(), "chunks in use");
     Ok(used)
 }
 
-fn add_ops(used: &mut HashSet<PackId>, ops: &[Op]) {
+fn add_chunks(used: &mut HashMap<(PackId, u64), ChunkRef>, chunks: &[ChunkRef]) {
+    for c in chunks {
+        used.insert((c.pack, c.offset), *c);
+    }
+}
+
+fn add_ops(used: &mut HashMap<(PackId, u64), ChunkRef>, ops: &[Op]) {
     for op in ops {
         if let Op::Upsert { entry, .. } = op
             && let Content::File { chunks, .. } = &entry.content
         {
-            used.extend(chunks.iter().map(|c| c.pack));
+            add_chunks(used, chunks);
         }
     }
+}
+
+async fn load_forwards(store: &dyn ObjectStore) -> Result<HashMap<PackId, Forward>> {
+    let mut out = HashMap::new();
+    for m in list(store, "fwd/").await? {
+        let Some(p) = pack_of(&m.key) else { continue };
+        if let Some(f) = rustfuse_chunk::load_forward(store, p).await? {
+            out.insert(p, f);
+        }
+    }
+    Ok(out)
+}
+
+/// Where each used chunk lives now, by pack and offset.
+fn follow_forwards(
+    refs: &HashMap<(PackId, u64), ChunkRef>,
+    forwards: &HashMap<PackId, Forward>,
+) -> HashMap<PackId, HashMap<u64, ChunkRef>> {
+    let mut live: HashMap<PackId, HashMap<u64, ChunkRef>> = HashMap::new();
+    for r in refs.values() {
+        let mut r = *r;
+        for _ in 0..MAX_HOPS {
+            match forwards.get(&r.pack).and_then(|f| f.get(&r.offset)) {
+                Some(n) if n.hash == r.hash => r = *n,
+                _ => break,
+            }
+        }
+        live.entry(r.pack).or_default().insert(r.offset, r);
+    }
+    live
+}
+
+/// Copies the used chunks of `sparse` packs into new packs, writes their
+/// forwarding tables, then marks them for deletion. In that order: until
+/// the table exists the old pack must stay.
+async fn compact(
+    store: &dyn ObjectStore,
+    sparse: &[(PackId, u64)],
+    live: &HashMap<PackId, HashMap<u64, ChunkRef>>,
+    forwards: &HashMap<PackId, Forward>,
+    stamp: &Bytes,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut id = rustfuse_chunk::random_pack_id();
+    let mut sources: Vec<(PackId, Forward)> = Vec::new();
+    for (i, (pack, _)) in sparse.iter().enumerate() {
+        let data = store.get(&pack.object_key()).await?;
+        let mut chunks: Vec<&ChunkRef> = live[pack].values().collect();
+        chunks.sort_by_key(|c| c.offset);
+        // A pack compacted before (and used again since) keeps what it
+        // already forwarded.
+        let mut fwd = forwards.get(pack).cloned().unwrap_or_default();
+        for c in chunks {
+            let stored = data
+                .get(c.offset as usize..(c.offset + u64::from(c.stored_len)) as usize)
+                .ok_or_else(|| Error::Corrupt(format!("{}: too short", pack.object_key())))?;
+            // Never copy damage into the new pack.
+            rustfuse_chunk::decode(c, stored)?;
+            let moved = ChunkRef {
+                pack: id,
+                offset: buf.len() as u64,
+                ..*c
+            };
+            buf.extend_from_slice(stored);
+            fwd.insert(c.offset, moved);
+        }
+        sources.push((*pack, fwd));
+        if buf.len() >= rustfuse_chunk::PACK_TARGET || i + 1 == sparse.len() {
+            store
+                .put(&id.object_key(), Bytes::from(std::mem::take(&mut buf)))
+                .await?;
+            for (src, fwd) in sources.drain(..) {
+                store
+                    .put(
+                        &rustfuse_chunk::forward_key(src),
+                        rustfuse_chunk::encode_forward(&fwd),
+                    )
+                    .await?;
+                store.put(&tombstone_key(src), stamp.clone()).await?;
+            }
+            debug!(pack = ?id, "wrote compacted pack");
+            id = rustfuse_chunk::random_pack_id();
+        }
+    }
+    Ok(())
 }
 
 async fn list(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<ObjectMeta>> {
