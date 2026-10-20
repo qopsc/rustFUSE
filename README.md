@@ -97,6 +97,12 @@ rustfuse attach --lazy ~/.rustfuse/project --volume project
 rustfuse mount ~/.rustfuse/project ~/src/project
 ```
 
+Fetched files stay on disk. To cap how much they take, pass
+`--cache-size` (for example `--cache-size 20G`) to `mount` or `nfs`: files
+nobody opened in the last minute, and that have not been changed since
+they were fetched, are emptied again, least recently used first, and
+fetched once more when next opened.
+
 ### Git
 
 - Commits, branches, stashes and worktrees replicate; `git fsck` stays clean.

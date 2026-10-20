@@ -91,6 +91,7 @@ struct Fuse {
 impl Fuse {
     fn add_file(&self, f: File) -> FileHandle {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
+        self.b.opened(&f);
         self.files.lock().unwrap().insert(fh, Arc::new(f));
         FileHandle(fh)
     }
@@ -358,7 +359,9 @@ impl Filesystem for Fuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.files.lock().unwrap().remove(&fh.0);
+        if let Some(f) = self.files.lock().unwrap().remove(&fh.0) {
+            self.b.closed(&f);
+        }
         reply.ok();
     }
 

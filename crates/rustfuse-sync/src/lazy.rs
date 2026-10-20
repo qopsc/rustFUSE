@@ -17,18 +17,28 @@
 //! When capturing, a file still marked as a placeholder counts as holding
 //! its recorded content, so a placeholder is never synced as zeros.
 //!
+//! Filling in a file keeps its record and notes the file's `stat` next to
+//! it (`<record>.filled`). [`Hydrator::evict`] turns such files back into
+//! placeholders to keep fetched content within a budget, least recently
+//! opened first, but only while the `stat` still matches: the file then
+//! holds exactly the recorded content, which is the current version (a
+//! newer one would have been renamed into place) and is in the bucket.
+//!
 //! A lazy directory must be used through `rustfuse mount` or `rustfuse
 //! nfs`: programs reading it directly see placeholders as zeros.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rustfuse_store::ObjectStore;
 use rustfuse_types::{ChunkRef, Content, NodeId};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::tree::Tree;
@@ -38,6 +48,42 @@ use crate::{Error, IoContext, Result, STATE_DIR};
 pub const XATTR: &str = "user.rustfuse.lazy";
 /// Chunk data fetched at a time while filling in a file.
 const WINDOW_BYTES: u64 = 64 << 20;
+/// Suffix of the note kept for a filled-in file.
+const FILLED: &str = ".filled";
+/// Files opened this recently are never turned back into placeholders.
+const RECENT: Duration = Duration::from_secs(60);
+
+/// A filled-in file as it was right after filling in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Filled {
+    /// Relative to the directory, as bytes.
+    path: Vec<u8>,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    ctime: i64,
+}
+
+impl Filled {
+    fn of(path: Vec<u8>, m: &fs::Metadata) -> Filled {
+        Filled {
+            path,
+            ino: m.ino(),
+            size: m.size(),
+            mtime: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            ctime: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+        }
+    }
+}
+
+/// What [`Hydrator::evict`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    /// Bytes of fetched content held before.
+    pub held: u64,
+    pub files: usize,
+    pub bytes: u64,
+}
 
 fn records(root: &Path) -> PathBuf {
     root.join(STATE_DIR).join("lazy")
@@ -103,9 +149,15 @@ pub(crate) fn placeholder_content(root: &Path, file: &File) -> Result<Option<Con
     };
     let record = records(root).join(&k);
     let raw = fs::read(&record).at(&record)?;
-    postcard::from_bytes(&raw)
-        .map(Some)
-        .map_err(|e| Error::Corrupt(format!("{}: {e}", record.display())))
+    let content: Content =
+        postcard::from_bytes(&raw).map_err(|e| Error::Corrupt(format!("{}: {e}", record.display())))?;
+    // Written to without the mount (which fills in first): the marker is
+    // stale and the file holds what was written.
+    let len = file.metadata().at(&record)?.len();
+    match content {
+        Content::File { size, .. } if size == len => Ok(Some(content)),
+        _ => Ok(None),
+    }
 }
 
 /// Deletes records no placeholder can still point at: the node is gone or
@@ -121,11 +173,12 @@ pub(crate) fn prune(root: &Path, tree: &Tree) -> Result<usize> {
     for ent in rd {
         let ent = ent.at(&dir)?;
         let name = ent.file_name().to_string_lossy().into_owned();
-        let keep = name
+        let k = name.strip_suffix(FILLED).unwrap_or(&name);
+        let keep = k
             .split_once('-')
             .and_then(|(id, _)| u128::from_str_radix(id, 16).ok())
             .map(NodeId)
-            .is_some_and(|id| tree.get(id).is_some_and(|e| key(id, &e.content) == name));
+            .is_some_and(|id| tree.get(id).is_some_and(|e| key(id, &e.content) == k));
         if !keep {
             let p = ent.path();
             fs::remove_file(&p).at(&p)?;
@@ -140,6 +193,8 @@ pub struct Hydrator {
     root: PathBuf,
     store: Arc<dyn ObjectStore>,
     busy: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// When each file was last asked for, by inode.
+    used: Mutex<HashMap<u64, Instant>>,
 }
 
 impl Hydrator {
@@ -149,7 +204,24 @@ impl Hydrator {
             root: root.canonicalize().at(root)?,
             store,
             busy: Mutex::new(HashMap::new()),
+            used: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        self.busy
+            .lock()
+            .unwrap()
+            .entry(path.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    fn unlock(&self, path: &Path, lock: &Arc<tokio::sync::Mutex<()>>) {
+        let mut busy = self.busy.lock().unwrap();
+        if Arc::strong_count(lock) == 2 {
+            busy.remove(path);
+        }
     }
 
     /// Makes sure the file at `path` holds its content, fetching it if it
@@ -164,22 +236,21 @@ impl Hydrator {
         };
         // Most files are not placeholders: answer those without locking.
         match open(false) {
-            Ok(f) if f.metadata().is_ok_and(|m| m.is_file()) && marker(&f).is_some() => {}
+            Ok(f) if f.metadata().is_ok_and(|m| m.is_file()) => {
+                if let Ok(m) = f.metadata() {
+                    self.used.lock().unwrap().insert(m.ino(), Instant::now());
+                }
+                if marker(&f).is_none() {
+                    return Ok(false);
+                }
+            }
             _ => return Ok(false),
         }
-        let lock = self
-            .busy
-            .lock()
-            .unwrap()
-            .entry(path.to_owned())
-            .or_default()
-            .clone();
-        let _guard = lock.lock().await;
+        let lock = self.lock_for(path);
+        let guard = lock.lock().await;
         let result = self.fill(path, open).await;
-        let mut busy = self.busy.lock().unwrap();
-        if Arc::strong_count(&lock) == 2 {
-            busy.remove(path);
-        }
+        drop(guard);
+        self.unlock(path, &lock);
         result
     }
 
@@ -243,14 +314,131 @@ impl Hydrator {
             .map_err(std::io::Error::from)
             .at(path)?;
         restore_mode()?;
-        let record = records(&self.root).join(&k);
-        let _ = fs::remove_file(record);
+        let m = f.metadata().at(path)?;
+        self.used.lock().unwrap().insert(m.ino(), Instant::now());
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
+        let note = records(&self.root).join(format!("{k}{FILLED}"));
+        let json =
+            serde_json::to_vec(&Filled::of(rel.as_os_str().as_bytes().to_vec(), &m)).expect("serializable");
+        fs::write(&note, json).at(&note)?;
         debug!(
             path = %path.display(),
             bytes = size,
             ms = t0.elapsed().as_millis() as u64,
             "fetched file content"
         );
+        Ok(true)
+    }
+}
+
+impl Hydrator {
+    /// Turns filled-in files back into placeholders, least recently opened
+    /// first, until at most `budget` bytes of fetched content remain
+    /// (down to 90% of it, so this does not run on every new fetch).
+    /// Skips files opened in the last minute and those `in_use` names (by
+    /// inode). Blocking.
+    pub fn evict(&self, budget: u64, in_use: impl Fn(u64) -> bool) -> Result<Evicted> {
+        let dir = records(&self.root);
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Evicted::default()),
+            Err(e) => return Err(e).at(&dir),
+        };
+        // Filled-in files that still hold exactly what was fetched.
+        let mut held = Vec::new();
+        for ent in rd {
+            let note = ent.at(&dir)?.path();
+            let Some(k) = note
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(FILLED))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let filled: Option<Filled> = fs::read(&note)
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok());
+            let path = filled
+                .as_ref()
+                .map(|f| self.root.join(std::ffi::OsStr::from_bytes(&f.path)));
+            let current = match (&filled, &path) {
+                (Some(f), Some(p)) => {
+                    fs::symlink_metadata(p).is_ok_and(|m| Filled::of(f.path.clone(), &m) == *f)
+                }
+                _ => false,
+            };
+            if current {
+                held.push((k, filled.unwrap(), path.unwrap()));
+            } else {
+                // Changed, replaced or gone since: not ours to empty.
+                let _ = fs::remove_file(&note);
+            }
+        }
+        let mut out = Evicted {
+            held: held.iter().map(|(_, f, _)| f.size).sum(),
+            ..Evicted::default()
+        };
+        if out.held <= budget {
+            return Ok(out);
+        }
+        let target = budget / 10 * 9;
+        let used = self.used.lock().unwrap().clone();
+        // Never opened since this process started: oldest first, by when
+        // they were filled in.
+        held.sort_by_key(|(k, f, _)| match used.get(&f.ino) {
+            Some(t) => (1, Some(*t), k.clone()),
+            None => (0, None, k.clone()),
+        });
+        let mut remaining = out.held;
+        for (k, f, path) in held {
+            if remaining <= target {
+                break;
+            }
+            if used.get(&f.ino).is_some_and(|t| t.elapsed() < RECENT) || in_use(f.ino) {
+                continue;
+            }
+            let lock = self.lock_for(&path);
+            let guard = lock.blocking_lock();
+            let done = self.empty(&k, &f, &path);
+            drop(guard);
+            self.unlock(&path, &lock);
+            if done? {
+                remaining -= f.size;
+                out.files += 1;
+                out.bytes += f.size;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Turns one filled-in file back into a placeholder, if it still holds
+    /// what was fetched.
+    fn empty(&self, k: &str, f: &Filled, path: &Path) -> Result<bool> {
+        let file = match OpenOptions::new()
+            .write(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(path)
+        {
+            Ok(file) => file,
+            // Read-only or gone: leave it.
+            Err(_) => return Ok(false),
+        };
+        let m = file.metadata().at(path)?;
+        if Filled::of(f.path.clone(), &m) != *f || !records(&self.root).join(k).exists() {
+            return Ok(false);
+        }
+        let mtime = m.modified().at(path)?;
+        // Marked first: from here on, capture sees the recorded content.
+        rustix::fs::fsetxattr(&file, XATTR, k.as_bytes(), rustix::fs::XattrFlags::empty())
+            .map_err(std::io::Error::from)
+            .at(path)?;
+        file.set_len(0).at(path)?;
+        file.set_len(f.size).at(path)?;
+        file.set_modified(mtime).at(path)?;
+        let note = records(&self.root).join(format!("{k}{FILLED}"));
+        let _ = fs::remove_file(note);
+        debug!(path = %path.display(), bytes = f.size, "dropped fetched content");
         Ok(true)
     }
 }

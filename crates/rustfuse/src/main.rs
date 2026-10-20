@@ -101,6 +101,11 @@ enum Command {
         /// Only serve the directory; a `rustfuse sync` runs elsewhere.
         #[arg(long)]
         no_sync: bool,
+        /// For a directory attached with `--lazy`: keep at most this much
+        /// fetched content (e.g. 20G), dropping files not opened lately
+        /// back to placeholders. Without it, fetched files stay.
+        #[arg(long, value_parser = parse_size)]
+        cache_size: Option<u64>,
         #[command(flatten)]
         opts: SyncOpts,
     },
@@ -116,6 +121,11 @@ enum Command {
         /// Only serve the directory; a `rustfuse sync` runs elsewhere.
         #[arg(long)]
         no_sync: bool,
+        /// For a directory attached with `--lazy`: keep at most this much
+        /// fetched content (e.g. 20G), dropping files not opened lately
+        /// back to placeholders. Without it, fetched files stay.
+        #[arg(long, value_parser = parse_size)]
+        cache_size: Option<u64>,
         #[command(flatten)]
         opts: SyncOpts,
     },
@@ -551,6 +561,7 @@ async fn start_sync(
 async fn prepare_serving(
     dir: &Path,
     no_sync: bool,
+    cache_size: Option<u64>,
     opts: &SyncOpts,
 ) -> Result<(
     Arc<rustfuse_mount::Backing>,
@@ -564,7 +575,7 @@ async fn prepare_serving(
     }
     let mut backing = rustfuse_mount::Backing::new(dir, &[rustfuse_sync::STATE_DIR])?;
     if no_sync {
-        if rustfuse_sync::lazy::is_lazy(dir) {
+        if rustfuse_sync::lazy::is_lazy(dir) || cache_size.is_some() {
             bail!(
                 "{} fetches files on first use; serve it with its sync (drop --no-sync)",
                 dir.display()
@@ -573,8 +584,10 @@ async fn prepare_serving(
         return Ok((Arc::new(backing), None));
     }
     let (r, spec) = open_replica(dir, opts).await?;
+    let mut hydrator = None;
     if rustfuse_sync::lazy::is_lazy(dir) {
         let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(dir, r.store().clone())?);
+        hydrator = Some(h.clone());
         let rt = tokio::runtime::Handle::current();
         backing = backing.with_fetch(Arc::new(move |path: &Path| {
             let fetch = || rt.block_on(h.hydrate(path));
@@ -590,8 +603,61 @@ async fn prepare_serving(
             })
         }));
     }
+    let backing = Arc::new(backing);
+    match (cache_size, hydrator) {
+        (Some(budget), Some(h)) => {
+            tokio::spawn(keep_within(budget, h, backing.clone()));
+        }
+        (Some(_), None) => bail!(
+            "--cache-size needs a directory attached with --lazy; {} holds every file",
+            dir.display()
+        ),
+        _ => {}
+    }
     let sync = start_sync(dir, r, spec, opts).await?;
-    Ok((Arc::new(backing), Some(sync)))
+    Ok((backing, Some(sync)))
+}
+
+/// Keeps fetched content in a lazy directory within `budget` bytes.
+async fn keep_within(
+    budget: u64,
+    h: Arc<rustfuse_sync::lazy::Hydrator>,
+    backing: Arc<rustfuse_mount::Backing>,
+) {
+    let mut every = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        every.tick().await;
+        let (h, b) = (h.clone(), backing.clone());
+        match tokio::task::spawn_blocking(move || h.evict(budget, |ino| b.in_use(ino))).await {
+            Ok(Ok(e)) if e.files > 0 => tracing::info!(
+                files = e.files,
+                mib = e.bytes >> 20,
+                held_mib = (e.held - e.bytes) >> 20,
+                "dropped fetched content to stay within the cache size"
+            ),
+            Ok(Err(e)) => tracing::warn!("cannot drop fetched content: {e}"),
+            _ => {}
+        }
+    }
+}
+
+/// Parses a size like `500M`, `10G` or `1T` (powers of 1024), or bytes.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(i) => s.split_at(i),
+        None => (s, ""),
+    };
+    let shift = match unit.trim().to_ascii_uppercase().trim_end_matches(['B', 'I']) {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => return Err(format!("unknown unit in {s:?}; use K, M, G or T")),
+    };
+    let n: f64 = num.parse().map_err(|_| format!("not a size: {s:?}"))?;
+    Ok((n * (1u64 << shift) as f64) as u64)
 }
 
 /// Runs `sync` (if any) until `serve` ends or Ctrl-C.
@@ -618,9 +684,10 @@ async fn mount(
     mountpoint: &Path,
     allow_other: bool,
     no_sync: bool,
+    cache_size: Option<u64>,
     opts: &SyncOpts,
 ) -> Result<()> {
-    let (backing, sync) = prepare_serving(dir, no_sync, opts).await?;
+    let (backing, sync) = prepare_serving(dir, no_sync, cache_size, opts).await?;
     let m = rustfuse_mount::mount_fuse(backing, mountpoint, allow_other)
         .with_context(|| format!("mount at {}", mountpoint.display()))?;
     println!(
@@ -634,12 +701,18 @@ async fn mount(
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn mount(_: &Path, _: &Path, _: bool, _: bool, _: &SyncOpts) -> Result<()> {
+async fn mount(_: &Path, _: &Path, _: bool, _: bool, _: Option<u64>, _: &SyncOpts) -> Result<()> {
     bail!("FUSE mounts are Linux-only; use `rustfuse nfs` and the system's NFS client")
 }
 
-async fn serve_nfs(dir: &Path, listen: &str, no_sync: bool, opts: &SyncOpts) -> Result<()> {
-    let (backing, sync) = prepare_serving(dir, no_sync, opts).await?;
+async fn serve_nfs(
+    dir: &Path,
+    listen: &str,
+    no_sync: bool,
+    cache_size: Option<u64>,
+    opts: &SyncOpts,
+) -> Result<()> {
+    let (backing, sync) = prepare_serving(dir, no_sync, cache_size, opts).await?;
     let server = rustfuse_mount::NfsServer::bind(backing, listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
@@ -809,14 +882,16 @@ async fn run(cli: Cli) -> Result<()> {
             mountpoint,
             allow_other,
             no_sync,
+            cache_size,
             opts,
-        } => mount(&dir, &mountpoint, allow_other, no_sync, &opts).await?,
+        } => mount(&dir, &mountpoint, allow_other, no_sync, cache_size, &opts).await?,
         Command::Nfs {
             dir,
             listen,
             no_sync,
+            cache_size,
             opts,
-        } => serve_nfs(&dir, &listen, no_sync, &opts).await?,
+        } => serve_nfs(&dir, &listen, no_sync, cache_size, &opts).await?,
         Command::Status { dir } => {
             let config = Replica::config_of(&dir)?;
             // Status only reads local state; no store access needed.
@@ -964,5 +1039,15 @@ mod tests {
     fn cli_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn sizes() {
+        use super::parse_size;
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert_eq!(parse_size("500M"), Ok(500 << 20));
+        assert_eq!(parse_size("1.5g"), Ok(3 << 29));
+        assert_eq!(parse_size("2TiB"), Ok(2 << 40));
+        assert!(parse_size("5X").is_err() && parse_size("G").is_err());
     }
 }

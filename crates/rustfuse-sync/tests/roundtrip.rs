@@ -6,7 +6,7 @@
 //! `RUSTFUSE_TEST_S3_ENDPOINT` is set.
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1293,6 +1293,15 @@ async fn metrics_count_sync_activity() {
     }
 }
 
+/// Drops all fetched content it may, except `busy`'s.
+async fn evict(h: &Arc<rustfuse_sync::lazy::Hydrator>, busy: Option<u64>) -> rustfuse_sync::lazy::Evicted {
+    let h = h.clone();
+    tokio::task::spawn_blocking(move || h.evict(0, |ino| Some(ino) == busy))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn lazy_directory_fetches_on_demand() {
     let mut c = Cluster::new(1, |root| {
@@ -1363,7 +1372,35 @@ async fn lazy_directory_fetches_on_demand() {
         fs::read(src.join(medium)).unwrap()
     );
 
-    // Records of filled-in or replaced placeholders go away.
+    // Fetched content can be dropped again, but not right after use, nor
+    // while the file is open.
+    let h = Arc::new(h);
+    let e = evict(&h, None).await;
+    assert_eq!((e.held, e.files), (real.len() as u64 + 4000 * 6, 0));
+    let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap());
+    let busy = fs::metadata(lazy.join(medium)).unwrap().ino();
+    let e = evict(&h, Some(busy)).await;
+    assert_eq!((e.files, e.bytes), (1, real.len() as u64));
+    assert!(fs::read(lazy.join(big)).unwrap().iter().all(|&b| b == 0));
+    assert_eq!(fs::metadata(lazy.join(big)).unwrap().len(), real.len() as u64);
+    let s = r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+    assert_eq!(s.pushed, 0, "dropping fetched content is not an edit");
+    assert!(h.hydrate(&lazy.join(big)).await.unwrap());
+    assert_eq!(fs::read(lazy.join(big)).unwrap(), real);
+
+    // An edited file is the user's: never emptied.
+    fs::write(lazy.join(medium), "mine\n").unwrap();
+    let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap());
+    let e = evict(&h, None).await;
+    assert_eq!((e.files, e.bytes), (1, real.len() as u64));
+    assert_eq!(fs::read(lazy.join(medium)).unwrap(), b"mine\n");
+
+    // Records of replaced placeholders go away. Written to without the
+    // mount, a placeholder of a new size counts as what was written.
+    fs::write(lazy.join(big), "replaced\n").unwrap();
+    r.sync_once(&c.hub, TIMEOUT).await.unwrap();
+    c.sync(0).await;
+    assert_eq!(fs::read(src.join(big)).unwrap(), b"replaced\n");
     drop(r);
     Replica::open(&lazy, c.volume.clone()).unwrap();
     assert_eq!(

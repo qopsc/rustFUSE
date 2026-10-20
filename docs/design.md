@@ -95,8 +95,21 @@ attribute. The applier always renames a new version into place, so a
 placeholder filled in at the same time as a newer version arrives never
 overwrites it. When capturing, a file still marked as a placeholder counts
 as holding its recorded content, so changing a placeholder's metadata
-never syncs zeros. Records nothing points at any more are pruned when the
-directory is opened.
+never syncs zeros, and a marked file whose size no longer matches its
+record (written without the mount) counts as what was written. Records
+nothing points at any more are pruned when the directory is opened.
+
+Fetched content stays, along with the file's record and a note of its
+inode, size and times right after filling in. With `--cache-size`, every
+30 seconds the mount compares the noted files with the budget; when over,
+it empties them again, least recently opened first, down to 90% of the
+budget. It skips files opened in the last minute, files the FUSE mount has
+open, and any whose size, times or inode differ from the note (changed or
+replaced since: they are the user's now). Emptying sets the marker first,
+then truncates and restores the size and time, so capture never sees zeros
+as content. Through NFS, which has no open or close, a write landing
+between the check and the truncation could be lost; the one-minute window
+after each access makes that unlikely but not impossible.
 
 A lazy directory must be used through its mount: read directly, files not
 fetched yet look empty, and its sync must run in the mount's process. After
@@ -574,7 +587,7 @@ crates/
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
 | **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
-| **6. Optional mount** | Read/write FUSE (Linux) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1 (**done**). Possible later: dropping fetched content again to free space |
+| **6. Optional mount** | Read/write FUSE (Linux) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1, with `--cache-size` to drop fetched content again (**done**) |
 
 ## 13. Decisions and open questions
 
