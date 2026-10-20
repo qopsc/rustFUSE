@@ -203,6 +203,7 @@ struct Cluster {
     hub: HubSpec,
     /// The volume's objects, straight from the bucket.
     volume: Arc<dyn ObjectStore>,
+    hub_metrics: Arc<rustfuse_hub::HubMetrics>,
 }
 
 impl Cluster {
@@ -224,7 +225,9 @@ impl Cluster {
             token: "t0ken".into(),
             tls: None,
         };
-        tokio::spawn(rustfuse_hub::Hub::new(root.clone(), hub.token.clone()).serve(listener));
+        let server = rustfuse_hub::Hub::new(root.clone(), hub.token.clone());
+        let hub_metrics = server.metrics().clone();
+        tokio::spawn(server.serve(listener));
 
         let mut c = Cluster {
             _tmp: tmp,
@@ -233,6 +236,7 @@ impl Cluster {
             offline: Vec::new(),
             hub,
             volume: Arc::new(PrefixStore::new(root.clone(), &format!("volumes/{volume}"))),
+            hub_metrics,
         };
         let mut populate = Some(populate);
         for i in 0..n {
@@ -1248,4 +1252,43 @@ async fn compaction_moves_used_chunks_and_old_references_still_work() {
         (0, 0, 0, 0),
         "{st:?}"
     );
+}
+
+#[tokio::test]
+async fn metrics_count_sync_activity() {
+    let mut c = Cluster::new(2, sample_tree).await;
+    fs::write(c.dir(0).join("new.txt"), "from machine 0").unwrap();
+    fs::write(c.dir(1).join("other.bin"), pseudo_random(300_000, 7)).unwrap();
+    c.settle().await;
+
+    let hub = &c.hub_metrics;
+    let head = c.replicas[0].applied();
+    assert_eq!(hub.head.get("vol").get(), head as i64);
+    assert_eq!(hub.appended_total.get("vol").get(), head);
+    assert!(hub.connections_total.get("log").get() >= 4);
+    // Machine 1 reads and writes its content through the hub.
+    assert!(hub.store_requests_total.get("put").get() >= 1);
+    assert!(hub.store_bytes_total.get("in").get() > 0);
+    assert!(hub.store_bytes_total.get("out").get() > 0);
+    assert_eq!(hub.refused_total.get(), 0);
+    let text = hub.render();
+    assert!(
+        text.contains(&format!("rustfuse_hub_log_head{{volume=\"vol\"}} {head}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains("rustfuse_hub_store_seconds_count{op=\"put\"}"),
+        "{text}"
+    );
+
+    for (i, r) in c.replicas.iter().enumerate() {
+        let m = r.metrics();
+        assert_eq!(m.applied.get(), head as i64, "machine {i}");
+        assert_eq!(m.hub_head.get(), head as i64, "machine {i}");
+        assert_eq!(m.outbox.get(), 0, "machine {i}");
+        assert!(m.pushed_total.get() >= 1, "machine {i}");
+        assert!(m.received_total.get() >= 1, "machine {i}");
+        assert!(m.captures_total.get() >= 1, "machine {i}");
+        assert!(m.render().contains(&format!("rustfuse_applied_seq {head}\n")));
+    }
 }

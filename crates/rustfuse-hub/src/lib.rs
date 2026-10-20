@@ -19,6 +19,7 @@
 mod client;
 pub mod codec;
 mod log;
+pub mod metrics;
 mod server;
 mod store;
 pub mod tls;
@@ -28,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub use client::{Event, HubClient};
 pub use log::Volume;
-pub use server::Hub;
+pub use server::{Hub, HubMetrics};
 pub use store::HubStore;
 
 use rustfuse_types::Changeset;

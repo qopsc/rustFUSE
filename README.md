@@ -49,6 +49,12 @@ rustfuse conflicts ~/src/project
 # Next to the hub, e.g. daily: delete stored content nobody needs any more
 # and compact packs that are mostly unused.
 rustfuse gc --volume project
+
+# Prometheus metrics (plain HTTP, GET /metrics): log position, outbox,
+# uploads and errors on a machine; connections, appends and storage calls
+# on the hub. Watch rustfuse_in_sync_timestamp_seconds for stalled machines.
+rustfuse sync ~/src/project --metrics 127.0.0.1:9421
+rustfuse hub --metrics 127.0.0.1:9420
 ```
 
 Build directories ignored by `.gitignore` (`target/`, `node_modules/`, …)

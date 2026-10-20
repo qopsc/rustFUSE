@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::client::connect_stream;
 use crate::codec::{encode_plain, read_frame, read_plain, write_frame};
+use crate::server::HubMetrics;
 use crate::{Error, ObjectError, ObjectOp, ObjectReply, ObjectRequest, ObjectResponse, Request, Response};
 
 /// Frames queued for the writer task of one connection.
@@ -267,7 +268,12 @@ impl ObjectStore for HubStore {
 }
 
 /// Serves one storage connection on the hub, after the `Store` hello.
-pub(crate) async fn serve<R, W>(store: Arc<dyn ObjectStore>, mut rd: R, mut wr: W) -> crate::Result<()>
+pub(crate) async fn serve<R, W>(
+    store: Arc<dyn ObjectStore>,
+    mut rd: R,
+    mut wr: W,
+    metrics: Arc<HubMetrics>,
+) -> crate::Result<()>
 where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -289,8 +295,21 @@ where
         let permit = permits.clone().acquire_owned().await.expect("never closed");
         let store = store.clone();
         let frames = frames.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            let op = op_name(&req.op);
+            if let ObjectOp::Put { data, .. } = &req.op {
+                metrics.store_bytes_total.get("in").add(data.len() as u64);
+            }
+            let t0 = Instant::now();
             let result = run(&*store, req.op).await;
+            metrics.store_seconds.get(op).observe(t0.elapsed());
+            metrics.store_requests_total.get(op).inc();
+            match &result {
+                Ok(ObjectReply::Data(d)) => metrics.store_bytes_total.get("out").add(d.len() as u64),
+                Err(ObjectError::Other(_)) => metrics.store_errors_total.get(op).inc(),
+                _ => {}
+            }
             let _ = frames
                 .send(encode_plain(&ObjectResponse { id: req.id, result }))
                 .await;
@@ -300,6 +319,17 @@ where
     drop(frames);
     let _ = writer.await;
     Ok(())
+}
+
+fn op_name(op: &ObjectOp) -> &'static str {
+    match op {
+        ObjectOp::Get { .. } => "get",
+        ObjectOp::GetRange { .. } => "get_range",
+        ObjectOp::Put { .. } => "put",
+        ObjectOp::Head { .. } => "head",
+        ObjectOp::Delete { .. } => "delete",
+        ObjectOp::List { .. } => "list",
+    }
 }
 
 /// Keys must stay inside the volume even on a store that would resolve
