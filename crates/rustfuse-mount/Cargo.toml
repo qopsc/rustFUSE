@@ -16,10 +16,17 @@ rustix = { version = "1.1.5", features = ["fs", "std"] }
 tokio = { version = "1.53.3", features = ["rt", "net", "sync"] }
 tracing = "0.1.44"
 
-# FUSE is Linux-only: on macOS it needs the macFUSE kernel extension, so
-# macOS mounts go through the built-in NFS client instead.
+[features]
+# FUSE on macOS through macFUSE (https://macfuse.github.io), which must be
+# installed to build and run with it. Without it, macOS mounts go through
+# the built-in NFS client.
+macfuse = ["dep:fuser"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.18.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.18.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"

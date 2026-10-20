@@ -41,6 +41,23 @@ jobs:
           cache: rust
       - run: cargo test --all-targets
 
+  # The FUSE mount on macOS links against macFUSE, so it is built (and its
+  # test runs, skipping if the runner cannot mount) only where it is
+  # installed.
+  macfuse:
+    runs-on: namespace-profile-rustfuse-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+      - run: brew install --cask macfuse && brew install pkgconf
+      - run: cargo clippy --all-targets --features rustfuse/macfuse
+      - run: cargo test -p rustfuse-mount -p rustfuse --features rustfuse/macfuse
+
   integration:
     runs-on: namespace-profile-rustfuse-linux-amd64
     services:

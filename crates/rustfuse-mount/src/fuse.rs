@@ -1,4 +1,5 @@
-//! FUSE frontend (Linux): passes each kernel request to the [`Backing`].
+//! FUSE frontend (Linux, and macOS through macFUSE): passes each kernel
+//! request to the [`Backing`].
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -23,6 +24,13 @@ use crate::backing::{self, Backing, SetAttr};
 /// again. Changes from other machines land in the directory underneath, so
 /// this bounds how long the mount can show something stale.
 const TTL: Duration = Duration::from_secs(1);
+
+// `rename` flags: Linux `renameat2`, macOS `renamex_np`.
+#[cfg(target_os = "linux")]
+const NOREPLACE: u32 = 1;
+#[cfg(target_os = "macos")]
+const NOREPLACE: u32 = 4;
+const EXCHANGE: u32 = 2;
 
 fn err(e: backing::Errno) -> Errno {
     Errno::from_i32(e.raw_os_error())
@@ -225,7 +233,7 @@ impl Filesystem for Fuse {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+        if flags.bits() & EXCHANGE != 0 {
             return reply.error(Errno::EINVAL);
         }
         Self::empty(
@@ -235,7 +243,7 @@ impl Filesystem for Fuse {
                 name.as_bytes(),
                 newparent.0,
                 newname.as_bytes(),
-                flags.contains(RenameFlags::RENAME_NOREPLACE),
+                flags.bits() & NOREPLACE != 0,
             ),
         );
     }
@@ -448,16 +456,53 @@ impl Drop for FuseMount {
     }
 }
 
-/// Mounts `backing` at `mountpoint`. `allow_other` lets other users in
-/// (non-root users need `user_allow_other` in /etc/fuse.conf).
-pub fn mount_fuse(backing: Arc<Backing>, mountpoint: &Path, allow_other: bool) -> std::io::Result<FuseMount> {
+/// Whether this build can serve FUSE mounts.
+pub const FUSE: bool = true;
+
+/// How to mount.
+#[derive(Clone, Debug, Default)]
+pub struct FuseOpts {
+    /// Let other users in (on Linux, non-root users need
+    /// `user_allow_other` in /etc/fuse.conf).
+    pub allow_other: bool,
+    /// macOS: use macFUSE's FSKit backend (no kernel extension; macOS 15.4
+    /// or later, mountpoint under /Volumes) instead of its kernel one.
+    pub fskit: bool,
+    /// macOS: the volume name Finder shows.
+    pub volname: Option<String>,
+}
+
+/// Mounts `backing` at `mountpoint`.
+pub fn mount_fuse(backing: Arc<Backing>, mountpoint: &Path, opts: &FuseOpts) -> std::io::Result<FuseMount> {
     let mut config = Config::default();
     config.mount_options.extend([
         MountOption::FSName("rustfuse".into()),
         MountOption::Subtype("rustfuse".into()),
         MountOption::DefaultPermissions,
     ]);
-    if allow_other {
+    if cfg!(target_os = "macos") {
+        // No `._*` AppleDouble files for Finder metadata: they would sync
+        // and show up in `git status`.
+        config
+            .mount_options
+            .push(MountOption::CUSTOM("noappledouble".into()));
+        if let Some(name) = &opts.volname {
+            config
+                .mount_options
+                .push(MountOption::CUSTOM(format!("volname={name}")));
+        }
+        if opts.fskit {
+            config
+                .mount_options
+                .push(MountOption::CUSTOM("backend=fskit".into()));
+        }
+    } else if opts.fskit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the FSKit backend is macOS-only",
+        ));
+    }
+    if opts.allow_other {
         config.acl = fuser::SessionACL::All;
     }
     config.n_threads = Some(8);

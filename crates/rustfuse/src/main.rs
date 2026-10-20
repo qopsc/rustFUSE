@@ -86,7 +86,8 @@ enum Command {
         #[command(flatten)]
         opts: SyncOpts,
     },
-    /// Mount a synced directory read/write somewhere else (FUSE, Linux)
+    /// Mount a synced directory read/write somewhere else (FUSE: Linux, or
+    /// macOS with macFUSE and a `macfuse` build)
     /// and keep it in sync. Writes through the mount sync like edits in
     /// the directory itself.
     Mount {
@@ -98,6 +99,10 @@ enum Command {
         /// `user_allow_other` in /etc/fuse.conf).
         #[arg(long)]
         allow_other: bool,
+        /// macOS: use macFUSE's FSKit backend, which needs no kernel
+        /// extension (macOS 15.4 or later; mount under /Volumes).
+        #[arg(long)]
+        fskit: bool,
         /// Only serve the directory; a `rustfuse sync` runs elsewhere.
         #[arg(long)]
         no_sync: bool,
@@ -678,17 +683,26 @@ async fn serve_until(
     }
 }
 
-#[cfg(target_os = "linux")]
 async fn mount(
     dir: &Path,
     mountpoint: &Path,
-    allow_other: bool,
+    fuse: &rustfuse_mount::FuseOpts,
     no_sync: bool,
     cache_size: Option<u64>,
     opts: &SyncOpts,
 ) -> Result<()> {
+    if !rustfuse_mount::FUSE {
+        bail!(
+            "this build of rustfuse has no FUSE support. Use `rustfuse nfs` and the system's NFS client, \
+             or install macFUSE (https://macfuse.github.io) and build with `--features macfuse`"
+        );
+    }
     let (backing, sync) = prepare_serving(dir, no_sync, cache_size, opts).await?;
-    let m = rustfuse_mount::mount_fuse(backing, mountpoint, allow_other)
+    let mut fuse = fuse.clone();
+    if fuse.volname.is_none() {
+        fuse.volname = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    }
+    let m = rustfuse_mount::mount_fuse(backing, mountpoint, &fuse)
         .with_context(|| format!("mount at {}", mountpoint.display()))?;
     println!(
         "Mounted {} at {} (Ctrl-C to unmount).",
@@ -698,11 +712,6 @@ async fn mount(
     let res = serve_until(sync, std::future::pending()).await;
     m.unmount()?;
     res
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn mount(_: &Path, _: &Path, _: bool, _: bool, _: Option<u64>, _: &SyncOpts) -> Result<()> {
-    bail!("FUSE mounts are Linux-only; use `rustfuse nfs` and the system's NFS client")
 }
 
 async fn serve_nfs(
@@ -881,10 +890,18 @@ async fn run(cli: Cli) -> Result<()> {
             dir,
             mountpoint,
             allow_other,
+            fskit,
             no_sync,
             cache_size,
             opts,
-        } => mount(&dir, &mountpoint, allow_other, no_sync, cache_size, &opts).await?,
+        } => {
+            let fuse = rustfuse_mount::FuseOpts {
+                allow_other,
+                fskit,
+                volname: None,
+            };
+            mount(&dir, &mountpoint, &fuse, no_sync, cache_size, &opts).await?
+        }
         Command::Nfs {
             dir,
             listen,

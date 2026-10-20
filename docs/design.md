@@ -53,11 +53,20 @@ full local copy that B's lazy loading would save. B stays on the roadmap
 
 ### 2.1 Mounts (Phase 6)
 
-`rustfuse mount <dir> <mountpoint>` (FUSE, Linux) and `rustfuse nfs <dir>`
-(NFSv3, any OS with an NFS client; the way to mount on macOS without a
-kernel extension, and from other machines) serve a synced directory
-read/write somewhere else, and run its sync in the same process
+`rustfuse mount <dir> <mountpoint>` (FUSE) and `rustfuse nfs <dir>`
+(NFSv3, any OS with an NFS client, and from other machines) serve a synced
+directory read/write somewhere else, and run its sync in the same process
 (`--no-sync` when a `rustfuse sync` runs separately).
+
+macOS is a first-class target. There, FUSE goes through macFUSE (fuser
+links its libfuse), so it is a build feature (`--features macfuse`): a
+default build runs on any Mac and mounts through the built-in NFS client.
+`--fskit` selects macFUSE's FSKit backend (macOS 15.4+), which needs no
+kernel extension but only mounts under `/Volumes` and is slower than the
+kernel backend. macOS mounts pass `noappledouble`, so Finder metadata never
+becomes `._*` files that would sync and show in `git status`. NFS stays at
+v3: the macOS client has no v4.1, and the server is local. A native lazy
+mode through Apple's File Provider framework is planned next.
 
 Both pass every operation straight to the synced directory
 (`rustfuse-mount/src/backing.rs`). The sync engine therefore sees a write
@@ -587,7 +596,7 @@ crates/
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
 | **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
-| **6. Optional mount** | Read/write FUSE (Linux) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1, with `--cache-size` to drop fetched content again (**done**) |
+| **6. Optional mount** | Read/write FUSE (Linux; macOS through macFUSE, kernel or FSKit backend) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1, with `--cache-size` to drop fetched content again (**done**) |
 
 ## 13. Decisions and open questions
 
