@@ -71,6 +71,22 @@ machines both: `--hub hub1,hub2`. See `docs/design.md` §9.1.
 Build directories ignored by `.gitignore` (`target/`, `node_modules/`, …)
 stay local; add a `.rustfuseignore` (gitignore syntax) for anything else.
 
+### Mounting
+
+A synced directory can also be mounted read/write somewhere else; the mount
+keeps it in sync, and writes through it sync like edits in the directory:
+
+```sh
+# Linux, FUSE:
+rustfuse mount ~/src/project /mnt/project
+# Any OS with an NFS client (macOS needs nothing extra), or other machines:
+rustfuse nfs ~/src/project --listen 127.0.0.1:20490
+sudo mount -t nfs -o vers=3,tcp,port=20490,mountport=20490,locallocks 127.0.0.1:/ /Volumes/project   # macOS
+sudo mount -t nfs -o vers=3,tcp,port=20490,mountport=20490,nolock 127.0.0.1:/ /mnt/project          # Linux
+```
+
+NFS has no authentication; listen on a trusted network only.
+
 ### Git
 
 - Commits, branches, stashes and worktrees replicate; `git fsck` stays clean.
@@ -97,6 +113,7 @@ stay local; add a `.rustfuseignore` (gitignore syntax) for anything else.
 | `rustfuse-chunk` | Content-defined chunking and pack files |
 | `rustfuse-hub` | The hub: per-volume ordered log, notifications |
 | `rustfuse-sync` | The sync engine: scan, capture, apply, conflict rules, git pass |
+| `rustfuse-mount` | FUSE and NFS frontends over a synced directory |
 | `rustfuse` | CLI |
 
 ## Development

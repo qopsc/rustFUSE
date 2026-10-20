@@ -1,6 +1,6 @@
 # rustFUSE — Architecture & Design (v2)
 
-Status: **Phases 0–5 implemented** · 2026-10-20
+Status: **Phases 0–5 implemented; Phase 6 started (read/write FUSE and NFS mounts)** · 2026-10-20
 
 > **v2 changes the core model.** v1 (in git history) assumed every machine
 > is online against a shared metadata server. The requirements below
@@ -50,6 +50,34 @@ full local copy that B's lazy loading would save. B stays on the roadmap
 (Phase 6) for very large trees and for "mount without syncing" use.
 
 (The project name stays; FUSE becomes an optional frontend.)
+
+### 2.1 Mounts (Phase 6)
+
+`rustfuse mount <dir> <mountpoint>` (FUSE, Linux) and `rustfuse nfs <dir>`
+(NFSv3, any OS with an NFS client; the way to mount on macOS without a
+kernel extension, and from other machines) serve a synced directory
+read/write somewhere else, and run its sync in the same process
+(`--no-sync` when a `rustfuse sync` runs separately).
+
+Both pass every operation straight to the synced directory
+(`rustfuse-mount/src/backing.rs`). The sync engine therefore sees a write
+through the mount exactly like an edit made in the directory: it is
+captured, works offline, and goes through the same conflict rules and git
+pass. Changes from other machines land in the directory and show in the
+mount within the attribute timeout (1 s on FUSE; NFS clients revalidate on
+their own schedule, `actimeo` on Linux). The state folder `.rustfuse/` is
+hidden from the mount. Hard links are refused (a volume has none; git falls
+back to renames), as are device files, pipes and sockets.
+
+Files are numbered on first lookup and keep their number through renames
+made via the mount; a name that disappears underneath (another machine
+deleted or renamed it) answers ENOENT, and an NFS handle to it ESTALE.
+
+NFS has no authentication: anyone who can reach the port can read and write
+the volume, so it listens on loopback by default. Writes are answered
+FILE_SYNC; the server does not implement COMMIT or LINK, which clients
+handle. Lazy hydration (fetching file content on first read instead of
+keeping the full copy) is the next step.
 
 ## 3. Prior art
 
@@ -491,8 +519,9 @@ crates/
   rustfuse-hub     log in the bucket, wire protocol, hub server + client
   rustfuse-sync    tree + conflict rules, redb index, scanner, watcher,
                    applier, outbox, sync loop
-  rustfuse         CLI: hub, init, attach, sync, status, conflicts, bench
-  rustfuse-fuse    optional mount frontend (Phase 6)
+  rustfuse-mount   FUSE and NFS frontends over a synced directory (§2.1)
+  rustfuse         CLI: hub, init, attach, sync, mount, nfs, status,
+                   conflicts, gc, key, bench
 ```
 
 ## 11. Testing
@@ -521,7 +550,7 @@ crates/
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
 | **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
-| **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
+| **6. Optional mount** | Read/write FUSE (Linux) and NFS (Linux, macOS) frontends over the replica, §2.1 (**done**); lazy hydration (fetch content on first read) next |
 
 ## 13. Decisions and open questions
 

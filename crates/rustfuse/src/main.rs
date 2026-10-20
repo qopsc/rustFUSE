@@ -75,22 +75,43 @@ enum Command {
     Sync {
         dir: PathBuf,
         /// Sync once and exit instead of running continuously.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "metrics")]
         once: bool,
-        /// Quiet period before capturing a burst of changes.
-        #[arg(long, default_value_t = 200)]
-        debounce_ms: u64,
-        /// Full rescan interval, to catch missed file events.
-        #[arg(long, default_value_t = 600)]
-        full_scan_secs: u64,
-        /// Serve Prometheus metrics over plain HTTP at this address
-        /// (`GET /metrics`), e.g. 127.0.0.1:9421. Not with `--once`.
-        #[arg(long, env = "RUSTFUSE_METRICS", conflicts_with = "once")]
-        metrics: Option<String>,
         #[command(flatten)]
-        creds: Credentials,
+        opts: SyncOpts,
+    },
+    /// Mount a synced directory read/write somewhere else (FUSE, Linux)
+    /// and keep it in sync. Writes through the mount sync like edits in
+    /// the directory itself.
+    Mount {
+        /// The synced directory (from `init` or `attach`).
+        dir: PathBuf,
+        /// Where to mount it; an existing, empty directory.
+        mountpoint: PathBuf,
+        /// Let other users use the mount (non-root users need
+        /// `user_allow_other` in /etc/fuse.conf).
+        #[arg(long)]
+        allow_other: bool,
+        /// Only serve the directory; a `rustfuse sync` runs elsewhere.
+        #[arg(long)]
+        no_sync: bool,
         #[command(flatten)]
-        token: Token,
+        opts: SyncOpts,
+    },
+    /// Serve a synced directory read/write over NFSv3 and keep it in sync;
+    /// mount it with the system's NFS client (macOS needs nothing extra).
+    /// There is no authentication: keep it on loopback or a trusted network.
+    Nfs {
+        /// The synced directory (from `init` or `attach`).
+        dir: PathBuf,
+        /// Address to serve NFS on.
+        #[arg(long, default_value = "127.0.0.1:20490")]
+        listen: String,
+        /// Only serve the directory; a `rustfuse sync` runs elsewhere.
+        #[arg(long)]
+        no_sync: bool,
+        #[command(flatten)]
+        opts: SyncOpts,
     },
     /// Show the volume, sync position and local changes not yet captured.
     Status { dir: PathBuf },
@@ -197,6 +218,25 @@ struct Credentials {
     access_key: Option<String>,
     #[arg(long, env = "RUSTFUSE_SECRET_KEY", hide_env_values = true)]
     secret_key: Option<String>,
+}
+
+/// How a running sync behaves.
+#[derive(Args)]
+struct SyncOpts {
+    /// Quiet period before capturing a burst of changes.
+    #[arg(long, default_value_t = 200)]
+    debounce_ms: u64,
+    /// Full rescan interval, to catch missed file events.
+    #[arg(long, default_value_t = 600)]
+    full_scan_secs: u64,
+    /// Serve Prometheus metrics over plain HTTP at this address
+    /// (`GET /metrics`), e.g. 127.0.0.1:9421. Not with `--once`.
+    #[arg(long, env = "RUSTFUSE_METRICS")]
+    metrics: Option<String>,
+    #[command(flatten)]
+    creds: Credentials,
+    #[command(flatten)]
+    token: Token,
 }
 
 /// Shared secret between the hub and machines, or a machine's own key from
@@ -469,6 +509,112 @@ fn git_fsmonitor(repo: &Path, off: bool) -> Result<()> {
     Ok(())
 }
 
+/// Opens a synced directory and the hub it syncs with.
+async fn open_replica(dir: &Path, opts: &SyncOpts) -> Result<(Replica, HubSpec)> {
+    let config = Replica::config_of(dir)?;
+    let Some(addr) = config.hub.clone() else {
+        bail!("{} has no hub configured", dir.display());
+    };
+    let spec = hub_spec(&addr, config.hub_ca.as_deref(), opts.token.get()?)?;
+    let r = Replica::open(dir, volume_store(&config, &opts.creds, &spec).await?)?;
+    Ok((r, spec))
+}
+
+/// Starts syncing `dir` (and its metrics endpoint); the returned future
+/// syncs until an error stops it.
+async fn run_sync(dir: &Path, opts: &SyncOpts) -> Result<impl std::future::Future<Output = Result<()>>> {
+    let (mut r, spec) = open_replica(dir, opts).await?;
+    if let Some(addr) = &opts.metrics {
+        let m = r.metrics();
+        serve_metrics(addr, move || m.render()).await?;
+    }
+    println!("Syncing {} with {} (Ctrl-C to stop)...", dir.display(), spec.addr);
+    let (debounce, full_scan) = (
+        Duration::from_millis(opts.debounce_ms),
+        Duration::from_secs(opts.full_scan_secs),
+    );
+    Ok(async move { Ok(r.run(&spec, debounce, full_scan).await?) })
+}
+
+/// Syncs `dir` unless `no_sync`, until `serve` ends or Ctrl-C.
+async fn serve_while_syncing(
+    dir: &Path,
+    no_sync: bool,
+    opts: &SyncOpts,
+    serve: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    if !dir.join(rustfuse_sync::STATE_DIR).is_dir() {
+        bail!(
+            "{} is not a rustfuse directory (run `rustfuse init` or `rustfuse attach`)",
+            dir.display()
+        );
+    }
+    let sync = async {
+        if no_sync {
+            std::future::pending::<()>().await;
+        }
+        run_sync(dir, opts).await?.await
+    };
+    tokio::select! {
+        res = sync => res,
+        res = serve => res,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn mount(
+    dir: &Path,
+    mountpoint: &Path,
+    allow_other: bool,
+    no_sync: bool,
+    opts: &SyncOpts,
+) -> Result<()> {
+    let backing = Arc::new(rustfuse_mount::Backing::new(dir, &[rustfuse_sync::STATE_DIR])?);
+    let m = rustfuse_mount::mount_fuse(backing, mountpoint, allow_other)
+        .with_context(|| format!("mount at {}", mountpoint.display()))?;
+    println!(
+        "Mounted {} at {} (Ctrl-C to unmount).",
+        dir.display(),
+        mountpoint.display()
+    );
+    let res = serve_while_syncing(dir, no_sync, opts, std::future::pending()).await;
+    m.unmount()?;
+    res
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn mount(_: &Path, _: &Path, _: bool, _: bool, _: &SyncOpts) -> Result<()> {
+    bail!("FUSE mounts are Linux-only; use `rustfuse nfs` and the system's NFS client")
+}
+
+async fn serve_nfs(dir: &Path, listen: &str, no_sync: bool, opts: &SyncOpts) -> Result<()> {
+    let backing = Arc::new(rustfuse_mount::Backing::new(dir, &[rustfuse_sync::STATE_DIR])?);
+    let server = rustfuse_mount::NfsServer::bind(backing, listen)
+        .await
+        .with_context(|| format!("listen on {listen}"))?;
+    let (ip, port) = (server.ip(), server.port());
+    if !ip.is_loopback() {
+        tracing::warn!(
+            "NFS has no authentication: anyone who can reach {ip}:{port} can read and write the volume"
+        );
+    }
+    println!(
+        "Serving {} over NFS at {ip}:{port}. Mount it with:",
+        dir.display()
+    );
+    let host = if ip.is_unspecified() {
+        "<this-host>".to_owned()
+    } else {
+        ip.to_string()
+    };
+    println!("  Linux: mount -t nfs -o vers=3,tcp,port={port},mountport={port},nolock {host}:/ <mountpoint>");
+    println!(
+        "  macOS: mount -t nfs -o vers=3,tcp,port={port},mountport={port},locallocks {host}:/ <mountpoint>"
+    );
+    serve_while_syncing(dir, no_sync, opts, async { Ok(server.serve().await?) }).await
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // The hook runs on every `git status`: answer without starting a runtime.
@@ -502,12 +648,14 @@ where
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // The NFS server warns about every request it does not implement
+    // (COMMIT after FILE_SYNC writes, LINK); the client copes with both.
+    if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("nfsserve")) {
+        filter = filter.add_directive("nfsserve=error".parse().expect("valid directive"));
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     match cli.command {
         Command::Hub {
             listen,
@@ -586,22 +734,9 @@ async fn run(cli: Cli) -> Result<()> {
             );
             first_sync(&mut r, &spec).await;
         }
-        Command::Sync {
-            dir,
-            once,
-            debounce_ms,
-            full_scan_secs,
-            metrics,
-            creds,
-            token,
-        } => {
-            let config = Replica::config_of(&dir)?;
-            let Some(addr) = config.hub.clone() else {
-                bail!("{} has no hub configured", dir.display());
-            };
-            let spec = hub_spec(&addr, config.hub_ca.as_deref(), token.get()?)?;
-            let mut r = Replica::open(&dir, volume_store(&config, &creds, &spec).await?)?;
+        Command::Sync { dir, once, opts } => {
             if once {
+                let (mut r, spec) = open_replica(&dir, &opts).await?;
                 let s = r.sync_once(&spec, SYNC_TIMEOUT).await?;
                 println!(
                     "Sent {} changesets, applied {}; now at changeset {}.",
@@ -610,17 +745,26 @@ async fn run(cli: Cli) -> Result<()> {
                     r.applied()
                 );
             } else {
-                if let Some(addr) = metrics {
-                    let m = r.metrics();
-                    serve_metrics(&addr, move || m.render()).await?;
-                }
-                println!("Syncing {} with {} (Ctrl-C to stop)...", dir.display(), spec.addr);
+                let sync = run_sync(&dir, &opts).await?;
                 tokio::select! {
-                    res = r.run(&spec, Duration::from_millis(debounce_ms), Duration::from_secs(full_scan_secs)) => res?,
+                    res = sync => res?,
                     _ = tokio::signal::ctrl_c() => {}
                 }
             }
         }
+        Command::Mount {
+            dir,
+            mountpoint,
+            allow_other,
+            no_sync,
+            opts,
+        } => mount(&dir, &mountpoint, allow_other, no_sync, &opts).await?,
+        Command::Nfs {
+            dir,
+            listen,
+            no_sync,
+            opts,
+        } => serve_nfs(&dir, &listen, no_sync, &opts).await?,
         Command::Status { dir } => {
             let config = Replica::config_of(&dir)?;
             // Status only reads local state; no store access needed.
@@ -760,4 +904,13 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Fsmonitor { .. } => unreachable!("handled before the runtime starts"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cli_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
 }
