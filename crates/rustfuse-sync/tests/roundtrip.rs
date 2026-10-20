@@ -1873,8 +1873,14 @@ async fn keep_downloaded_free_up_space_and_usage() {
     let big_id = format!("n{:032x}", r.tree().resolve(Path::new(big)).unwrap().0);
     let big_item = item(ask(&mut r, provider::Request::Item { id: big_id }).await);
     assert!(big_item.pinned, "inside a pinned folder");
-    for _ in 0..500 {
-        if fs::read(lazy.join(big)).unwrap() == fs::read(src.join(big)).unwrap() {
+    // The folder is fetched in the background, a file at a time.
+    let fetched = || {
+        [big, medium]
+            .iter()
+            .all(|f| fs::read(lazy.join(f)).unwrap() == fs::read(src.join(f)).unwrap())
+    };
+    for _ in 0..1000 {
+        if fetched() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
