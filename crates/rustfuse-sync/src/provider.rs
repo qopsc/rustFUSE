@@ -79,7 +79,7 @@ pub enum Request {
     /// A directory's children, by name, after `after`.
     List {
         id: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
     },
     /// The current position of the change journal.
@@ -94,28 +94,28 @@ pub enum Request {
         parent: String,
         name: String,
         kind: Kind,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<PathBuf>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime_ns: Option<i64>,
     },
     /// Changes an item: moves it, replaces its content with `source`, or
     /// sets its permissions or time. Unset fields stay.
     Modify {
         id: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<PathBuf>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mtime_ns: Option<i64>,
     },
     /// Deletes an item; a directory only if empty unless `recursive`.

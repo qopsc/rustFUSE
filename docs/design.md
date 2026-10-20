@@ -182,9 +182,22 @@ signed by one team and share an App Group. Development may work with
 Xcode's free personal team (to verify); release needs the paid Apple
 Developer account.
 
+**The app** (`macos/`, built unsigned in CI). A menu bar app adds a
+volume with `rustfuse attach --lazy` into the app group container, keeps
+its hub token in the keychain, registers the volume as a File Provider
+domain, and keeps a `rustfuse sync --provider-socket` running for it. It
+polls the daemon's anchor and signals the working set when it moves. The
+extension maps items and errors onto File Provider. It keeps `.git`
+downloaded (`downloadEagerlyAndKeepDownloaded`, which everything under it
+inherits), stages new content in the container for the daemon to move in,
+and hands fetched content to macOS as a clone. `RustFuseKit` holds the wire
+protocol, and its tests and the daemon's check the same samples.
+
 **Steps.** (1) The daemon side and the protocol (done, tested on Linux).
-(2) The Swift host app and extension in `macos/`, built unsigned in CI.
-(3) On a Mac: sign with a personal team, run the git checks above, tune.
+(2) The Swift host app and extension in `macos/`, built unsigned in CI
+(done). (3) On a Mac: sign with a personal team, run the git checks above,
+tune. One open question: whether macOS needs the working set to list every
+item. It is now empty, and items arrive as folders are browsed.
 
 ## 3. Prior art
 
@@ -631,6 +644,7 @@ crates/
   rustfuse-mount   FUSE and NFS frontends over a synced directory (§2.1)
   rustfuse         CLI: hub, init, attach, sync, mount, nfs, status,
                    conflicts, gc, key, bench
+macos/             Mac app + File Provider extension (Swift, §2.2)
 ```
 
 ## 11. Testing
