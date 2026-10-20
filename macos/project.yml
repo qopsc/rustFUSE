@@ -4,7 +4,7 @@
 name: rustFUSE
 options:
   deploymentTarget:
-    macOS: "13.0"
+    macOS: "15.0"
   createIntermediateGroups: true
 configFiles:
   Debug: Config/Base.xcconfig

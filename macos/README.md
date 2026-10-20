@@ -1,20 +1,41 @@
 # rustFUSE for Mac
 
-A menu bar app that puts rustFUSE volumes in Finder through Apple's File
-Provider, the way iCloud Drive works: each volume shows under Locations,
-files download when first opened, and macOS can free their space again.
-It needs no kernel extension or macFUSE. How it fits together is in
-[docs/design.md §2.2](../docs/design.md).
+A menu bar app with a main window (macOS 15 or later) that syncs rustFUSE
+volumes on this Mac. Each volume is shown one of three ways:
 
-- `App/`: the host app. It adds volumes (`rustfuse attach --lazy` into the
-  app group container), registers each as a File Provider domain, keeps a
-  `rustfuse sync --provider-socket` running for each, and tells macOS when
-  a volume changes. Hub tokens are kept in the login keychain.
+- **In Finder** through Apple's File Provider, the way iCloud Drive works:
+  under Locations, files download when first opened. Needs no kernel
+  extension or macFUSE.
+- **As a folder** anywhere, holding a full copy.
+- **As a mount** anywhere, through macFUSE (FSKit or its kernel
+  extension); files download when first opened. Greyed out until macFUSE
+  is installed.
+
+Volumes come from saved **connections**: a hub address, its token and CA,
+and optionally S3 keys to read the bucket directly. The app lists the
+volumes a connection's token opens, adds them here, or creates a new
+volume from a folder. Each lazy volume has its own cache size (20 GB by
+default); the window shows what each volume takes on disk against it.
+
+**Settings:** what quitting does (stop syncing, or keep syncing in the
+background through a login agent per volume), open at login, the default
+cache size, and the mount backend.
+
+How it fits together is in [docs/design.md §2.2](../docs/design.md).
+
+- `App/`: the host app. It adds volumes (`rustfuse attach`, or `init` for a
+  new one), registers Finder volumes as File Provider domains, keeps a
+  daemon running for each volume (`rustfuse sync --provider-socket`, or
+  `rustfuse mount` for a mount), and tells macOS when a Finder volume
+  changes. Secrets are kept in the login keychain. With "keep syncing", a
+  launchd login agent per volume runs the app headless
+  (`rustFUSE --daemon <volume>`) instead.
 - `Extension/`: the File Provider extension. It holds no sync logic and
   asks the volume's daemon for everything over its socket.
-- `RustFuseKit/`: what both share: the wire protocol, the socket client and
-  the app group layout. `swift test` checks the protocol against the same
-  samples the daemon's tests use.
+- `RustFuseKit/`: what both share: the wire protocol, the socket client, the
+  app group layout and the saved library (connections, volumes, settings)
+  with the daemon command lines built from it. `swift test` checks the
+  protocol against the same samples the daemon's tests use.
 
 ## Build
 
@@ -29,7 +50,10 @@ xcodebuild -project rustFUSE.xcodeproj -scheme rustFUSE -derivedDataPath build \
 ```
 
 The build compiles `rustfuse` with cargo and puts it inside the app
-(`Contents/Helpers/rustfuse`). CI builds it this way, unsigned.
+(`Contents/Helpers/rustfuse`). Where macFUSE is installed (`brew install
+--cask macfuse pkgconf`), it also bundles a build with macFUSE support
+(`Contents/Helpers/rustfuse-macfuse`) for mount mode. CI builds it this
+way, unsigned.
 
 ## Run
 
@@ -45,9 +69,8 @@ RUSTFUSE_BUNDLE_PREFIX = com.example.rustfuse
 ```
 
 Then run `xcodegen generate`, open `rustFUSE.xcodeproj`, run the `rustFUSE`
-scheme, choose **Volumes…** in the menu bar item and add a volume (its name
-in the bucket, the hub address and the hub token). It appears in Finder
-under Locations.
+scheme, choose **Open rustFUSE…** in the menu bar item, add a connection
+(the hub address and token), then add one of its volumes.
 
 ## Not checked on a Mac yet
 

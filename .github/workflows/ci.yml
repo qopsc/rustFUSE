@@ -68,7 +68,8 @@ jobs:
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
-      - run: brew install xcodegen
+      # macFUSE too, so the bundle gets its mount-mode daemon.
+      - run: brew install xcodegen pkgconf && brew install --cask macfuse
       - run: swift test --package-path macos/RustFuseKit
       - name: Build the app and extension (unsigned)
         working-directory: macos
@@ -82,6 +83,8 @@ jobs:
           test -x "$app/Contents/Helpers/rustfuse"
           test -d "$app/Contents/PlugIns/RustFuseFileProvider.appex"
           "$app/Contents/Helpers/rustfuse" sync --help | grep -q provider-socket
+          "$app/Contents/Helpers/rustfuse" volumes --help | grep -q json
+          "$app/Contents/Helpers/rustfuse-macfuse" mount --help | grep -q fskit
           plutil -p "$app/Contents/PlugIns/RustFuseFileProvider.appex/Contents/Info.plist" | grep -q fileprovider-nonui
 
   integration:

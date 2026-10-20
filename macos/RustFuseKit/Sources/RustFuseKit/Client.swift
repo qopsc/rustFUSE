@@ -16,7 +16,7 @@ public enum ProviderError: Error, Equatable {
 public final class Client: @unchecked Sendable {
     public let socketPath: String
     private let lock = NSLock()
-    private var idle: [Connection] = []
+    private var idle: [SocketConnection] = []
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.outputFormatting = .withoutEscapingSlashes
@@ -142,17 +142,17 @@ public final class Client: @unchecked Sendable {
         .badAnswer("expected \(wanted)")
     }
 
-    private func take() throws -> (Connection, Bool) {
+    private func take() throws -> (SocketConnection, Bool) {
         lock.lock()
         let conn = idle.popLast()
         lock.unlock()
         if let conn {
             return (conn, true)
         }
-        return (try Connection(path: socketPath), false)
+        return (try SocketConnection(path: socketPath), false)
     }
 
-    private func give(_ conn: Connection) {
+    private func give(_ conn: SocketConnection) {
         lock.lock()
         if idle.count < 8 {
             idle.append(conn)
@@ -165,7 +165,7 @@ public final class Client: @unchecked Sendable {
 }
 
 /// One socket connection, used by one call at a time.
-final class Connection {
+final class SocketConnection {
     private var fd: Int32
     private var buffer: [UInt8] = []
 
@@ -183,7 +183,7 @@ final class Connection {
         }
         addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw ProviderError.unreachable(Connection.errno("socket")) }
+        guard fd >= 0 else { throw ProviderError.unreachable(SocketConnection.errno("socket")) }
         var on: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         let r = withUnsafePointer(to: &addr) {
@@ -192,7 +192,7 @@ final class Connection {
             }
         }
         guard r == 0 else {
-            let message = Connection.errno("connecting to \(path)")
+            let message = SocketConnection.errno("connecting to \(path)")
             Darwin.close(fd)
             fd = -1
             throw ProviderError.unreachable(message)
@@ -217,7 +217,7 @@ final class Connection {
                 let n = Darwin.write(fd, raw.baseAddress! + off, raw.count - off)
                 if n < 0 {
                     if Darwin.errno == EINTR { continue }
-                    throw ProviderError.unreachable(Connection.errno("writing"))
+                    throw ProviderError.unreachable(SocketConnection.errno("writing"))
                 }
                 off += n
             }
@@ -236,7 +236,7 @@ final class Connection {
             let n = chunk.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, $0.count) }
             if n < 0 {
                 if Darwin.errno == EINTR { continue }
-                throw ProviderError.unreachable(Connection.errno("reading"))
+                throw ProviderError.unreachable(SocketConnection.errno("reading"))
             }
             if n == 0 {
                 throw ProviderError.unreachable("the daemon closed the connection")

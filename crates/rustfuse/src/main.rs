@@ -493,6 +493,23 @@ fn mib(bytes: u64) -> String {
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Ctrl-C, or SIGTERM (launchd, the Mac app, `kill`): stop cleanly, so a
+/// mount is unmounted and the sync state saved.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
 /// A volume's tree read from the bucket (through the hub unless
 /// `--bucket` is given).
 async fn remote_tree(
@@ -801,7 +818,7 @@ async fn serve_until(
     tokio::select! {
         res = sync => res,
         res = serve => res,
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = shutdown_signal() => Ok(()),
     }
 }
 
@@ -945,7 +962,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             tokio::select! {
                 res = hub.serve_with(listener, tls) => res?,
-                _ = tokio::signal::ctrl_c() => {}
+                _ = shutdown_signal() => {}
             }
         }
         Command::Init {
@@ -1032,7 +1049,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
                 tokio::select! {
                     res = sync => res?,
-                    _ = tokio::signal::ctrl_c() => {}
+                    _ = shutdown_signal() => {}
                 }
             }
         }

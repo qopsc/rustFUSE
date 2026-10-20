@@ -3,128 +3,173 @@ import RustFuseKit
 import ServiceManagement
 import SwiftUI
 
-/// A menu bar app: it registers each volume with File Provider (it then
-/// shows under Locations in Finder) and keeps a `rustfuse sync` running for
-/// it, which the File Provider extension talks to.
+/// `rustFUSE --daemon <key>` runs one volume headless for its login agent;
+/// otherwise this is the app.
 @main
+@MainActor
+enum Entry {
+    static func main() {
+        let args = CommandLine.arguments
+        if args.count >= 3 && args[1] == "--daemon" {
+            runHeadless(key: args[2])
+        }
+        RustFuseApp.main()
+    }
+}
+
+/// A menu bar item and a main window: volumes (shown in Finder, as a
+/// folder, or as a mount), the connections they come from, and settings.
 struct RustFuseApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
-    @StateObject private var store = VolumeStore.shared
+    @StateObject private var model = AppModel.shared
 
     var body: some Scene {
         MenuBarExtra("rustFUSE", systemImage: "externaldrive.connected.to.line.below") {
-            MenuContent(store: store)
+            MenuContent(model: model)
         }
-        Window("rustFUSE Volumes", id: "volumes") {
-            VolumesView(store: store)
+        Window("rustFUSE", id: "main") {
+            MainWindow(model: model)
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: 820, height: 540)
+        Settings {
+            SettingsView(model: model)
+        }
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        VolumeStore.shared.startAll()
+        AppModel.shared.launched()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        VolumeStore.shared.stopAll()
+        AppModel.shared.quitting()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 }
 
 struct MenuContent: View {
-    @ObservedObject var store: VolumeStore
+    @ObservedObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @State private var atLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
-        if store.volumes.isEmpty {
+        if model.library.volumes.isEmpty {
             Text("No volumes")
         }
-        ForEach(store.volumes) { v in
-            Text("\(v.name): \(store.state(of: v.name))")
-        }
-        Divider()
-        Button("Volumes…") {
-            openWindow(id: "volumes")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        Toggle("Open at Login", isOn: $atLogin)
-            .onChange(of: atLogin) { on in
-                do {
-                    if on {
-                        try SMAppService.mainApp.register()
-                    } else {
-                        try SMAppService.mainApp.unregister()
-                    }
-                } catch {
-                    store.lastError = "Open at Login: \(error.localizedDescription)"
-                }
-                atLogin = SMAppService.mainApp.status == .enabled
+        ForEach(model.library.volumes) { v in
+            Button("\(v.key): \(summary(v))") {
+                model.showInFinder(v)
             }
+        }
         Divider()
-        Button("Quit rustFUSE") { NSApp.terminate(nil) }
+        Button("Open rustFUSE…") {
+            openWindow(id: "main")
+            NSApp.activate()
+        }
+        SettingsLink {
+            Text("Settings…")
+        }
+        .keyboardShortcut(",")
+        Divider()
+        Button(model.settings.onQuit == .keepSyncing ? "Quit (volumes keep syncing)" : "Quit rustFUSE") {
+            NSApp.terminate(nil)
+        }
+        .keyboardShortcut("q")
+    }
+
+    private func summary(_ v: VolumeConfig) -> String {
+        let state = model.state(of: v.key)
+        guard let u = model.usage[v.key] else { return state }
+        if u.lazy, let limit = u.limit {
+            return "\(state), cache \(bytes(u.usage.cached)) of \(bytes(limit))"
+        }
+        return "\(state), \(bytes(u.usage.local))"
     }
 }
 
-struct VolumesView: View {
-    @ObservedObject var store: VolumeStore
-    @State private var name = ""
-    @State private var hub = ""
-    @State private var token = ""
-    @State private var caPath = ""
-    @State private var busy = false
+struct SettingsView: View {
+    @ObservedObject var model: AppModel
+    @State private var atLogin = SMAppService.mainApp.status == .enabled
+    @State private var cacheGB: Double = 20
+    @State private var onQuit: OnQuit = .stop
+    @State private var backend: MountBackend = .fskit
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Volumes").font(.headline)
-            if store.volumes.isEmpty {
-                Text("None yet. Add one below; it appears under Locations in Finder.")
-                    .foregroundStyle(.secondary)
+        Form {
+            Section {
+                Picker("When rustFUSE quits", selection: $onQuit) {
+                    Text("Stop syncing").tag(OnQuit.stop)
+                    Text("Keep syncing in the background").tag(OnQuit.keepSyncing)
+                }
+                Text(
+                    onQuit == .stop
+                        ? "Volumes sync while the app runs. Quitting stops them and unmounts mounts."
+                        : "Each volume runs as a login agent: it keeps syncing after you quit and starts when you log in."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+                Toggle("Open rustFUSE at login", isOn: $atLogin)
+                    .onChange(of: atLogin) { _, on in setOpenAtLogin(on) }
             }
-            ForEach(store.volumes) { v in
+            Section {
                 HStack {
-                    VStack(alignment: .leading) {
-                        Text(v.name)
-                        Text("\(v.hub) · \(store.state(of: v.name))").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Show Log") { store.showLog(v.name) }
-                    Button("Remove") { Task { await store.remove(v.name) } }
+                    TextField(
+                        "Cache size for new volumes", value: $cacheGB, format: .number.precision(.fractionLength(0...1)))
+                    Text("GB")
                 }
-            }
-            Divider()
-            Text("Add a volume").font(.headline)
-            Form {
-                TextField("Volume name", text: $name)
-                TextField("Hub (host[:port] or tls://host[:port])", text: $hub)
-                SecureField("Hub token", text: $token)
-                TextField("Hub CA certificate (PEM path, optional)", text: $caPath)
-            }
-            HStack {
-                Button(busy ? "Adding…" : "Add") {
-                    busy = true
-                    Task {
-                        let ok = await store.add(name: name, hub: hub, token: token, caPath: caPath)
-                        busy = false
-                        if ok {
-                            name = ""
-                            hub = ""
-                            token = ""
-                            caPath = ""
-                        }
-                    }
+                .onSubmit {
+                    model.update { $0.defaultCacheSize = UInt64(max(cacheGB, 0.1) * Double(gigabyte)) }
                 }
-                .disabled(busy || name.isEmpty || hub.isEmpty)
-                Text("Content downloads when a file is first opened; git data is kept downloaded.")
+            } footer: {
+                Text("For volumes shown in Finder or as a mount; each volume's own size is set in its page.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if let error = store.lastError {
-                Text(error).foregroundStyle(.red).textSelection(.enabled)
+            Section {
+                Picker("Mount with", selection: $backend) {
+                    Text("FSKit (no kernel extension)").tag(MountBackend.fskit)
+                    Text("macFUSE kernel extension").tag(MountBackend.kernel)
+                }
+                if macfuseAvailable() {
+                    Text("macFUSE is installed.").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    HStack {
+                        Text("Mounting needs macFUSE.").font(.caption).foregroundStyle(.secondary)
+                        Link("Install macFUSE", destination: URL(string: "https://macfuse.github.io")!).font(.caption)
+                    }
+                }
+            } footer: {
+                Text("FSKit mounts belong under /Volumes. Changing this restarts mounted volumes.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
+            ErrorText(text: model.lastError)
         }
-        .padding()
-        .frame(width: 520)
+        .formStyle(.grouped)
+        .frame(width: 480)
+        .onAppear {
+            cacheGB = Double(model.settings.defaultCacheSize) / Double(gigabyte)
+            onQuit = model.settings.onQuit
+            backend = model.settings.mountBackend
+        }
+        .onChange(of: onQuit) { _, v in model.update { $0.onQuit = v } }
+        .onChange(of: backend) { _, v in model.update { $0.mountBackend = v } }
+        .onDisappear {
+            model.update { $0.defaultCacheSize = UInt64(max(cacheGB, 0.1) * Double(gigabyte)) }
+        }
+    }
+
+    private func setOpenAtLogin(_ on: Bool) {
+        do {
+            if on {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            model.lastError = "Open at login: \(error.localizedDescription)"
+        }
+        atLogin = SMAppService.mainApp.status == .enabled
     }
 }
