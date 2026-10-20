@@ -17,9 +17,13 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
     func invalidate() {}
 
     func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
+        // Observers may be called from any thread; see `run` in
+        // FileProviderExtension.swift.
+        nonisolated(unsafe) let observer = observer
+        let after = Self.after(page)
         DispatchQueue.global(qos: .userInitiated).async { [client, id] in
             do {
-                let (items, next) = try client.list(id, after: Self.after(page))
+                let (items, next) = try client.list(id, after: after)
                 observer.didEnumerate(items.map(ProviderItem.init))
                 observer.finishEnumerating(upTo: next.map(Self.page))
             } catch {
@@ -69,9 +73,10 @@ final class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
+        nonisolated(unsafe) let observer = observer
+        let since = String(decoding: anchor.rawValue, as: UTF8.self)
         DispatchQueue.global(qos: .userInitiated).async { [client] in
             do {
-                let since = String(decoding: anchor.rawValue, as: UTF8.self)
                 let (updated, deleted, next) = try client.changes(since: since)
                 for start in stride(from: 0, to: updated.count, by: batch) {
                     observer.didUpdate(updated[start..<min(start + batch, updated.count)].map(ProviderItem.init))
@@ -95,6 +100,7 @@ final class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
 }
 
 private func currentAnchor(_ client: Client, _ done: @escaping (NSFileProviderSyncAnchor?) -> Void) {
+    nonisolated(unsafe) let done = done
     DispatchQueue.global(qos: .userInitiated).async {
         done((try? client.anchor()).map { NSFileProviderSyncAnchor(Data($0.utf8)) })
     }

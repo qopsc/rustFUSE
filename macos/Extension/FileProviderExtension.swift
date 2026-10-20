@@ -177,8 +177,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     // MARK: Helpers
 
     /// Runs `work` off the caller's thread; a thrown error goes to `fail`.
+    ///
+    /// File Provider lets its completion handlers, item templates and
+    /// requests be used from any thread, but its Objective-C API does not
+    /// say so to Swift, so they are handed over unchecked.
     private func run(_ fail: @escaping (Error) -> Void, _ work: @escaping () throws -> Void) -> Progress {
-        let progress = Progress(totalUnitCount: 1)
+        nonisolated(unsafe) let progress = Progress(totalUnitCount: 1)
+        nonisolated(unsafe) let work = work
+        nonisolated(unsafe) let fail = fail
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 try work()
