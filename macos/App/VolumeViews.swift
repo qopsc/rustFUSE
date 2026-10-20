@@ -96,7 +96,7 @@ struct UsageView: View {
                     } currentValueLabel: {
                         Text("\(bytes(u.cached)) of \(bytes(limit))")
                     }
-                    .tint(u.cached > limit ? .orange : .accentColor)
+                    .tint(u.cached > limit ? Color.orange : Color.accentColor)
                 }
                 LabeledContent("On this Mac", value: "\(bytes(u.local)) of \(bytes(u.total))")
                 LabeledContent("Git data (always kept)", value: bytes(u.git))

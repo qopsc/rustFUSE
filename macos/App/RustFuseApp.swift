@@ -6,6 +6,7 @@ import SwiftUI
 /// `rustFUSE --daemon <key>` runs one volume headless for its login agent;
 /// otherwise this is the app.
 @main
+@MainActor
 enum Entry {
     static func main() {
         let args = CommandLine.arguments
@@ -94,19 +95,18 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
     @State private var atLogin = SMAppService.mainApp.status == .enabled
     @State private var cacheGB: Double = 20
+    @State private var onQuit: OnQuit = .stop
+    @State private var backend: MountBackend = .fskit
 
     var body: some View {
         Form {
             Section {
-                Picker(
-                    "When rustFUSE quits",
-                    selection: Binding(get: { model.settings.onQuit }, set: { v in model.update { $0.onQuit = v } })
-                ) {
+                Picker("When rustFUSE quits", selection: $onQuit) {
                     Text("Stop syncing").tag(OnQuit.stop)
                     Text("Keep syncing in the background").tag(OnQuit.keepSyncing)
                 }
                 Text(
-                    model.settings.onQuit == .stop
+                    onQuit == .stop
                         ? "Volumes sync while the app runs. Quitting stops them and unmounts mounts."
                         : "Each volume runs as a login agent: it keeps syncing after you quit and starts when you log in."
                 )
@@ -128,11 +128,7 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                Picker(
-                    "Mount with",
-                    selection: Binding(
-                        get: { model.settings.mountBackend }, set: { v in model.update { $0.mountBackend = v } })
-                ) {
+                Picker("Mount with", selection: $backend) {
                     Text("FSKit (no kernel extension)").tag(MountBackend.fskit)
                     Text("macFUSE kernel extension").tag(MountBackend.kernel)
                 }
@@ -152,7 +148,13 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 480)
-        .onAppear { cacheGB = Double(model.settings.defaultCacheSize) / Double(gigabyte) }
+        .onAppear {
+            cacheGB = Double(model.settings.defaultCacheSize) / Double(gigabyte)
+            onQuit = model.settings.onQuit
+            backend = model.settings.mountBackend
+        }
+        .onChange(of: onQuit) { _, v in model.update { $0.onQuit = v } }
+        .onChange(of: backend) { _, v in model.update { $0.mountBackend = v } }
         .onDisappear {
             model.update { $0.defaultCacheSize = UInt64(max(cacheGB, 0.1) * Double(gigabyte)) }
         }
