@@ -197,7 +197,12 @@ enum Command {
     Status { dir: PathBuf },
     /// List conflict copies kept next to the files they conflicted with,
     /// and git branches that diverged on two machines.
-    Conflicts { dir: PathBuf },
+    Conflicts {
+        dir: PathBuf,
+        /// Print JSON (`{"files": [..], "branches": [{"repo", "branch"}]}`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete stored content no machine can need any more. Run it next to
     /// the hub (it needs the bucket), e.g. daily; a pack is deleted on a
     /// run at least an hour after the run that found it unused.
@@ -580,6 +585,48 @@ fn find_conflicts(root: &Path) -> Result<Vec<PathBuf>> {
     }
     found.sort();
     Ok(found)
+}
+
+/// What `rustfuse conflicts` reports: conflict copies of ordinary files,
+/// and branches that diverged on two machines. Other copies inside `.git`
+/// are handled by the git pass.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+struct ConflictReport {
+    files: Vec<String>,
+    branches: Vec<DivergedBranch>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct DivergedBranch {
+    /// The repository's folder, `.` for the top.
+    repo: String,
+    branch: String,
+}
+
+impl ConflictReport {
+    fn of(found: Vec<PathBuf>) -> Self {
+        let mut report = Self::default();
+        for p in found {
+            let s = p.to_string_lossy();
+            if let Some((repo, branch)) = s
+                .split_once(".git/refs/heads/")
+                .or_else(|| s.strip_prefix(".git/refs/heads/").map(|b| ("", b)))
+            {
+                let repo = if repo.is_empty() {
+                    ".".into()
+                } else {
+                    repo.trim_end_matches('/').to_owned()
+                };
+                report.branches.push(DivergedBranch {
+                    repo,
+                    branch: branch.to_owned(),
+                });
+            } else if !p.components().any(|c| c.as_os_str() == ".git") {
+                report.files.push(s.into_owned());
+            }
+        }
+        report
+    }
 }
 
 /// git's fsmonitor hook value; the config syncs to every machine, so it
@@ -1168,37 +1215,27 @@ async fn run(cli: Cli) -> Result<()> {
             );
             describe_changes(&dir, &r)?;
         }
-        Command::Conflicts { dir } => {
+        Command::Conflicts { dir, json } => {
             // Reads the disk, not the index, so it works while `sync` runs.
             if !dir.join(rustfuse_sync::STATE_DIR).is_dir() {
                 bail!("{} is not a rustfuse directory", dir.display());
             }
-            let found = find_conflicts(&dir)?;
-            let mut any = false;
-            for p in found {
-                // Branches that diverged on two machines; other copies
-                // inside .git are handled by the git pass.
-                let s = p.to_string_lossy();
-                if let Some((repo, branch)) = s
-                    .split_once(".git/refs/heads/")
-                    .or_else(|| s.strip_prefix(".git/refs/heads/").map(|b| ("", b)))
-                {
-                    let repo = if repo.is_empty() {
-                        ".".into()
-                    } else {
-                        repo.trim_end_matches('/').to_owned()
-                    };
+            let report = ConflictReport::of(find_conflicts(&dir)?);
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                for b in &report.branches {
                     println!(
-                        "branch {branch} in {repo}: diverged on two machines; merge it with `git merge {branch}`"
+                        "branch {} in {}: diverged on two machines; merge it with `git merge {}`",
+                        b.branch, b.repo, b.branch
                     );
-                    any = true;
-                } else if !p.components().any(|c| c.as_os_str() == ".git") {
-                    println!("{}", p.display());
-                    any = true;
                 }
-            }
-            if !any {
-                println!("No conflicts.");
+                for f in &report.files {
+                    println!("{f}");
+                }
+                if report.files.is_empty() && report.branches.is_empty() {
+                    println!("No conflicts.");
+                }
             }
         }
         Command::Key { action, store, creds } => {
@@ -1312,5 +1349,31 @@ mod tests {
         assert_eq!(parse_size("1.5g"), Ok(3 << 29));
         assert_eq!(parse_size("2TiB"), Ok(2 << 40));
         assert!(parse_size("5X").is_err() && parse_size("G").is_err());
+    }
+
+    /// `conflicts --json` prints what the Mac app reads: the first sample in
+    /// the app's wire.json.
+    #[test]
+    fn conflict_report_matches_the_app() {
+        use super::ConflictReport;
+        use std::path::PathBuf;
+        let samples: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../macos/RustFuseKit/Tests/RustFuseKitTests/wire.json"
+        ))
+        .unwrap();
+        let found = [
+            ".git/refs/heads/main.conflict-0000000c-20261020-091500",
+            ".git/objects/pack/x.conflict-0000000c-20261020-091500",
+            "docs/a.conflict-000000ab-20261019-150000.txt",
+            "notes.conflict-0000000c-20261020-091500",
+            "tools/sub/.git/refs/heads/feature/x.conflict-0000000c-20261020-091500",
+        ];
+        let report = ConflictReport::of(found.iter().map(PathBuf::from).collect());
+        // A diverged branch is kept as its own ref, the branch to merge.
+        assert_eq!(serde_json::to_value(&report).unwrap(), samples["conflicts"][0]);
+        assert_eq!(
+            serde_json::to_value(ConflictReport::of(Vec::new())).unwrap(),
+            samples["conflicts"][1]
+        );
     }
 }

@@ -2,11 +2,12 @@ import RustFuseKit
 import SwiftUI
 
 /// One saved connection: its hub and bucket, and the volumes its token
-/// opens, each with a button to add it here.
+/// opens, each with buttons to browse it in the bucket and to add it here.
 struct ConnectionDetail: View {
     @ObservedObject var model: AppModel
     let connection: Connection
     let add: (String) -> Void
+    let browse: (String) -> Void
     let edit: () -> Void
     @State private var names: [String]?
     @State private var error: String?
@@ -43,6 +44,7 @@ struct ConnectionDetail: View {
                                 Text(here.map { describe($0.mode) }.joined(separator: ", "))
                                     .font(.caption).foregroundStyle(.secondary)
                             }
+                            Button("Browse") { browse(n) }
                             Button(here.isEmpty ? "Add…" : "Add Again…") { add(n) }
                         }
                     }

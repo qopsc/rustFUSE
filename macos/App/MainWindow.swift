@@ -6,6 +6,8 @@ import SwiftUI
 enum SidebarItem: Hashable {
     case volume(String)
     case connection(UUID)
+    /// A volume of a connection, browsed in the bucket.
+    case bucket(UUID, String)
 }
 
 /// The sheets the main window opens.
@@ -86,7 +88,7 @@ struct MainWindow: View {
         switch selection {
         case .volume(let key):
             if let v = model.library.volume(key) {
-                VolumeDetail(model: model, volume: v)
+                VolumePage(model: model, volume: v)
             } else {
                 empty
             }
@@ -94,9 +96,19 @@ struct MainWindow: View {
             if let c = model.library.connection(id) {
                 ConnectionDetail(model: model, connection: c) { name in
                     sheet = .addVolume(connection: id, name: name)
+                } browse: { name in
+                    selection = .bucket(id, name)
                 } edit: {
                     sheet = .connection(c)
                 }
+            } else {
+                empty
+            }
+        case .bucket(let id, let name):
+            if let c = model.library.connection(id) {
+                RemoteBrowser(model: model, connection: c, volume: name)
+                    .id("\(id)-\(name)")
+                    .navigationTitle("\(name) in \(c.name)")
             } else {
                 empty
             }
