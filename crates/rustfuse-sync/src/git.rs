@@ -155,6 +155,9 @@ struct Resolved {
     admin: PathBuf,
     target: String,
     other: String,
+    /// The diverged ref's conflict copy (relative to the root), to mark
+    /// handled once the worktrees are clean.
+    copy: Option<PathBuf>,
 }
 
 impl GitTidy {
@@ -224,14 +227,13 @@ impl GitTidy {
                     }
                     Ok(Outcome::Diverged) => {
                         live.insert(rel.clone());
-                        if self.handled.insert(rel.clone()) {
-                            info!(
-                                branch = %rel.display(),
-                                "a branch moved on two machines at once; the other side is kept as a branch to merge"
-                            );
-                        } else {
+                        if self.handled.contains(&rel) {
                             // Already cleaned up once; do not touch again.
                             resolved.pop();
+                        } else if let Some(r) = resolved.last_mut() {
+                            // Marked handled once its worktrees are clean,
+                            // so a failed cleanup is tried again.
+                            r.copy = Some(rel);
                         }
                     }
                     Err(e) => {
@@ -242,9 +244,19 @@ impl GitTidy {
             }
             for r in resolved {
                 match self.clean_worktrees(&r) {
-                    Ok(c) => changed |= c,
+                    Ok(c) => {
+                        changed |= c;
+                        if let Some(rel) = r.copy
+                            && self.handled.insert(rel.clone())
+                        {
+                            info!(
+                                branch = %rel.display(),
+                                "a branch moved on two machines at once; the other side is kept as a branch to merge"
+                            );
+                        }
+                    }
                     Err(e) => {
-                        warn!(gitdir = %r.gitdir.display(), "cleaning worktree after a ref conflict: {e}")
+                        warn!(gitdir = %r.gitdir.display(), "cleaning worktree after a ref conflict (will retry): {e}")
                     }
                 }
             }
@@ -428,6 +440,7 @@ impl GitTidy {
                     admin: admin.clone(),
                     target,
                     other,
+                    copy: None,
                 });
             }
         };

@@ -1068,6 +1068,42 @@ async fn git_cleanup_handles_odd_names_and_deletes() {
     }
 }
 
+#[tokio::test]
+async fn git_cleanup_is_retried_after_a_failure() {
+    let mut c = Cluster::new(2, |root: &Path| {
+        git(root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("a.txt"), "base\n").unwrap();
+        fs::write(root.join("b.txt"), "base\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "first"]);
+    })
+    .await;
+    let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    fs::write(a.join("a.txt"), "a\n").unwrap();
+    git(&a, &["commit", "-q", "-am", "on a"]);
+    fs::write(b.join("b.txt"), "b\n").unwrap();
+    git(&b, &["commit", "-q", "-am", "on b"]);
+    // A git command left its lock behind: cleaning up fails for now.
+    for dir in [&a, &b] {
+        fs::write(dir.join(".git/index.lock"), "").unwrap();
+    }
+    c.settle().await;
+    for dir in [&a, &b] {
+        fs::remove_file(dir.join(".git/index.lock")).unwrap();
+    }
+    c.settle().await;
+    let main = git(&a, &["rev-parse", "main"]);
+    for dir in [&a, &b] {
+        assert_eq!(git(dir, &["rev-parse", "main"]), main);
+        assert_eq!(
+            git(dir, &["status", "--porcelain"]),
+            "",
+            "worktree not clean in {}",
+            dir.display()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn large_files_stream_and_reuse_local_chunks() {
     let size = 80 << 20;

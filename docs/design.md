@@ -352,8 +352,10 @@ if only the index does). A conflict copy next to such a file that holds
 X's or T's committed version is removed, since git keeps it. Uncommitted
 edits are never touched, and nothing runs while a merge, rebase,
 cherry-pick or revert is in progress. Each diverged conflict is cleaned
-up once per machine (remembered in `.rustfuse/git-handled`); merging the
-conflict branch later never triggers it again.
+up once per machine (remembered in `.rustfuse/git-handled` once the cleanup
+succeeds, so one that fails, e.g. on a leftover `index.lock`, is tried
+again on the next pass); merging the conflict branch later never triggers
+it again.
 
 **Linked worktrees.** `git worktree add` writes absolute paths in two
 places. The worktree's `.git` file is rewritten to a relative path, which
