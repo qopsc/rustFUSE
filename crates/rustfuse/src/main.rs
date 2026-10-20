@@ -189,7 +189,8 @@ impl Token {
 #[derive(Args)]
 struct HubArgs {
     /// Hub address: host[:port], or tls://host[:port] if the hub has a
-    /// certificate.
+    /// certificate. List several hubs of the same bucket comma-separated
+    /// (tls://a,b) to fail over between them.
     #[arg(long, env = "RUSTFUSE_HUB")]
     hub: String,
     /// CA certificates (PEM) to trust for the hub instead of the system's;
@@ -232,9 +233,17 @@ fn hub_spec(hub: &str, ca: Option<&Path>, token: String) -> Result<HubSpec> {
     })
 }
 
+/// Adds the default port to each address of a (comma-separated) list.
 fn with_port(addr: &str) -> String {
     if let Some(rest) = addr.strip_prefix(rustfuse_hub::tls::SCHEME) {
         return format!("{}{}", rustfuse_hub::tls::SCHEME, with_port(rest));
+    }
+    if addr.contains(',') {
+        return addr
+            .split(',')
+            .map(|a| with_port(a.trim().trim_start_matches(rustfuse_hub::tls::SCHEME)))
+            .collect::<Vec<_>>()
+            .join(",");
     }
     if addr
         .rsplit_once(':')

@@ -90,13 +90,16 @@ impl Volume {
     }
 
     /// Appends a changeset. Fails with [`Error::Conflict`] if its sequence
-    /// number is already taken (another writer got there first).
+    /// number is already taken (another hub got there first); the write is
+    /// atomic, so two hubs can never both claim a number.
     pub async fn put_changeset(&self, cs: &Changeset) -> Result<()> {
-        let key = log_key(cs.seq);
-        if self.store.head(&key).await?.is_some() {
+        if !self
+            .store
+            .put_if_absent(&log_key(cs.seq), codec::encode(cs))
+            .await?
+        {
             return Err(Error::Conflict(cs.seq));
         }
-        self.store.put(&key, codec::encode(cs)).await?;
         Ok(())
     }
 

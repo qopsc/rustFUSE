@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustfuse_types::Changeset;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::codec::{read_frame, write_frame};
 use crate::{Error, Request, Response, Result};
@@ -11,12 +13,35 @@ use crate::{Error, Request, Response, Result};
 pub(crate) type Reader = Box<dyn AsyncRead + Send + Unpin>;
 pub(crate) type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
-/// Opens a connection to the hub, over TLS when `tls` is given.
+/// How long to wait for one hub to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Opens a connection to the hub, over TLS when `tls` is given. `addrs`
+/// may list several hubs serving the same bucket, comma-separated; they
+/// are tried in order.
 pub(crate) async fn connect_stream(
-    addr: &str,
+    addrs: &str,
     tls: Option<&Arc<rustls::ClientConfig>>,
 ) -> Result<(Reader, Writer)> {
-    let stream = TcpStream::connect(addr).await?;
+    let mut last = None;
+    for addr in addrs.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        match connect_one(addr, tls).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                debug!(addr, "hub unreachable: {e}");
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Protocol("no hub address".into())))
+}
+
+async fn connect_one(addr: &str, tls: Option<&Arc<rustls::ClientConfig>>) -> Result<(Reader, Writer)> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{addr}: connect timed out"))
+        })??;
     let _ = stream.set_nodelay(true);
     Ok(match tls {
         Some(config) => {

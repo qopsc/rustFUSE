@@ -229,3 +229,101 @@ async fn storage_through_the_hub() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(s.get("x").await.unwrap(), bytes::Bytes::from_static(b"v"));
 }
+
+#[tokio::test]
+async fn two_hubs_share_a_volume() {
+    let root: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    Volume::new(Arc::new(PrefixStore::new(root.clone(), "volumes/v")))
+        .create()
+        .await
+        .unwrap();
+    let (h1, h2) = (start(root.clone()).await, start(root.clone()).await);
+    let mut a = HubClient::connect(&h1, "v", "secret", 0).await.unwrap();
+    let mut b = HubClient::connect(&h2, "v", "secret", 0).await.unwrap();
+
+    // Both hubs append at once and keep losing numbers to each other.
+    const N: u64 = 20;
+    let (ra, rb) = tokio::join!(
+        async {
+            for i in 1..=N {
+                a.push(&cs(1, i)).await.unwrap();
+            }
+            a
+        },
+        async {
+            for i in 1..=N {
+                b.push(&cs(2, i)).await.unwrap();
+            }
+            b
+        }
+    );
+    let (mut a, mut b) = (ra, rb);
+
+    // Each machine sees the whole log, in the same order, once.
+    let mut logs = Vec::new();
+    for c in [&mut a, &mut b] {
+        let mut seen = Vec::new();
+        while seen.len() < 2 * N as usize {
+            let cs = tokio::time::timeout(std::time::Duration::from_secs(10), next_changeset(c))
+                .await
+                .expect("changesets from the other hub arrive");
+            seen.push(cs);
+        }
+        logs.push(seen);
+    }
+    assert_eq!(logs[0], logs[1]);
+    let seqs: Vec<u64> = logs[0].iter().map(|c| c.seq).collect();
+    assert_eq!(seqs, (1..=2 * N).collect::<Vec<_>>());
+    let mut ids: Vec<(u64, u64)> = logs[0].iter().map(|c| (c.version.replica.0, c.local)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 2 * N as usize, "a changeset was lost or doubled");
+}
+
+#[tokio::test]
+async fn clients_fail_over_to_the_next_hub() {
+    let root: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    Volume::new(Arc::new(PrefixStore::new(root.clone(), "volumes/v")))
+        .create()
+        .await
+        .unwrap();
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let live = start(root).await;
+    let both = format!("{dead}, {live}");
+    let mut c = HubClient::connect(&both, "v", "secret", 0).await.unwrap();
+    c.push(&cs(1, 1)).await.unwrap();
+    assert_eq!(next_changeset(&mut c).await.seq, 1);
+    let store = HubStore::connect(&both, None, "v", "secret").await.unwrap();
+    assert!(store.head("volume.json").await.unwrap().is_some());
+    assert!(HubClient::connect(&dead, "v", "secret", 0).await.is_err());
+}
+
+#[tokio::test]
+async fn resent_changesets_are_not_appended_twice() {
+    let root: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    Volume::new(Arc::new(PrefixStore::new(root.clone(), "volumes/v")))
+        .create()
+        .await
+        .unwrap();
+    let (h1, h2) = (start(root.clone()).await, start(root.clone()).await);
+    let mut a = HubClient::connect(&h1, "v", "secret", 0).await.unwrap();
+    a.push(&cs(1, 1)).await.unwrap();
+    assert_eq!(next_changeset(&mut a).await.seq, 1);
+    // Again on the same hub, then on the other one after a newer change.
+    a.push(&cs(1, 1)).await.unwrap();
+    let mut b = HubClient::connect(&h2, "v", "secret", 0).await.unwrap();
+    b.push(&cs(2, 1)).await.unwrap();
+    b.push(&cs(1, 1)).await.unwrap();
+    let mut acks = Vec::new();
+    while acks.len() < 2 {
+        if let Event::Pushed { local, seq } = b.next().await.unwrap().unwrap() {
+            acks.push((local, seq));
+        }
+    }
+    assert_eq!(acks, [(1, 2), (1, 1)]);
+    let log = Volume::new(Arc::new(PrefixStore::new(root, "volumes/v")));
+    assert_eq!(log.head().await.unwrap(), 2);
+}

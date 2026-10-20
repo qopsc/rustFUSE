@@ -54,6 +54,15 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
+        let mut objects = self.objects.lock().unwrap();
+        if objects.contains_key(key) {
+            return Ok(false);
+        }
+        objects.insert(key.to_owned(), (data, SystemTime::now()));
+        Ok(true)
+    }
+
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         Ok(self.objects.lock().unwrap().get(key).map(|(d, t)| ObjectMeta {
             key: key.to_owned(),

@@ -367,8 +367,9 @@ nothing here), then later ones take 0.06–0.1 s.
 
 ## 9. Hub
 
-- Rust, tokio; one process (`rustfuse hub`) per deployment, run next to
-  rustFS. One hub serves every volume in a bucket.
+- Rust, tokio; `rustfuse hub` runs next to rustFS. One hub serves every
+  volume in a bucket, and several hubs can serve the same bucket at once
+  (§9.1).
 - Per volume: the hub numbers each changeset and writes it to the bucket
   (`log/{seq}`) **before** acknowledging it, then streams it to every
   connected machine. Recent changesets are cached in memory; older ones
@@ -414,8 +415,58 @@ nothing here), then later ones take 0.06–0.1 s.
   rustfuse_applied_seq`; a machine whose
   `rustfuse_in_sync_timestamp_seconds` stops moving needs a look. Bind it
   to localhost or a trusted network: it has no auth.
-- HA is optional; if the hub is down, every machine keeps working offline,
-  and content waits in a local spool if the bucket is unreachable too.
+- HA is optional (§9.1); if every hub is down, every machine keeps working
+  offline, and content waits in a local spool if the bucket is unreachable
+  too.
+
+### 9.1 High availability
+
+The bucket holds all shared state; a hub keeps only a cache of recent
+changesets and its connections. So HA means running more than one hub
+over the same bucket and letting machines reach whichever is up.
+
+- **Several hubs, one log.** A hub writes `log/{seq}` with a create-only
+  write (S3 `If-None-Match: *`), so exactly one hub can claim each number.
+  A hub that loses the race reads what the other wrote, sends it to its
+  own machines, and tries the next number. While machines are connected,
+  each hub also lists the log every 2 s to pick up the other hubs'
+  appends. Machines on the same hub see a change at once; across hubs it
+  takes up to those 2 s. `rustfuse_hub_peer_changesets_total` counts what
+  a hub picked up from the others.
+- **Store support.** This needs conditional writes. AWS S3 and rustFS
+  support them (the store conformance suite races eight writers and checks
+  exactly one wins; CI runs it against rustFS). On a store without them,
+  run one hub at a time.
+- **Machines.** `--hub` takes a comma-separated list (`tls://hub1,hub2`).
+  Every connect, including the storage proxy's, tries each address in
+  order with a 5 s timeout. Give each machine the nearest hub first. A DNS
+  name or TCP load balancer in front of the hubs works as well. All hubs
+  must share `RUSTFUSE_HUB_TOKEN`, and with TLS each hub's certificate must
+  name its own host (or be listed in `--hub-ca`).
+- **What failover costs.** A machine whose hub goes away logs the lost
+  connection, reconnects to the next address with the usual backoff
+  (0.5 s, doubling), re-sends anything not yet acknowledged, and catches
+  up from its last applied changeset. A changeset that a hub wrote but
+  whose acknowledgement was lost is re-sent. The receiving hub recognises
+  it among the changesets it has cached (the last 4096, at least the last
+  64 right after it opens the volume) and answers with the number it
+  already has, so it is not appended twice.
+- **Upgrades.** Hubs hold no state, so restart them one at a time.
+- **The bucket is the single point of failure.** Make rustFS itself
+  redundant (multiple nodes with erasure coding) and back up or replicate
+  the bucket. While the bucket is down, machines keep working, and
+  machines that reach it directly spool new packs locally until it is
+  back. Machines that reach it through a hub keep their changes in the
+  outbox, and their uploads wait the same way.
+- **Cleanup.** Run `rustfuse gc` from one place on a schedule, not from
+  every hub.
+- **Tested.** Two hubs over rustFS, two machines (one through the hub's
+  storage proxy) listing them in opposite order:
+  - With both hubs up, 20 files created on each machine at once converge.
+  - With the first hub killed, both machines move to the second, and new
+    edits (including a 300 KB file) converge.
+  - With the first hub restarted and the second killed, they move back,
+    and again everything converges.
 
 ## 10. Code layout
 
@@ -456,7 +507,7 @@ crates/
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
 | **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
-| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), HA notes |
+| **5. Remote & ops** (in progress) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**) |
 | **6. Optional mount** | FUSE/NFS frontend over the replica with lazy hydration (v1 ideas) |
 
 ## 13. Decisions and open questions

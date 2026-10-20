@@ -58,6 +58,29 @@ pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     store.put(&k("a"), Bytes::from_static(b"new")).await.unwrap();
     assert_eq!(store.get(&k("a")).await.unwrap(), Bytes::from_static(b"new"));
 
+    // Create-only writes, racing: exactly one wins and its data stays.
+    assert!(
+        !store
+            .put_if_absent(&k("a"), Bytes::from_static(b"x"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get(&k("a")).await.unwrap(), Bytes::from_static(b"new"));
+    let once = k("once");
+    let racers = (0..8u8).map(|i| store.put_if_absent(&once, Bytes::from(vec![i; 100])));
+    let won: Vec<usize> = futures::future::join_all(racers)
+        .await
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.unwrap().then_some(i))
+        .collect();
+    assert_eq!(won.len(), 1, "put_if_absent let {won:?} write");
+    assert_eq!(
+        store.get(&once).await.unwrap(),
+        Bytes::from(vec![won[0] as u8; 100])
+    );
+    store.delete(&once).await.unwrap();
+
     // Listing with pagination; "list/" must not match "list2/".
     for i in 0..5 {
         store

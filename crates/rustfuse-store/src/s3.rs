@@ -183,6 +183,25 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
+    async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
+        let res = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.full_key(key))
+            .if_none_match("*")
+            .body(ByteStream::from(data))
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            // 412: the object exists. 409: another conditional write to the
+            // key is in flight; the caller re-reads and decides again.
+            Err(e) if matches!(http_status(&e), Some(412 | 409)) => Ok(false),
+            Err(e) => Err(Error::backend(e)),
+        }
+    }
+
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let res = self
             .client
