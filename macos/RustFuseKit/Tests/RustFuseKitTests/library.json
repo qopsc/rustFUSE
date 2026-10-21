@@ -1,0 +1,51 @@
+{
+  "connections": [
+    {
+      "hub": "tls://hub.example.com:7420",
+      "id": "8F14E45F-CEEA-467A-9B36-4B0C2A8F5D11",
+      "name": "Office"
+    },
+    {
+      "caFile": "/Users/me/Library/Group Containers/dev.rustfuse/ca/2C1B7A0E-5B3D-4E8F-A1C2-93D4E5F60718.pem",
+      "hub": "nas.local:7420",
+      "id": "2C1B7A0E-5B3D-4E8F-A1C2-93D4E5F60718",
+      "name": "Home NAS",
+      "s3": {
+        "accessKey": "rustfuse",
+        "bucket": "rustfs",
+        "endpoint": "http://nas.local:9000",
+        "prefix": "team/",
+        "region": "us-east-1"
+      }
+    }
+  ],
+  "settings": {
+    "defaultCacheSize": 20000000000,
+    "mountBackend": "kernel",
+    "onQuit": "keepSyncing"
+  },
+  "volumes": [
+    {
+      "cacheSize": 20000000000,
+      "connection": "2C1B7A0E-5B3D-4E8F-A1C2-93D4E5F60718",
+      "key": "proj",
+      "mode": "finder",
+      "name": "proj"
+    },
+    {
+      "connection": "2C1B7A0E-5B3D-4E8F-A1C2-93D4E5F60718",
+      "key": "docs",
+      "mode": "folder",
+      "name": "docs",
+      "path": "/Users/me/rustFUSE/docs"
+    },
+    {
+      "cacheSize": 50000000000,
+      "connection": "8F14E45F-CEEA-467A-9B36-4B0C2A8F5D11",
+      "key": "media",
+      "mode": "mount",
+      "name": "media",
+      "path": "/Volumes/media"
+    }
+  ]
+}

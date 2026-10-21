@@ -10,6 +10,6 @@ let package = Package(
     products: [.library(name: "RustFuseKit", targets: ["RustFuseKit"])],
     targets: [
         .target(name: "RustFuseKit"),
-        .testTarget(name: "RustFuseKitTests", dependencies: ["RustFuseKit"], exclude: ["wire.json"]),
+        .testTarget(name: "RustFuseKitTests", dependencies: ["RustFuseKit"], exclude: ["wire.json", "library.json"]),
     ]
 )
