@@ -28,6 +28,27 @@ final class AppModel: ObservableObject {
     @Published var lastError: String?
     private var daemons: [String: Daemon] = [:]
     private var poller: Timer?
+    /// Sample data shown instead of asking daemons and the bucket, for
+    /// screenshots (`rustFUSE --screenshots`).
+    private(set) var demo: Demo?
+
+    /// What a demo model shows: folders of items by id, bucket folders by
+    /// path, conflicts and the volumes a connection opens.
+    struct Demo {
+        var items: [String: [Item]]
+        var bucket: [String: RemoteListing]
+        var conflicts: ConflictReport
+        var volumes: [String]
+    }
+
+    /// A model showing `library` and `demo`; it runs nothing and saves
+    /// nothing.
+    init(library: Library, usage: [String: VolumeUsage], states: [String: String], demo: Demo) {
+        self.library = library
+        self.usage = usage
+        self.states = states
+        self.demo = demo
+    }
 
     init() {
         do {
@@ -199,6 +220,7 @@ final class AppModel: ObservableObject {
 
     /// The volumes a connection's token opens.
     func volumes(of c: Connection) async throws -> [String] {
+        if let demo { return demo.volumes }
         let out = try await runTool(volumesArguments(c), connection: c)
         return try JSONDecoder().decode([String].self, from: Data(out.utf8))
     }
@@ -325,6 +347,7 @@ final class AppModel: ObservableObject {
 
     /// The conflict copies and diverged branches in `v` on this Mac.
     func conflicts(of v: VolumeConfig) async throws -> ConflictReport {
+        if let demo { return demo.conflicts }
         let dir = syncedDir(v, container: try Shared.container())
         let out = try await runTool(conflictsArguments(dir: dir), connection: nil)
         return try JSONDecoder().decode(ConflictReport.self, from: Data(out.utf8))
@@ -334,6 +357,10 @@ final class AppModel: ObservableObject {
 
     /// The folder `path` of volume `volume` as the bucket holds it.
     func listRemote(_ c: Connection, volume: String, path: String) async throws -> RemoteListing {
+        if let demo {
+            guard let listing = demo.bucket[path] else { throw failure("No folder \(path) in the sample.") }
+            return listing
+        }
         let out = try await runTool(lsArguments(volume: volume, path: path, c), connection: c)
         return try JSONDecoder().decode(RemoteListing.self, from: Data(out.utf8))
     }
@@ -379,6 +406,7 @@ final class AppModel: ObservableObject {
     }
 
     private func save() {
+        guard demo == nil else { return }
         do {
             try Shared.saveLibrary(library)
         } catch {

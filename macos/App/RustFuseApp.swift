@@ -4,6 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 /// `rustFUSE --daemon <key>` runs one volume headless for its login agent;
+/// `rustFUSE --screenshots <dir>` saves screenshots with sample data;
 /// otherwise this is the app.
 @main
 @MainActor
@@ -12,6 +13,9 @@ enum Entry {
         let args = CommandLine.arguments
         if args.count >= 3 && args[1] == "--daemon" {
             runHeadless(key: args[2])
+        }
+        if args.count >= 3 && args[1] == "--screenshots" {
+            takeScreenshots(into: URL(fileURLWithPath: args[2]))
         }
         RustFuseApp.main()
     }

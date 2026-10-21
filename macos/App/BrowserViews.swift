@@ -14,7 +14,13 @@ enum VolumeTab: String, CaseIterable {
 struct VolumePage: View {
     @ObservedObject var model: AppModel
     let volume: VolumeConfig
-    @State private var tab: VolumeTab = .overview
+    @State private var tab: VolumeTab
+
+    init(model: AppModel, volume: VolumeConfig, tab: VolumeTab = .overview) {
+        self.model = model
+        self.volume = volume
+        _tab = State(initialValue: tab)
+    }
 
     var body: some View {
         Group {
@@ -211,6 +217,11 @@ struct LocalBrowser: View {
 
     private func load() async {
         let id = folderID
+        if let demo = model.demo {
+            items = (demo.items[id] ?? []).sorted { finderOrder(($0.name, $0.kind), ($1.name, $1.kind)) }
+            loaded = true
+            return
+        }
         do {
             let c = try client()
             let all = try await Task.detached { () throws -> [Item] in

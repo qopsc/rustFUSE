@@ -29,6 +29,14 @@ struct MainWindow: View {
     @ObservedObject var model: AppModel
     @State private var selection: SidebarItem?
     @State private var sheet: Sheet?
+    /// The view a volume's page opens on.
+    private let tab: VolumeTab
+
+    init(model: AppModel, selection: SidebarItem? = nil, tab: VolumeTab = .overview) {
+        self.model = model
+        self.tab = tab
+        _selection = State(initialValue: selection)
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -88,7 +96,7 @@ struct MainWindow: View {
         switch selection {
         case .volume(let key):
             if let v = model.library.volume(key) {
-                VolumePage(model: model, volume: v)
+                VolumePage(model: model, volume: v, tab: tab)
             } else {
                 empty
             }
@@ -152,7 +160,9 @@ func bytes(_ n: UInt64) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(clamping: n), countStyle: .file)
 }
 
-let gigabyte: UInt64 = 1 << 30
+/// Sizes are entered in GB as Finder shows them (10^9 bytes), so a 20 GB
+/// cache reads as 20 GB everywhere.
+let gigabyte: UInt64 = 1_000_000_000
 
 /// An error line under a form, selectable so it can be copied.
 struct ErrorText: View {
