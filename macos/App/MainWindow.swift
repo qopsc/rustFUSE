@@ -29,6 +29,14 @@ struct MainWindow: View {
     @ObservedObject var model: AppModel
     @State private var selection: SidebarItem?
     @State private var sheet: Sheet?
+    /// The view a volume's page opens on.
+    private let tab: VolumeTab
+
+    init(model: AppModel, selection: SidebarItem? = nil, tab: VolumeTab = .overview) {
+        self.model = model
+        self.tab = tab
+        _selection = State(initialValue: selection)
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -88,7 +96,7 @@ struct MainWindow: View {
         switch selection {
         case .volume(let key):
             if let v = model.library.volume(key) {
-                VolumePage(model: model, volume: v)
+                VolumePage(model: model, volume: v, tab: tab)
             } else {
                 empty
             }

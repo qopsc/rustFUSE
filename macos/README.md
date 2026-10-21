@@ -65,7 +65,9 @@ The build compiles `rustfuse` with cargo and puts it inside the app
 (`Contents/Helpers/rustfuse`). Where macFUSE is installed (`brew install
 --cask macfuse pkgconf`), it also bundles a build with macFUSE support
 (`Contents/Helpers/rustfuse-macfuse`) for mount mode. CI builds it this
-way, unsigned.
+way, unsigned, then runs `rustFUSE --screenshots <dir>`, which shows the
+window, its views and sheets with sample data and saves a PNG of each (the
+CI run's `screenshots` artifact).
 
 ## Run
 

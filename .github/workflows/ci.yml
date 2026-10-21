@@ -86,6 +86,33 @@ jobs:
           "$app/Contents/Helpers/rustfuse" volumes --help | grep -q json
           "$app/Contents/Helpers/rustfuse-macfuse" mount --help | grep -q fskit
           plutil -p "$app/Contents/PlugIns/RustFuseFileProvider.appex/Contents/Info.plist" | grep -q fileprovider-nonui
+      # The UI with sample data (`rustFUSE --screenshots`), kept as an
+      # artifact and printed as small JPEGs between markers so the log alone
+      # shows it. Best effort: a runner without a window server skips it.
+      - name: Take screenshots
+        continue-on-error: true
+        run: |
+          app=macos/build/Build/Products/Debug/rustFUSE.app
+          mkdir -p screenshots
+          "$app/Contents/MacOS/rustFUSE" --screenshots "$PWD/screenshots" &
+          pid=$!
+          for _ in $(seq 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          kill "$pid" 2>/dev/null || true
+          ls -la screenshots
+          for f in screenshots/*.png; do
+            jpg="${f%.png}.jpg"
+            sips -s format jpeg -s formatOptions 70 -Z 1280 "$f" --out "$jpg" >/dev/null
+            echo "=== SHOT $(basename "${f%.png}") ==="
+            base64 -i "$jpg" | fold -w 160
+            echo "=== END ==="
+          done
+          ls screenshots/*.png >/dev/null
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
 
   integration:
     runs-on: namespace-profile-rustfuse-linux-amd64
