@@ -21,7 +21,7 @@ struct VolumeDetail: View {
             }
             Section("Disk use") {
                 if let u = model.usage[volume.key] {
-                    UsageView(usage: u)
+                    UsageView(usage: u).glassCard()
                 } else {
                     Text("Waiting for the volume to answer…").foregroundStyle(.secondary)
                 }
@@ -175,6 +175,7 @@ struct AddVolumeSheet: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(busy ? "Adding…" : "Add") { add() }
                     .keyboardShortcut(.defaultAction)
+                    .mainButton()
                     .disabled(busy || name.isEmpty || (mode == .mount && !macfuseAvailable()))
             }
         }
@@ -284,6 +285,7 @@ struct NewVolumeSheet: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(busy ? "Uploading…" : "Create") { create() }
                     .keyboardShortcut(.defaultAction)
+                    .mainButton()
                     .disabled(busy || name.isEmpty || folder.isEmpty || connectionID == nil)
             }
         }

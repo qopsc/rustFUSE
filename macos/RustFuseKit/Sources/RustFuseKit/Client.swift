@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-public enum ProviderError: Error, Equatable {
+public enum ProviderError: Error, Equatable, Sendable {
     /// The daemon answered with an error.
     case daemon(ErrorCode, String)
     /// The daemon is not running or went away.

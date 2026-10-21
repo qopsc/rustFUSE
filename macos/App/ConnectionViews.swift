@@ -136,6 +136,7 @@ struct ConnectionSheet: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Save") { save() }
                     .keyboardShortcut(.defaultAction)
+                    .mainButton()
                     .disabled(hub.isEmpty || (direct && (bucket.isEmpty || accessKey.isEmpty)))
             }
         }
@@ -211,31 +212,6 @@ struct ConnectionSheet: View {
 /// `rustfuse volumes` with an explicit environment, for checking a
 /// connection before it is saved.
 private func runChecked(_ args: [String], env: [String: String]) async throws -> [String] {
-    try await withCheckedThrowingContinuation { cont in
-        let p = Process()
-        p.executableURL = rustfuseTool()
-        p.arguments = args
-        p.environment = env
-        let out = Pipe()
-        let err = Pipe()
-        p.standardOutput = out
-        p.standardError = err
-        p.terminationHandler = { p in
-            let o = out.fileHandleForReading.readDataToEndOfFile()
-            let e = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            if p.terminationStatus == 0, let names = try? JSONDecoder().decode([String].self, from: o) {
-                cont.resume(returning: names)
-            } else {
-                cont.resume(
-                    throwing: CocoaError(
-                        .executableLoad,
-                        userInfo: [NSLocalizedDescriptionKey: e.trimmingCharacters(in: .whitespacesAndNewlines)]))
-            }
-        }
-        do {
-            try p.run()
-        } catch {
-            cont.resume(throwing: error)
-        }
-    }
+    let out = try await runProcess(rustfuseTool(), args, env: env)
+    return try JSONDecoder().decode([String].self, from: Data(out.utf8))
 }

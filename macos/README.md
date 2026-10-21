@@ -50,7 +50,8 @@ How it fits together is in [docs/design.md §2.2](../docs/design.md).
 
 ## Build
 
-Needs Xcode, Rust and [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+Needs Xcode 26 or later (the code is Swift 6, and uses Liquid Glass on
+macOS 26 and later while still running on macOS 15), Rust and [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 (`brew install xcodegen`).
 
 ```sh

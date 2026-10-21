@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 import PackageDescription
 
 // What the rustFUSE app and its File Provider extension share: the wire
@@ -6,7 +6,7 @@ import PackageDescription
 // app group layout.
 let package = Package(
     name: "RustFuseKit",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v15)],
     products: [.library(name: "RustFuseKit", targets: ["RustFuseKit"])],
     targets: [
         .target(name: "RustFuseKit"),

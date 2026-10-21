@@ -136,7 +136,6 @@ struct LocalBrowser: View {
                     Text("Empty folder").foregroundStyle(.secondary)
                 }
             }
-            Divider()
             HStack {
                 if let error {
                     ErrorText(text: error)
@@ -147,8 +146,7 @@ struct LocalBrowser: View {
                 actions(selection)
             }
             .controlSize(.small)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .bottomBar()
         }
         // Reloads while shown, so downloads and changes from other machines
         // appear.
@@ -313,7 +311,6 @@ struct RemoteBrowser: View {
                     Text("Empty folder").foregroundStyle(.secondary)
                 }
             }
-            Divider()
             HStack {
                 if let error {
                     ErrorText(text: error)
@@ -330,11 +327,11 @@ struct RemoteBrowser: View {
                 Spacer()
                 Button("Refresh") { Task { await load() } }
                 Button("Download…") { download(selection) }
+                    .mainButton()
                     .disabled(selection.isEmpty || busy != nil)
             }
             .controlSize(.small)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .bottomBar()
         }
         .task(id: trail) {
             selection = []

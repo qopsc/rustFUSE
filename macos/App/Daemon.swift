@@ -35,45 +35,43 @@ func toolEnv(for connection: Connection?) -> [String: String] {
 /// Runs `rustfuse` to completion with `connection`'s secrets; returns its
 /// standard output, or throws its output if it failed.
 func runTool(_ args: [String], connection: Connection?) async throws -> String {
-    let env = toolEnv(for: connection)
-    return try await withCheckedThrowingContinuation { cont in
+    try await runProcess(rustfuseTool(), args, env: toolEnv(for: connection))
+}
+
+/// Runs `tool` to completion; returns its standard output, or throws its
+/// error output if it failed. Output goes through temporary files, so a
+/// chatty tool cannot fill a pipe and stall.
+func runProcess(_ tool: URL, _ args: [String], env: [String: String]) async throws -> String {
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("rustfuse-\(UUID().uuidString)")
+    let outURL = tmp.appendingPathExtension("out")
+    let errURL = tmp.appendingPathExtension("err")
+    defer {
+        try? FileManager.default.removeItem(at: outURL)
+        try? FileManager.default.removeItem(at: errURL)
+    }
+    FileManager.default.createFile(atPath: outURL.path, contents: nil)
+    FileManager.default.createFile(atPath: errURL.path, contents: nil)
+    let status: Int32 = try await withCheckedThrowingContinuation { cont in
         let p = Process()
-        p.executableURL = rustfuseTool()
+        p.executableURL = tool
         p.arguments = args
         p.environment = env
-        let out = Pipe()
-        let err = Pipe()
-        p.standardOutput = out
-        p.standardError = err
+        p.terminationHandler = { cont.resume(returning: $0.terminationStatus) }
         do {
+            p.standardOutput = try FileHandle(forWritingTo: outURL)
+            p.standardError = try FileHandle(forWritingTo: errURL)
             try p.run()
         } catch {
             cont.resume(throwing: error)
-            return
-        }
-        // Read while it runs, so a chatty tool cannot fill a pipe and stall.
-        DispatchQueue.global().async {
-            var errText = ""
-            let group = DispatchGroup()
-            group.enter()
-            DispatchQueue.global().async {
-                errText = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                group.leave()
-            }
-            let outText = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            group.wait()
-            p.waitUntilExit()
-            if p.terminationStatus == 0 {
-                cont.resume(returning: outText)
-            } else {
-                let message = errText.isEmpty ? outText : errText
-                cont.resume(
-                    throwing: CocoaError(
-                        .executableLoad,
-                        userInfo: [NSLocalizedDescriptionKey: message.trimmingCharacters(in: .whitespacesAndNewlines)]))
-            }
         }
     }
+    let out = (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
+    guard status == 0 else {
+        let err = (try? String(contentsOf: errURL, encoding: .utf8)) ?? ""
+        let message = (err.isEmpty ? out : err).trimmingCharacters(in: .whitespacesAndNewlines)
+        throw CocoaError(.executableLoad, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+    return out
 }
 
 /// Keeps one volume's daemon running (`rustfuse sync`, or `rustfuse mount`
@@ -162,14 +160,15 @@ final class Daemon: @unchecked Sendable {
             let started = Date()
             p.terminationHandler = { [weak self] p in
                 guard let self else { return }
+                let status = p.terminationStatus
                 self.queue.async {
                     guard !self.stopped else { return }
                     // Back off while it keeps failing; a run that lasted a
                     // while starts the delay over.
                     self.restartDelay =
                         Date().timeIntervalSince(started) > 60 ? 1 : min(self.restartDelay * 2, 60)
-                    self.onState("stopped (exit \(p.terminationStatus)), restarting")
-                    log.error("\(self.volume.key, privacy: .public) exited with \(p.terminationStatus)")
+                    self.onState("stopped (exit \(status)), restarting")
+                    log.error("\(self.volume.key, privacy: .public) exited with \(status)")
                     self.queue.asyncAfter(deadline: .now() + self.restartDelay) { self.launch() }
                 }
             }
@@ -187,13 +186,12 @@ final class Daemon: @unchecked Sendable {
     private func watch() {
         guard let socket = try? Shared.socket(volume.key) else { return }
         let client = Client(socketPath: socket.path)
-        let domain = finderDomain(volume)
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
             guard let self, let anchor = try? client.anchor(), anchor != self.lastAnchor else { return }
             self.lastAnchor = anchor
-            NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { error in
+            NSFileProviderManager(for: finderDomain(self.volume))?.signalEnumerator(for: .workingSet) { error in
                 if let error {
                     log.error("signalling \(self.volume.key, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -222,6 +220,8 @@ func runHeadless(key: String) -> Never {
     let daemon = Daemon(volume: v, connection: lib.connection(v.connection), settings: lib.settings) { state in
         log.info("\(key, privacy: .public): \(state, privacy: .public)")
     }
+    // Kept alive by never returning.
+    var sources: [DispatchSourceSignal] = []
     for sig in [SIGTERM, SIGINT] {
         signal(sig, SIG_IGN)
         let s = DispatchSource.makeSignalSource(signal: sig, queue: .global())
@@ -230,11 +230,8 @@ func runHeadless(key: String) -> Never {
             exit(0)
         }
         s.resume()
-        signalSources.append(s)
+        sources.append(s)
     }
     daemon.start()
-    dispatchMain()
+    withExtendedLifetime(sources) { dispatchMain() }
 }
-
-/// Kept alive for the life of a headless daemon.
-private var signalSources: [DispatchSourceSignal] = []

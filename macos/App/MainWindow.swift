@@ -185,3 +185,40 @@ func chooseFile(prompt: String) -> String? {
     panel.prompt = prompt
     return panel.runModal() == .OK ? panel.url?.path : nil
 }
+
+// Liquid Glass on macOS 26 and later, used sparingly: the system already
+// gives the sidebar, toolbar and controls their glass. Earlier versions
+// keep the plain look.
+extension View {
+    /// A bar along the bottom of a browser: floating glass, or a plain bar
+    /// under a divider.
+    @ViewBuilder func bottomBar() -> some View {
+        let bar = padding(.horizontal, 12).padding(.vertical, 8)
+        if #available(macOS 26, *) {
+            bar.glassEffect(.regular, in: .rect(cornerRadius: 12)).padding(8)
+        } else {
+            VStack(spacing: 0) {
+                Divider()
+                bar
+            }
+        }
+    }
+
+    /// A summary card, such as a volume's disk use.
+    @ViewBuilder func glassCard() -> some View {
+        if #available(macOS 26, *) {
+            padding(12).glassEffect(.regular, in: .rect(cornerRadius: 14))
+        } else {
+            self
+        }
+    }
+
+    /// The one main action of a sheet or bar.
+    @ViewBuilder func mainButton() -> some View {
+        if #available(macOS 26, *) {
+            buttonStyle(.glassProminent)
+        } else {
+            self
+        }
+    }
+}
