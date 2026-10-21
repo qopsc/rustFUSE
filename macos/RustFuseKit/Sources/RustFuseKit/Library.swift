@@ -101,7 +101,7 @@ public enum MountBackend: String, Codable, CaseIterable, Sendable {
     case kernel
 }
 
-public let defaultCacheSize: UInt64 = 20 << 30
+public let defaultCacheSize: UInt64 = 20_000_000_000
 
 public struct AppSettings: Codable, Equatable, Sendable {
     public var onQuit: OnQuit = .stop

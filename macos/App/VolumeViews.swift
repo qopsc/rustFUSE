@@ -29,7 +29,9 @@ struct VolumeDetail: View {
             if volume.mode.isLazy {
                 Section {
                     HStack {
+                        Text("Cache size")
                         TextField("Cache size", value: $cacheGB, format: .number.precision(.fractionLength(0...1)))
+                            .labelsHidden()
                             .frame(width: 80)
                         Text("GB")
                         Spacer()
@@ -162,10 +164,13 @@ struct AddVolumeSheet: View {
                     }
                 }
                 if mode.isLazy {
-                    HStack {
-                        TextField("Cache size", value: $cacheGB, format: .number.precision(.fractionLength(0...1)))
-                            .frame(width: 80)
-                        Text("GB")
+                    LabeledContent("Cache size") {
+                        HStack {
+                            TextField("Cache size", value: $cacheGB, format: .number.precision(.fractionLength(0...1)))
+                                .labelsHidden()
+                                .frame(width: 80)
+                            Text("GB")
+                        }
                     }
                 }
             }

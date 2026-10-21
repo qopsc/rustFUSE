@@ -80,20 +80,20 @@ func sampleModel() -> AppModel {
     lib.connections = [home]
     let homeDir = NSHomeDirectory()
     lib.volumes = [
-        VolumeConfig(key: "proj", name: "proj", connection: home.id, mode: .finder, cacheSize: 20 << 30),
+        VolumeConfig(key: "proj", name: "proj", connection: home.id, mode: .finder, cacheSize: 20 * gigabyte),
         VolumeConfig(key: "docs", name: "docs", connection: home.id, mode: .folder, path: "\(homeDir)/rustFUSE/docs"),
-        VolumeConfig(key: "media", name: "media", connection: home.id, mode: .mount, path: "/Volumes/media", cacheSize: 50 << 30),
+        VolumeConfig(key: "media", name: "media", connection: home.id, mode: .mount, path: "/Volumes/media", cacheSize: 50 * gigabyte),
     ]
     let usage = [
         "proj": VolumeUsage(
             usage: decode(#"{"files": 48210, "total": 9900000000, "local": 3300000000, "git": 1500000000, "pinned": 640000000, "cached": 1160000000}"#),
-            limit: 20 << 30, lazy: true),
+            limit: 20 * gigabyte, lazy: true),
         "docs": VolumeUsage(
             usage: decode(#"{"files": 1204, "total": 820000000, "local": 820000000, "git": 0, "pinned": 0, "cached": 0}"#),
             limit: nil, lazy: false),
         "media": VolumeUsage(
             usage: decode(#"{"files": 9312, "total": 412000000000, "local": 51800000000, "git": 0, "pinned": 2100000000, "cached": 49700000000}"#),
-            limit: 50 << 30, lazy: true),
+            limit: 50 * gigabyte, lazy: true),
     ]
     let states = ["proj": "running", "docs": "running", "media": "running"]
     let root = [

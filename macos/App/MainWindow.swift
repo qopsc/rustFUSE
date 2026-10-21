@@ -160,7 +160,9 @@ func bytes(_ n: UInt64) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(clamping: n), countStyle: .file)
 }
 
-let gigabyte: UInt64 = 1 << 30
+/// Sizes are entered in GB as Finder shows them (10^9 bytes), so a 20 GB
+/// cache reads as 20 GB everywhere.
+let gigabyte: UInt64 = 1_000_000_000
 
 /// An error line under a form, selectable so it can be copied.
 struct ErrorText: View {
