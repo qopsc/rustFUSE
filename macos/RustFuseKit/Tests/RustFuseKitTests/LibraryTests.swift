@@ -85,6 +85,11 @@ final class LibraryTests: XCTestCase {
         XCTAssertEqual(
             initArguments(name: "new", c, dir: URL(fileURLWithPath: "/Users/me/new")).prefix(4),
             ["init", "/Users/me/new", "--volume", "new"])
+        XCTAssertEqual(
+            initArguments(name: "new", c, dir: URL(fileURLWithPath: "/Users/me/new"), encrypt: true).prefix(5),
+            ["init", "/Users/me/new", "--volume", "new", "--encrypt"])
+        XCTAssertEqual(toolEnvironment(base: [:], token: nil, s3Secret: nil, c, passphrase: "pw")["RUSTFUSE_PASSPHRASE"], "pw")
+        XCTAssertNil(toolEnvironment(base: [:], token: nil, s3Secret: nil, c, passphrase: "")["RUSTFUSE_PASSPHRASE"])
         let env = toolEnvironment(base: ["PATH": "/bin"], token: "t", s3Secret: "S", c)
         XCTAssertEqual(env["RUSTFUSE_HUB_TOKEN"], "t")
         XCTAssertEqual(env["RUSTFUSE_ACCESS_KEY"], "AK")

@@ -325,8 +325,22 @@ impl App {
         args: Vec<String>,
         c: Option<&Connection>,
     ) -> impl FnOnce() -> Result<String> + Send + 'static {
+        self.tool_job_with(args, c, "")
+    }
+
+    /// Like [`tool_job`](Self::tool_job), giving an encrypted volume's
+    /// passphrase (if not empty) to the command.
+    fn tool_job_with(
+        &self,
+        args: Vec<String>,
+        c: Option<&Connection>,
+        passphrase: &str,
+    ) -> impl FnOnce() -> Result<String> + Send + 'static {
         let exe = self.exe.clone();
-        let env = c.map(|c| self.env_for(c)).unwrap_or_default();
+        let mut env = c.map(|c| self.env_for(c)).unwrap_or_default();
+        if !passphrase.is_empty() {
+            env.insert("RUSTFUSE_PASSPHRASE".into(), passphrase.to_string());
+        }
         move || tool(&exe, &args, &env)
     }
 
@@ -551,7 +565,8 @@ impl App {
         });
         bucket.entries = Loaded::Loading;
         let dir = bucket.dir();
-        let job = self.tool_job(library::ls_args(&v.name, &dir, &c), Some(&c));
+        let synced = library::synced_dir(&v, &self.places.data);
+        let job = self.tool_job(library::ls_args(&v.name, &dir, &synced, &c), Some(&c));
         let key = key.to_string();
         self.spawn(
             "Reading the bucket",
@@ -983,6 +998,7 @@ impl App {
                     &format_size(self.lib.settings.default_cache_size),
                     "e.g. 20 GB",
                 ),
+                Field::secret("Passphrase", "only for an encrypted volume"),
             ],
         )
         .with_note(MOUNT_NOTE);
@@ -1001,9 +1017,15 @@ impl App {
             vec![
                 Field::text("Name", "", "letters, digits, . _ -"),
                 Field::text("Folder", "", "e.g. ~/src/proj"),
+                Field::secret("Passphrase", "empty: not encrypted"),
+                Field::secret("Again", ""),
             ],
         )
-        .with_note("The folder is uploaded as a new volume and keeps syncing in place.");
+        .with_note(
+            "The folder is uploaded as a new volume and keeps syncing in place. With a passphrase, \
+             content and names are encrypted before they leave this machine; every machine needs \
+             the passphrase to add the volume, and nobody can recover it if it is lost.",
+        );
         self.modal = Some(Modal::Form(
             FormFor::CreateVolume {
                 connection: connection.to_string(),
@@ -1105,7 +1127,8 @@ impl App {
                     .connection(&v.connection)
                     .context("no connection")?
                     .clone();
-                let job = self.tool_job(library::get_args(&v.name, path, &dest, &c), Some(&c));
+                let synced = library::synced_dir(v, &self.places.data);
+                let job = self.tool_job(library::get_args(&v.name, path, &dest, &synced, &c), Some(&c));
                 self.spawn(&format!("Downloading {path}"), job, move |app, r| match r {
                     Ok(_) => app.say(format!("Saved {}", dest.display())),
                     Err(e) => app.fail(format!("{e:#}")),
@@ -1241,7 +1264,11 @@ impl App {
         };
         let dir = library::synced_dir(&v, &self.places.data);
         self.places.create()?;
-        let job = self.tool_job(library::attach_args(&v, &c, &dir), Some(&c));
+        let job = self.tool_job_with(
+            library::attach_args(&v, &c, &dir),
+            Some(&c),
+            &form.get("Passphrase"),
+        );
         let what = if mode == Mode::Folder {
             "Downloading"
         } else {
@@ -1277,7 +1304,16 @@ impl App {
             path: Some(dir.to_string_lossy().into()),
             cache_size: None,
         };
-        let job = self.tool_job(library::init_args(&name, &c, &dir), Some(&c));
+        let passphrase = form.get("Passphrase");
+        if passphrase != form.get("Again") {
+            bail!("The passphrases differ.");
+        }
+        let encrypt = !passphrase.is_empty();
+        let job = self.tool_job_with(
+            library::init_args(&name, &c, &dir, encrypt),
+            Some(&c),
+            &passphrase,
+        );
         self.spawn(&format!("Uploading {name}"), job, move |app, r| match r {
             Ok(_) => app.added(v),
             Err(e) => app.fail(format!("Creating {name}: {e:#}")),

@@ -271,9 +271,13 @@ pub fn attach_args(v: &VolumeConfig, c: &Connection, dir: &Path) -> Vec<String> 
 }
 
 /// `rustfuse init`: a new volume `name` from the folder `dir`, which then
-/// syncs in place.
-pub fn init_args(name: &str, c: &Connection, dir: &Path) -> Vec<String> {
+/// syncs in place; `encrypt` seals it with the passphrase given in
+/// `RUSTFUSE_PASSPHRASE`.
+pub fn init_args(name: &str, c: &Connection, dir: &Path, encrypt: bool) -> Vec<String> {
     let mut args = strings(&["init", &dir.to_string_lossy(), "--volume", name]);
+    if encrypt {
+        args.push("--encrypt".into());
+    }
     args.extend(connection_args(c));
     args
 }
@@ -285,9 +289,17 @@ pub fn volumes_args(c: &Connection) -> Vec<String> {
     args
 }
 
-/// `rustfuse ls`: a folder of volume `name` as the bucket holds it.
-pub fn ls_args(name: &str, path: &str, c: &Connection) -> Vec<String> {
-    let mut args = strings(&["ls", "--volume", name, "--json"]);
+/// `rustfuse ls`: a folder of volume `name` as the bucket holds it. An
+/// encrypted volume's key comes from its synced directory `key_from`.
+pub fn ls_args(name: &str, path: &str, key_from: &Path, c: &Connection) -> Vec<String> {
+    let mut args = strings(&[
+        "ls",
+        "--volume",
+        name,
+        "--json",
+        "--key-from",
+        &key_from.to_string_lossy(),
+    ]);
     if !path.is_empty() {
         args.push(path.to_string());
     }
@@ -295,9 +307,18 @@ pub fn ls_args(name: &str, path: &str, c: &Connection) -> Vec<String> {
     args
 }
 
-/// `rustfuse get`: downloads `path` of volume `name` to `dest`.
-pub fn get_args(name: &str, path: &str, dest: &Path, c: &Connection) -> Vec<String> {
-    let mut args = strings(&["get", "--volume", name, path, &dest.to_string_lossy()]);
+/// `rustfuse get`: downloads `path` of volume `name` to `dest`, like
+/// [`ls_args`].
+pub fn get_args(name: &str, path: &str, dest: &Path, key_from: &Path, c: &Connection) -> Vec<String> {
+    let mut args = strings(&[
+        "get",
+        "--volume",
+        name,
+        path,
+        &dest.to_string_lossy(),
+        "--key-from",
+        &key_from.to_string_lossy(),
+    ]);
     args.extend(connection_args(c));
     args
 }
@@ -464,8 +485,12 @@ mod tests {
         );
         assert!(!attach_args(&folder, &c, &dir).contains(&"--lazy".to_string()));
         assert_eq!(
-            ls_args("proj", "", &c)[..4],
-            strings(&["ls", "--volume", "proj", "--json"])
+            ls_args("proj", "", &dir, &c)[..6],
+            strings(&["ls", "--volume", "proj", "--json", "--key-from", "/home/me/proj"])
+        );
+        assert_eq!(
+            init_args("proj", &c, &dir, true)[..5],
+            strings(&["init", "/home/me/proj", "--volume", "proj", "--encrypt"])
         );
         let env = tool_env(&c, Some("tok".into()), None);
         assert_eq!(env["RUSTFUSE_HUB_TOKEN"], "tok");

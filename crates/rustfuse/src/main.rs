@@ -176,6 +176,10 @@ enum Command {
         /// Print JSON (`{"seq": .., "entries": [..]}`).
         #[arg(long)]
         json: bool,
+        /// For an encrypted volume: take the key from this synced directory
+        /// of it instead of asking for the passphrase.
+        #[arg(long, value_name = "DIR")]
+        key_from: Option<PathBuf>,
         #[command(flatten)]
         hub: HubArgs,
         #[command(flatten)]
@@ -192,6 +196,10 @@ enum Command {
         path: PathBuf,
         /// Where to put it; must not exist yet.
         dest: PathBuf,
+        /// For an encrypted volume: take the key from this synced directory
+        /// of it instead of asking for the passphrase.
+        #[arg(long, value_name = "DIR")]
+        key_from: Option<PathBuf>,
         #[command(flatten)]
         hub: HubArgs,
         #[command(flatten)]
@@ -478,7 +486,9 @@ fn passphrase(confirm: bool) -> Result<String> {
         return Ok(p);
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        bail!("this volume is encrypted: set RUSTFUSE_PASSPHRASE");
+        bail!(
+            "this volume is encrypted: give its passphrase (in RUSTFUSE_PASSPHRASE when not run from a terminal)"
+        );
     }
     let p = rpassword::prompt_password("Volume passphrase: ")?;
     if p.is_empty() {
@@ -569,11 +579,15 @@ async fn remote_tree(
     hub: &HubArgs,
     store: &StoreArgs,
     creds: &Credentials,
+    key_from: Option<&Path>,
 ) -> Result<rustfuse_sync::remote::RemoteTree> {
     let spec = hub.spec()?;
     let config = store.config(volume, hub)?;
     let s = volume_store(&config, creds, &spec).await?;
-    let cipher = volume_cipher(&s).await?;
+    let cipher = match key_from {
+        Some(dir) => rustfuse_sync::crypt::load_key_if_any(dir)?.map(Arc::new),
+        None => volume_cipher(&s).await?,
+    };
     Ok(rustfuse_sync::remote::RemoteTree::load(s, cipher).await?)
 }
 
@@ -1288,8 +1302,9 @@ async fn run(cli: Cli) -> Result<()> {
             hub,
             store,
             creds,
+            key_from,
         } => {
-            let tree = remote_tree(volume, &hub, &store, &creds).await?;
+            let tree = remote_tree(volume, &hub, &store, &creds, key_from.as_deref()).await?;
             let entries = tree.list(&path.unwrap_or_default())?;
             if json {
                 let out = serde_json::json!({ "seq": tree.seq(), "entries": entries });
@@ -1314,8 +1329,9 @@ async fn run(cli: Cli) -> Result<()> {
             hub,
             store,
             creds,
+            key_from,
         } => {
-            let tree = remote_tree(volume, &hub, &store, &creds).await?;
+            let tree = remote_tree(volume, &hub, &store, &creds, key_from.as_deref()).await?;
             let d = tree.download(&path, &dest).await?;
             println!(
                 "Downloaded {} files ({}) and {} folders to {}.",
