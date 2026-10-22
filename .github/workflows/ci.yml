@@ -126,6 +126,8 @@ jobs:
           RUSTFS_SECRET_KEY: rustfsadmin
     env:
       RUSTFUSE_TEST_S3_ENDPOINT: http://localhost:9000
+      # Sync tests log here; printed below if a test fails.
+      RUSTFUSE_TEST_LOG_FILE: /tmp/rustfuse-sync-tests.log
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -140,6 +142,9 @@ jobs:
           done
           exit 1
       - run: cargo test --all-targets
+      - name: Sync test log (on failure)
+        if: failure()
+        run: tail -n 20000 "$RUSTFUSE_TEST_LOG_FILE" || true
       - name: Object store benchmark (smoke)
         run: >
           cargo run --release -p rustfuse -- bench
