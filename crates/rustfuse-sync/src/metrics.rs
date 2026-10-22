@@ -63,7 +63,7 @@ impl SyncMetrics {
         self.check_in_sync();
     }
 
-    fn check_in_sync(&self) {
+    pub(crate) fn check_in_sync(&self) {
         if self.connected.get() == 1 && self.outbox.get() == 0 && self.applied.get() >= self.hub_head.get() {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
             self.in_sync_at.set(now.as_secs() as i64);
