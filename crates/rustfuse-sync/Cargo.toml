@@ -18,6 +18,7 @@ notify = "8"
 postcard = { version = "1.1.3", features = ["use-std"] }
 rayon = "1.12.0"
 redb = "4.4.0"
+rustfuse-crypt = { version = "0.1.0", path = "../rustfuse-crypt" }
 rustfuse-chunk = { version = "0.1.0", path = "../rustfuse-chunk" }
 rustfuse-hub = { version = "0.1.0", path = "../rustfuse-hub" }
 rustfuse-store = { version = "0.1.0", path = "../rustfuse-store" }

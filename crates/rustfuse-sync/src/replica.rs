@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rayon::prelude::*;
-use rustfuse_chunk::{PackBuilder, SealedPack};
+use rustfuse_chunk::{PackBuilder, SealedPack, Sealing};
 use rustfuse_hub::{Event, HubClient, Volume};
 use rustfuse_store::ObjectStore;
 use rustfuse_types::{
@@ -98,6 +98,8 @@ pub struct Replica {
     counters: Counters,
     clock: Clock,
     volume: Volume,
+    /// How chunks are named and stored (sealed in an encrypted volume).
+    sealing: Sealing,
     builder: Arc<Mutex<PackBuilder>>,
     ignore: Ignore,
     /// Taken while the git pass runs on a blocking thread.
@@ -166,12 +168,29 @@ impl Replica {
         config: Config,
         store: Arc<dyn ObjectStore>,
     ) -> Result<(Self, CaptureStats)> {
+        Replica::init_with(root, config, store, None).await
+    }
+
+    /// Like [`init`](Self::init); with `encryption` (a new key and its
+    /// passphrase-wrapped record), the volume is encrypted
+    /// (`docs/design.md` §5.6).
+    pub async fn init_with(
+        root: &Path,
+        mut config: Config,
+        store: Arc<dyn ObjectStore>,
+        encryption: Option<(rustfuse_crypt::KeyInfo, rustfuse_crypt::VolumeKey)>,
+    ) -> Result<(Self, CaptureStats)> {
         if root.join(STATE_DIR).exists() {
             return Err(Error::AlreadyInitialized(root.to_owned()));
         }
         let volume = Volume::new(store.clone());
-        volume.create().await?;
+        let (info, key) = encryption.unzip();
+        volume.create_with(info).await?;
         create_state_dir(root)?;
+        if let Some(key) = &key {
+            crate::crypt::save_key(root, key)?;
+            config.encrypted = true;
+        }
         let index = Index::create(&index_path(root), &config)?;
         let mut r = Replica::load(root, index, store)?;
         let stats = r.capture(None).await?.unwrap_or_default();
@@ -181,24 +200,34 @@ impl Replica {
     /// Materializes an existing volume into the empty directory `root`
     /// from the bucket's snapshot and log.
     pub async fn attach(root: &Path, config: Config, store: Arc<dyn ObjectStore>) -> Result<Self> {
-        Replica::attach_with(root, config, store, false).await
+        Replica::attach_with(root, config, store, false, None).await
     }
 
     /// Like [`attach`](Self::attach); with `lazy`, files are written as
     /// placeholders and fetched when a mount first opens them
-    /// ([`crate::lazy`]).
+    /// ([`crate::lazy`]). An encrypted volume needs its `passphrase`.
     pub async fn attach_with(
         root: &Path,
-        config: Config,
+        mut config: Config,
         store: Arc<dyn ObjectStore>,
         lazy: bool,
+        passphrase: Option<&str>,
     ) -> Result<Self> {
         let volume = Volume::new(store.clone());
         volume.check().await?;
         if root.exists() && fs::read_dir(root).at(root)?.next().is_some() {
             return Err(Error::NotEmpty(root.to_owned()));
         }
+        let key = match (volume.key_info().await?, passphrase) {
+            (Some(info), Some(p)) => Some(info.unlock(p).map_err(rustfuse_hub::Error::from)?),
+            (Some(_), None) => return Err(rustfuse_hub::Error::NeedKey.into()),
+            (None, _) => None,
+        };
         create_state_dir(root)?;
+        if let Some(key) = &key {
+            crate::crypt::save_key(root, key)?;
+            config.encrypted = true;
+        }
         if lazy {
             crate::lazy::enable(root)?;
         }
@@ -218,6 +247,11 @@ impl Replica {
 
     fn load(root: &Path, index: Index, store: Arc<dyn ObjectStore>) -> Result<Self> {
         let l = index.load()?;
+        let cipher = if l.config.encrypted {
+            Some(Arc::new(crate::crypt::load_key(root)?))
+        } else {
+            None
+        };
         let mut builder = PackBuilder::new(l.config.seed);
         for r in &l.chunks {
             builder.insert_known(*r);
@@ -253,7 +287,8 @@ impl Replica {
             outbox_nodes,
             pending: l.pending.into_iter().collect(),
             stats: l.stats,
-            volume: Volume::new(store),
+            volume: Volume::new(store).with_cipher(cipher.clone()),
+            sealing: Sealing::with(cipher),
             builder: Arc::new(Mutex::new(builder)),
             checked_packs: HashMap::new(),
             metrics: Arc::default(),
@@ -273,6 +308,11 @@ impl Replica {
 
     pub fn store(&self) -> &Arc<dyn ObjectStore> {
         self.volume.store()
+    }
+
+    /// How this volume's chunks are named and stored.
+    pub fn sealing(&self) -> &Sealing {
+        &self.sealing
     }
 
     /// What is on disk, as far as the index knows.
@@ -396,6 +436,7 @@ impl Replica {
             if cs.seq <= self.counters.applied {
                 continue;
             }
+            let cs = self.volume.open_changeset(cs)?;
             if cs.seq != self.counters.applied + 1 {
                 return Err(Error::Corrupt(format!(
                     "log gap: expected changeset {}, got {}",
@@ -499,6 +540,7 @@ impl Replica {
         let applier = Applier {
             root: &self.root,
             store: self.volume.store().clone(),
+            sealing: self.sealing.clone(),
             lazy: self.lazy,
         };
         let t0 = Instant::now();
@@ -858,11 +900,12 @@ impl Replica {
         });
 
         let builder = self.builder.clone();
+        let sealing = self.sealing.clone();
         let lazy_root = self.lazy.then(|| self.root.clone());
         let reader = tokio::task::spawn_blocking(move || {
             let out: Vec<Result<Option<Content>>> = reads
                 .par_iter()
-                .map(|(path, kind)| read_one(path, *kind, &builder, &tx, lazy_root.as_deref()))
+                .map(|(path, kind)| read_one(path, *kind, &sealing, &builder, &tx, lazy_root.as_deref()))
                 .collect();
             if let Some(last) = builder.lock().unwrap().seal() {
                 let _ = tx.blocking_send(last);
@@ -1195,7 +1238,7 @@ impl Replica {
         let mut n = 0;
         for cs in &self.outbox {
             if sent.insert(cs.local) {
-                conn.push(cs).await?;
+                conn.push(&self.volume.seal_changeset(cs)).await?;
                 n += 1;
             }
         }
@@ -1622,6 +1665,7 @@ fn tokio_stream_from<T: Send + 'static>(
 fn read_one(
     path: &Path,
     kind: Kind,
+    sealing: &Sealing,
     builder: &Mutex<PackBuilder>,
     tx: &tokio::sync::mpsc::Sender<SealedPack>,
     lazy_root: Option<&Path>,
@@ -1654,18 +1698,18 @@ fn read_one(
             return Ok(Some(Content::Inline(data)));
         }
         // Grew while we looked; fall through and chunk it.
-        return read_one(path, kind, builder, tx, lazy_root);
+        return read_one(path, kind, sealing, builder, tx, lazy_root);
     }
     let mut chunks = Vec::new();
     let mut size = 0u64;
     rustfuse_chunk::chunk_reader(BufReader::with_capacity(1 << 20, file), |data| {
-        let hash = rustfuse_chunk::hash(data);
+        let hash = sealing.hash(data);
         size += data.len() as u64;
         let known = builder.lock().unwrap().lookup(&hash);
         let r = match known {
             Some(r) => r,
             None => {
-                let prepared = rustfuse_chunk::prepare(hash, data);
+                let prepared = sealing.prepare(hash, data);
                 let (r, sealed) = builder.lock().unwrap().add(prepared);
                 if let Some(pack) = sealed {
                     tx.blocking_send(pack)

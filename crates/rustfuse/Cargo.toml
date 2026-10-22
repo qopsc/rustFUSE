@@ -19,6 +19,8 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 getrandom = "0.4.3"
+rpassword = "7.4.0"
+rustfuse-crypt = { version = "0.1.0", path = "../rustfuse-crypt" }
 rustfuse-hub = { version = "0.1.0", path = "../rustfuse-hub" }
 rustfuse-mount = { version = "0.1.0", path = "../rustfuse-mount" }
 rustfuse-store = { version = "0.1.0", path = "../rustfuse-store" }

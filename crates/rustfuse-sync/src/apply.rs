@@ -32,6 +32,7 @@ const WINDOW_BYTES: u64 = 64 << 20;
 pub struct Applier<'a> {
     pub root: &'a Path,
     pub store: Arc<dyn ObjectStore>,
+    pub sealing: rustfuse_chunk::Sealing,
     /// Write placeholders instead of fetching content (`crate::lazy`).
     pub lazy: bool,
 }
@@ -240,7 +241,8 @@ impl Applier<'_> {
             })
             .collect();
         let t0 = std::time::Instant::now();
-        let data: HashMap<ChunkHash, Bytes> = rustfuse_chunk::fetch(self.store.clone(), &refs).await?;
+        let data: HashMap<ChunkHash, Bytes> =
+            rustfuse_chunk::fetch(self.store.clone(), &self.sealing, &refs).await?;
         tracing::debug!(
             chunks = refs.len(),
             ms = t0.elapsed().as_millis() as u64,
@@ -312,7 +314,7 @@ impl Applier<'_> {
                         continue;
                     }
                     let mut buf = vec![0; len as usize];
-                    if f.read_exact_at(&mut buf, offset).is_ok() && rustfuse_chunk::hash(&buf) == r.hash {
+                    if f.read_exact_at(&mut buf, offset).is_ok() && self.sealing.hash(&buf) == r.hash {
                         have.insert(r.hash, Bytes::from(buf));
                     }
                 }
@@ -323,7 +325,7 @@ impl Applier<'_> {
                 .copied()
                 .collect();
             if !missing.is_empty() {
-                have.extend(rustfuse_chunk::fetch(self.store.clone(), &missing).await?);
+                have.extend(rustfuse_chunk::fetch(self.store.clone(), &self.sealing, &missing).await?);
             }
             for r in window {
                 out.write_all(&have[&r.hash]).at(&tmp)?;

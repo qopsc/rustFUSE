@@ -34,6 +34,13 @@ rustfuse init ~/src/project --volume project --hub rustfs-host
 # Other machines: download it into an empty directory.
 rustfuse attach ~/src/project --volume project --hub rustfs-host
 
+# Encrypted: content and names are sealed before they leave each machine,
+# so the hub and the bucket see only sizes and timing. Every machine needs
+# the passphrase to attach (asked for, or RUSTFUSE_PASSPHRASE); keep it
+# safe, as nobody can recover the volume without it. See docs/design.md §5.6.
+rustfuse init ~/src/private --volume private --hub rustfs-host --encrypt
+rustfuse attach ~/src/private --volume private --hub rustfs-host
+
 # Over the internet, give the hub a certificate and use tls://. A
 # self-signed certificate works if each machine gets a copy as --hub-ca:
 #   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
@@ -172,6 +179,7 @@ instead.
 | `rustfuse-types` | IDs, clocks, tree entries, changesets |
 | `rustfuse-store` | `ObjectStore` trait, S3 and in-memory implementations, conformance suite |
 | `rustfuse-chunk` | Content-defined chunking and pack files |
+| `rustfuse-crypt` | Client-side encryption: volume keys, passphrase wrap, sealing |
 | `rustfuse-hub` | The hub: per-volume ordered log, notifications |
 | `rustfuse-sync` | The sync engine: scan, capture, apply, conflict rules, git pass |
 | `rustfuse-mount` | FUSE and NFS frontends over a synced directory |

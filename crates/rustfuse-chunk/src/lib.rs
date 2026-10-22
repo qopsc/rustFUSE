@@ -4,7 +4,8 @@
 //! Files are cut into variable-size chunks with FastCDC so that an edit only
 //! changes the chunks around it, hashed with BLAKE3 for deduplication, and
 //! batched into immutable pack objects so a large tree does not become one
-//! S3 object per file.
+//! S3 object per file. An encrypted volume names its chunks with a keyed
+//! hash and seals each one ([`Sealing`]).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
+use rustfuse_crypt::Cipher;
 use rustfuse_store::ObjectStore;
 use rustfuse_types::{ChunkHash, ChunkRef, Codec, PackId};
 
@@ -81,8 +83,94 @@ pub fn random_pack_id() -> PackId {
     PackId(u128::from_le_bytes(b))
 }
 
+/// Plain BLAKE3. A chunk's id comes from [`Sealing::hash`] instead.
 pub fn hash(data: &[u8]) -> ChunkHash {
     ChunkHash(*blake3::hash(data).as_bytes())
+}
+
+/// How a volume names and stores its chunks: in the clear, or sealed with
+/// its key.
+#[derive(Clone, Debug, Default)]
+pub struct Sealing(Option<Arc<Cipher>>);
+
+impl Sealing {
+    pub fn plain() -> Sealing {
+        Sealing(None)
+    }
+
+    pub fn with(cipher: Option<Arc<Cipher>>) -> Sealing {
+        Sealing(cipher)
+    }
+
+    pub fn cipher(&self) -> Option<&Arc<Cipher>> {
+        self.0.as_ref()
+    }
+
+    /// A chunk's id: BLAKE3, keyed in an encrypted volume.
+    pub fn hash(&self, data: &[u8]) -> ChunkHash {
+        match &self.0 {
+            Some(c) => c.chunk_hash(data),
+            None => hash(data),
+        }
+    }
+
+    /// Compresses the chunk when that helps, then seals it if the volume is
+    /// encrypted.
+    pub fn prepare(&self, hash: ChunkHash, data: &[u8]) -> Prepared {
+        let len = u32::try_from(data.len()).expect("chunk larger than 4 GiB");
+        let (codec, stored) = match zstd::bulk::compress(data, 3) {
+            // Only keep compression when it saves at least ~10%.
+            Ok(z) if z.len() < data.len() - data.len() / 10 => (Codec::Zstd, z),
+            _ => (Codec::Raw, data.to_vec()),
+        };
+        let (codec, stored) = match (&self.0, codec) {
+            (None, codec) => (codec, stored),
+            (Some(c), Codec::Zstd) => (Codec::SealedZstd, c.seal_chunk(&hash, &stored)),
+            (Some(c), _) => (Codec::SealedRaw, c.seal_chunk(&hash, &stored)),
+        };
+        Prepared {
+            hash,
+            len,
+            codec,
+            stored,
+        }
+    }
+
+    /// Decodes and verifies one chunk from its stored bytes.
+    pub fn decode(&self, r: &ChunkRef, stored: &[u8]) -> Result<Bytes> {
+        let opened;
+        let (codec, stored) = match r.codec {
+            Codec::Raw | Codec::Zstd => (r.codec, stored),
+            Codec::SealedRaw | Codec::SealedZstd => {
+                let Some(c) = &self.0 else {
+                    return Err(Error::Corrupt(
+                        r.hash,
+                        "encrypted, and this machine has no key".into(),
+                    ));
+                };
+                opened = c
+                    .open_chunk(&r.hash, stored)
+                    .map_err(|e| Error::Corrupt(r.hash, e.to_string()))?;
+                let codec = if r.codec == Codec::SealedZstd {
+                    Codec::Zstd
+                } else {
+                    Codec::Raw
+                };
+                (codec, opened.as_slice())
+            }
+        };
+        let data = match codec {
+            Codec::Zstd => Bytes::from(
+                zstd::bulk::decompress(stored, r.len as usize)
+                    .map_err(|e| Error::Corrupt(r.hash, e.to_string()))?,
+            ),
+            _ => Bytes::copy_from_slice(stored),
+        };
+        if data.len() != r.len as usize || self.hash(&data) != r.hash {
+            return Err(Error::Corrupt(r.hash, "hash mismatch".into()));
+        }
+        Ok(data)
+    }
 }
 
 /// Splits a stream into content-defined chunks, calling `f` for each.
@@ -107,23 +195,9 @@ pub struct Prepared {
     pub stored: Vec<u8>,
 }
 
+/// [`Sealing::prepare`] for a volume in the clear.
 pub fn prepare(hash: ChunkHash, data: &[u8]) -> Prepared {
-    let len = u32::try_from(data.len()).expect("chunk larger than 4 GiB");
-    match zstd::bulk::compress(data, 3) {
-        // Only keep compression when it saves at least ~10%.
-        Ok(z) if z.len() < data.len() - data.len() / 10 => Prepared {
-            hash,
-            len,
-            codec: Codec::Zstd,
-            stored: z,
-        },
-        _ => Prepared {
-            hash,
-            len,
-            codec: Codec::Raw,
-            stored: data.to_vec(),
-        },
-    }
+    Sealing::plain().prepare(hash, data)
 }
 
 /// A finished pack, ready to upload.
@@ -242,29 +316,18 @@ pub async fn upload_pack(store: &dyn ObjectStore, pack: SealedPack) -> Result<()
     Ok(())
 }
 
-/// Decodes and verifies one chunk from its stored bytes.
-pub fn decode(r: &ChunkRef, stored: &[u8]) -> Result<Bytes> {
-    let data = match r.codec {
-        Codec::Raw => Bytes::copy_from_slice(stored),
-        Codec::Zstd => Bytes::from(
-            zstd::bulk::decompress(stored, r.len as usize)
-                .map_err(|e| Error::Corrupt(r.hash, e.to_string()))?,
-        ),
-    };
-    if data.len() != r.len as usize || hash(&data) != r.hash {
-        return Err(Error::Corrupt(r.hash, "hash mismatch".into()));
-    }
-    Ok(data)
-}
-
 /// Fetches and verifies chunks, merging nearby reads from the same pack
 /// into single ranged requests. Chunks of a compacted pack are read from
 /// where they moved ([`Forward`]).
-pub async fn fetch(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<HashMap<ChunkHash, Bytes>> {
+pub async fn fetch(
+    store: Arc<dyn ObjectStore>,
+    sealing: &Sealing,
+    refs: &[ChunkRef],
+) -> Result<HashMap<ChunkHash, Bytes>> {
     let mut out = HashMap::new();
     let mut todo = refs.to_vec();
     for _ in 0..=MAX_HOPS {
-        let (got, gone) = fetch_once(store.clone(), &todo).await?;
+        let (got, gone) = fetch_once(store.clone(), sealing, &todo).await?;
         out.extend(got);
         if gone.is_empty() {
             return Ok(out);
@@ -292,7 +355,7 @@ type Fetched = (HashMap<ChunkHash, Bytes>, Vec<(PackId, Vec<ChunkRef>)>);
 /// One ranged read: its chunks, or the pack and chunks it found gone.
 type RangeRead = Result<Vec<(ChunkHash, Bytes)>, (PackId, Vec<ChunkRef>)>;
 
-async fn fetch_once(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<Fetched> {
+async fn fetch_once(store: Arc<dyn ObjectStore>, sealing: &Sealing, refs: &[ChunkRef]) -> Result<Fetched> {
     let mut by_pack: HashMap<PackId, Vec<ChunkRef>> = HashMap::new();
     for r in refs {
         by_pack.entry(r.pack).or_default().push(*r);
@@ -331,7 +394,7 @@ async fn fetch_once(store: Arc<dyn ObjectStore>, refs: &[ChunkRef]) -> Result<Fe
                     let stored = data
                         .get(lo..hi)
                         .ok_or_else(|| Error::Corrupt(c.hash, "pack too short".into()))?;
-                    out.push((c.hash, decode(&c, stored)?));
+                    out.push((c.hash, sealing.decode(&c, stored)?));
                 }
                 Ok::<_, Error>(Ok(out))
             }
@@ -424,7 +487,7 @@ mod tests {
         upload_pack(store.as_ref(), builder.seal().unwrap())
             .await
             .unwrap();
-        let got = fetch(store, &refs).await.unwrap();
+        let got = fetch(store, &Sealing::plain(), &refs).await.unwrap();
         let rebuilt: Vec<u8> = refs.iter().flat_map(|r| got[&r.hash].to_vec()).collect();
         let mut expected = compressible.clone();
         expected.extend_from_slice(&random);
@@ -443,7 +506,42 @@ mod tests {
         bytes[10] ^= 0xff;
         pack.data = Bytes::from(bytes);
         upload_pack(store.as_ref(), pack).await.unwrap();
-        assert!(matches!(fetch(store, &[r]).await, Err(Error::Corrupt(..))));
+        assert!(matches!(
+            fetch(store, &Sealing::plain(), &[r]).await,
+            Err(Error::Corrupt(..))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sealed_chunks_round_trip_and_need_the_key() {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let key = rustfuse_crypt::VolumeKey::generate();
+        let sealing = Sealing::with(Some(Arc::new(Cipher::new(&key))));
+        let mut builder = PackBuilder::new([5; 16]);
+        let text = b"hello hello hello hello hello hello hello hello".repeat(100);
+        let mut refs = Vec::new();
+        for data in [text.clone(), pseudo_random(5000, 7)] {
+            let (r, _) = builder.add(sealing.prepare(sealing.hash(&data), &data));
+            refs.push(r);
+        }
+        assert_eq!(
+            (refs[0].codec, refs[1].codec),
+            (Codec::SealedZstd, Codec::SealedRaw)
+        );
+        assert_ne!(refs[0].hash, hash(&text), "ids are keyed");
+        let pack = builder.seal().unwrap();
+        assert!(
+            !pack.data.windows(5).any(|w| w == b"hello"),
+            "content is not readable in the bucket"
+        );
+        upload_pack(store.as_ref(), pack).await.unwrap();
+        let got = fetch(store.clone(), &sealing, &refs).await.unwrap();
+        assert_eq!(got[&refs[0].hash], text);
+        assert!(fetch(store.clone(), &Sealing::plain(), &refs).await.is_err());
+        let other = Sealing::with(Some(Arc::new(
+            Cipher::new(&rustfuse_crypt::VolumeKey::generate()),
+        )));
+        assert!(fetch(store, &other, &refs).await.is_err());
     }
 
     #[test]

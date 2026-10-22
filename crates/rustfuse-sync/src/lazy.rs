@@ -321,6 +321,7 @@ pub(crate) fn prune(root: &Path, tree: &Tree) -> Result<usize> {
 pub struct Hydrator {
     root: PathBuf,
     store: Arc<dyn ObjectStore>,
+    sealing: rustfuse_chunk::Sealing,
     busy: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// When each file was last asked for, by inode.
     used: Mutex<HashMap<u64, Instant>>,
@@ -331,10 +332,12 @@ impl Hydrator {
     /// For the lazy directory at `root`, whose volume is in `store`.
     pub fn new(root: &Path, store: Arc<dyn ObjectStore>) -> Result<Hydrator> {
         let root = root.canonicalize().at(root)?;
+        let cipher = crate::crypt::load_key_if_any(&root)?.map(Arc::new);
         Ok(Hydrator {
             pins: Arc::new(Pins::load(&root)),
             root,
             store,
+            sealing: rustfuse_chunk::Sealing::with(cipher),
             busy: Mutex::new(HashMap::new()),
             used: Mutex::new(HashMap::new()),
         })
@@ -459,7 +462,7 @@ impl Hydrator {
                 end += 1;
             }
             let window: Vec<ChunkRef> = chunks[start..end].to_vec();
-            let data = rustfuse_chunk::fetch(self.store.clone(), &window).await?;
+            let data = rustfuse_chunk::fetch(self.store.clone(), &self.sealing, &window).await?;
             let mut buf = Vec::with_capacity(bytes as usize);
             for r in &window {
                 let d = data

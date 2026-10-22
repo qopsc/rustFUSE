@@ -1,0 +1,24 @@
+[package]
+name = "rustfuse-crypt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client-side encryption of a rustFUSE volume's content and metadata"
+
+[lints]
+workspace = true
+
+[dependencies]
+argon2 = "0.5.3"
+blake3 = "1.8.7"
+chacha20poly1305 = "0.10.1"
+getrandom = "0.4.3"
+hex = "0.4.3"
+rustfuse-types = { path = "../rustfuse-types" }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+zeroize = { version = "1.8.1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"

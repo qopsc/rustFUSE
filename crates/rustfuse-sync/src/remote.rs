@@ -24,6 +24,7 @@ pub struct RemoteTree {
     tree: Tree,
     seq: u64,
     store: Arc<dyn ObjectStore>,
+    sealing: rustfuse_chunk::Sealing,
 }
 
 /// One entry of a remote directory.
@@ -48,20 +49,32 @@ pub struct Downloaded {
 }
 
 impl RemoteTree {
-    /// Reads the volume's latest state from `store` (scoped to the volume).
-    pub async fn load(store: Arc<dyn ObjectStore>) -> Result<RemoteTree> {
-        let volume = Volume::new(store.clone());
+    /// Reads the volume's latest state from `store` (scoped to the volume),
+    /// opening an encrypted volume with `cipher`.
+    pub async fn load(
+        store: Arc<dyn ObjectStore>,
+        cipher: Option<Arc<rustfuse_crypt::Cipher>>,
+    ) -> Result<RemoteTree> {
+        let volume = Volume::new(store.clone()).with_cipher(cipher.clone());
         volume.check().await?;
+        if cipher.is_none() && volume.key_info().await?.is_some() {
+            return Err(rustfuse_hub::Error::NeedKey.into());
+        }
         let (mut tree, mut seq) = match volume.latest_snapshot().await? {
             Some(snap) => (Tree::from_snapshot(&snap), snap.seq),
             None => (Tree::default(), 0),
         };
         for s in volume.changesets_after(seq).await? {
-            let cs = volume.get_changeset(s).await?;
+            let cs = volume.open_changeset(volume.get_changeset(s).await?)?;
             tree.apply(cs.version, &cs.ops);
             seq = s;
         }
-        Ok(RemoteTree { tree, seq, store })
+        Ok(RemoteTree {
+            tree,
+            seq,
+            store,
+            sealing: rustfuse_chunk::Sealing::with(cipher),
+        })
     }
 
     /// The last changeset the tree includes.
@@ -194,7 +207,7 @@ impl RemoteTree {
                 end += 1;
             }
             let window = &chunks[start..end];
-            let data = rustfuse_chunk::fetch(self.store.clone(), window).await?;
+            let data = rustfuse_chunk::fetch(self.store.clone(), &self.sealing, window).await?;
             for r in window {
                 let d = data
                     .get(&r.hash)
