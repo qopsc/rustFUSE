@@ -23,19 +23,21 @@ func macfuseAvailable() -> Bool {
         && FileManager.default.isExecutableFile(atPath: macfuseTool().path)
 }
 
-/// The environment carrying `connection`'s secrets.
-func toolEnv(for connection: Connection?) -> [String: String] {
+/// The environment carrying `connection`'s secrets (and an encrypted
+/// volume's passphrase).
+func toolEnv(for connection: Connection?, passphrase: String? = nil) -> [String: String] {
     toolEnvironment(
         base: ProcessInfo.processInfo.environment,
         token: connection.flatMap { Secrets.get(.hubToken, for: $0.id) },
         s3Secret: connection.flatMap { Secrets.get(.s3Secret, for: $0.id) },
-        connection)
+        connection,
+        passphrase: passphrase)
 }
 
 /// Runs `rustfuse` to completion with `connection`'s secrets; returns its
 /// standard output, or throws its output if it failed.
-func runTool(_ args: [String], connection: Connection?) async throws -> String {
-    try await runProcess(rustfuseTool(), args, env: toolEnv(for: connection))
+func runTool(_ args: [String], connection: Connection?, passphrase: String? = nil) async throws -> String {
+    try await runProcess(rustfuseTool(), args, env: toolEnv(for: connection, passphrase: passphrase))
 }
 
 /// Runs `tool` to completion; returns its standard output, or throws its

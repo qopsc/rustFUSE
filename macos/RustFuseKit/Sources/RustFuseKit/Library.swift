@@ -205,9 +205,10 @@ public func attachArguments(_ v: VolumeConfig, _ c: Connection, dir: URL) -> [St
 }
 
 /// `rustfuse init`: a new volume `name` from the folder `dir`, which then
-/// syncs in place.
-public func initArguments(name: String, _ c: Connection, dir: URL) -> [String] {
-    ["init", dir.path, "--volume", name] + connectionArguments(c)
+/// syncs in place; `encrypt` seals it with the passphrase given in
+/// `RUSTFUSE_PASSPHRASE`.
+public func initArguments(name: String, _ c: Connection, dir: URL, encrypt: Bool = false) -> [String] {
+    ["init", dir.path, "--volume", name] + (encrypt ? ["--encrypt"] : []) + connectionArguments(c)
 }
 
 /// `rustfuse volumes`: the volumes `c`'s token opens.
@@ -229,8 +230,11 @@ public func daemonArguments(_ v: VolumeConfig, dir: URL, socket: URL, settings: 
 }
 
 /// The environment carrying `c`'s secrets to `rustfuse`.
-public func toolEnvironment(base: [String: String], token: String?, s3Secret: String?, _ c: Connection?) -> [String: String] {
+public func toolEnvironment(
+    base: [String: String], token: String?, s3Secret: String?, _ c: Connection?, passphrase: String? = nil
+) -> [String: String] {
     var env = base
+    env["RUSTFUSE_PASSPHRASE"] = passphrase.flatMap { $0.isEmpty ? nil : $0 }
     env["RUSTFUSE_HUB_TOKEN"] = token
     if let s3 = c?.s3 {
         env["RUSTFUSE_ACCESS_KEY"] = s3.accessKey

@@ -29,6 +29,9 @@ final class RemoteTests: XCTestCase {
         XCTAssertEqual(
             getArguments(volume: "proj", path: "src", dest: URL(fileURLWithPath: "/Users/me/Downloads/src"), c),
             ["get", "--volume", "proj", "src", "/Users/me/Downloads/src", "--hub", "h:7420"])
+        XCTAssertEqual(
+            lsArguments(volume: "proj", path: "", keyFrom: URL(fileURLWithPath: "/V/proj"), c),
+            ["ls", "--volume", "proj", "--json", "--key-from", "/V/proj", "--hub", "h:7420"])
     }
 
     func testConflictCopies() {

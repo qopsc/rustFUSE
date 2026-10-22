@@ -31,7 +31,7 @@ pub(crate) fn save_key(root: &Path, key: &VolumeKey) -> Result<()> {
 }
 
 /// The key, if the directory's volume is encrypted.
-pub(crate) fn load_key_if_any(root: &Path) -> Result<Option<Cipher>> {
+pub fn load_key_if_any(root: &Path) -> Result<Option<Cipher>> {
     if key_path(root).exists() {
         load_key(root).map(Some)
     } else {

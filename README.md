@@ -137,7 +137,9 @@ connections to hubs, the volumes in each bucket, and the volumes this
 machine uses, each as a plain folder or a mount.
 
 - Add a connection (`a`) with the hub's address and token, then pick one
-  of its volumes to add, or make a new volume from a folder (`n`).
+  of its volumes to add, or make a new volume from a folder (`n`). Give a
+  passphrase when making one to encrypt it, and when adding an encrypted
+  one; it is not stored (each machine keeps the volume's key instead).
 - Each volume syncs in a background service of its own (a systemd user
   service on Linux, a launchd agent on a Mac), so it keeps syncing after
   the TUI quits and starts again at login. `s` starts or stops it, `l`

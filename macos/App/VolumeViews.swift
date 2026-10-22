@@ -124,6 +124,7 @@ struct AddVolumeSheet: View {
     @State private var mode: Mode = .finder
     @State private var path = ""
     @State private var cacheGB: Double = 20
+    @State private var passphrase = ""
     @State private var busy = false
     @State private var error: String?
 
@@ -173,6 +174,7 @@ struct AddVolumeSheet: View {
                         }
                     }
                 }
+                SecureField("Passphrase", text: $passphrase, prompt: Text("Only for an encrypted volume"))
             }
             ErrorText(text: error)
             HStack {
@@ -241,7 +243,7 @@ struct AddVolumeSheet: View {
             do {
                 try await model.addVolume(
                     name: name, connection: c, mode: mode, path: mode == .finder ? nil : path,
-                    cacheSize: UInt64(max(cacheGB, 0.1) * Double(gigabyte)))
+                    cacheSize: UInt64(max(cacheGB, 0.1) * Double(gigabyte)), passphrase: passphrase)
                 dismiss()
             } catch {
                 self.error = error.localizedDescription
@@ -259,6 +261,9 @@ struct NewVolumeSheet: View {
     @State private var connectionID: UUID?
     @State private var name = ""
     @State private var folder = ""
+    @State private var encrypt = false
+    @State private var passphrase = ""
+    @State private var again = ""
     @State private var busy = false
     @State private var error: String?
 
@@ -281,9 +286,20 @@ struct NewVolumeSheet: View {
                     }
                 }
                 TextField("Volume name", text: $name)
+                Toggle("Encrypt with a passphrase", isOn: $encrypt)
+                if encrypt {
+                    SecureField("Passphrase", text: $passphrase)
+                    SecureField("Again", text: $again)
+                }
             }
             Text("Uploads the folder as a new volume in the bucket. The folder stays where it is and keeps syncing.")
                 .font(.caption).foregroundStyle(.secondary)
+            if encrypt {
+                Text(
+                    "Content and names are encrypted before they leave this Mac. Every machine needs the passphrase to add the volume, and nobody can recover it if it is lost."
+                )
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             ErrorText(text: error)
             HStack {
                 Spacer()
@@ -291,7 +307,8 @@ struct NewVolumeSheet: View {
                 Button(busy ? "Uploading…" : "Create") { create() }
                     .keyboardShortcut(.defaultAction)
                     .mainButton()
-                    .disabled(busy || name.isEmpty || folder.isEmpty || connectionID == nil)
+                    .disabled(
+                        busy || name.isEmpty || folder.isEmpty || connectionID == nil || (encrypt && passphrase.isEmpty))
             }
         }
         .padding(20)
@@ -301,11 +318,15 @@ struct NewVolumeSheet: View {
 
     private func create() {
         guard let c = connectionID.flatMap(model.library.connection) else { return }
+        if encrypt && passphrase != again {
+            error = "The passphrases differ."
+            return
+        }
         busy = true
         error = nil
         Task {
             do {
-                try await model.createVolume(name: name, connection: c, folder: folder)
+                try await model.createVolume(name: name, connection: c, folder: folder, passphrase: encrypt ? passphrase : "")
                 dismiss()
             } catch {
                 self.error = error.localizedDescription

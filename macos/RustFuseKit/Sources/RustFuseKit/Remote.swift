@@ -30,14 +30,20 @@ public struct RemoteEntry: Codable, Equatable, Hashable, Identifiable, Sendable 
 }
 
 /// `rustfuse ls`: the folder `path` of volume `volume` (the top when empty).
-public func lsArguments(volume: String, path: String, _ c: Connection) -> [String] {
-    ["ls", "--volume", volume] + (path.isEmpty ? [] : [path]) + ["--json"] + connectionArguments(c)
+/// An encrypted volume's key comes from its synced directory `keyFrom`.
+public func lsArguments(volume: String, path: String, keyFrom: URL? = nil, _ c: Connection) -> [String] {
+    ["ls", "--volume", volume] + (path.isEmpty ? [] : [path]) + ["--json"] + keyArguments(keyFrom)
+        + connectionArguments(c)
+}
+
+func keyArguments(_ keyFrom: URL?) -> [String] {
+    keyFrom.map { ["--key-from", $0.path] } ?? []
 }
 
 /// `rustfuse get`: downloads the file or folder `path` of `volume` to
 /// `dest`, which must not exist yet.
-public func getArguments(volume: String, path: String, dest: URL, _ c: Connection) -> [String] {
-    ["get", "--volume", volume, path, dest.path] + connectionArguments(c)
+public func getArguments(volume: String, path: String, dest: URL, keyFrom: URL? = nil, _ c: Connection) -> [String] {
+    ["get", "--volume", volume, path, dest.path] + keyArguments(keyFrom) + connectionArguments(c)
 }
 
 /// Whether `name` is a conflict copy: the losing side of an edit made on

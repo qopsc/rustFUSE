@@ -6,7 +6,7 @@
 //! same way (`docs/design.md` §7).
 
 mod apply;
-mod crypt;
+pub mod crypt;
 pub mod fsmonitor;
 pub mod gc;
 mod git;

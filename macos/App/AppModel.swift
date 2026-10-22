@@ -229,7 +229,9 @@ final class AppModel: ObservableObject {
 
     /// Adds volume `name` from connection `c`: downloads it (everything in
     /// folder mode, the tree otherwise) and starts syncing it.
-    func addVolume(name: String, connection c: Connection, mode: Mode, path: String?, cacheSize: UInt64?) async throws {
+    func addVolume(
+        name: String, connection c: Connection, mode: Mode, path: String?, cacheSize: UInt64?, passphrase: String = ""
+    ) async throws {
         var v = VolumeConfig(
             key: library.newKey(for: name), name: name, connection: c.id, mode: mode,
             path: path.map { ($0 as NSString).expandingTildeInPath },
@@ -247,7 +249,7 @@ final class AppModel: ObservableObject {
         if mode != .folder {
             try FileManager.default.createDirectory(at: dir.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
-        _ = try await runTool(attachArguments(v, c, dir: dir), connection: c)
+        _ = try await runTool(attachArguments(v, c, dir: dir), connection: c, passphrase: passphrase)
         v.path = v.path.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
         library.volumes.append(v)
         save()
@@ -256,13 +258,14 @@ final class AppModel: ObservableObject {
     }
 
     /// Creates volume `name` from the folder at `path`, which then syncs in
-    /// place (folder mode).
-    func createVolume(name: String, connection c: Connection, folder path: String) async throws {
+    /// place (folder mode); with a passphrase it is encrypted.
+    func createVolume(name: String, connection c: Connection, folder path: String, passphrase: String = "") async throws {
         guard Shared.validName(name) else {
             throw failure("Use up to 40 letters, digits, '.', '_' or '-' for the name, not starting with '.'.")
         }
         let dir = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
-        _ = try await runTool(initArguments(name: name, c, dir: dir), connection: c)
+        _ = try await runTool(
+            initArguments(name: name, c, dir: dir, encrypt: !passphrase.isEmpty), connection: c, passphrase: passphrase)
         let v = VolumeConfig(key: library.newKey(for: name), name: name, connection: c.id, mode: .folder, path: dir.path)
         library.volumes.append(v)
         save()
@@ -361,13 +364,21 @@ final class AppModel: ObservableObject {
             guard let listing = demo.bucket[path] else { throw failure("No folder \(path) in the sample.") }
             return listing
         }
-        let out = try await runTool(lsArguments(volume: volume, path: path, c), connection: c)
+        let out = try await runTool(lsArguments(volume: volume, path: path, keyFrom: try keyDir(c, volume), c), connection: c)
         return try JSONDecoder().decode(RemoteListing.self, from: Data(out.utf8))
     }
 
     /// Downloads the file or folder `path` of `volume` to `dest`.
     func download(_ c: Connection, volume: String, path: String, to dest: URL) async throws {
-        _ = try await runTool(getArguments(volume: volume, path: path, dest: dest, c), connection: c)
+        _ = try await runTool(
+            getArguments(volume: volume, path: path, dest: dest, keyFrom: try keyDir(c, volume), c), connection: c)
+    }
+
+    /// The synced directory of `volume` if it is added here: an encrypted
+    /// volume's key is read from it.
+    private func keyDir(_ c: Connection, _ volume: String) throws -> URL? {
+        guard let v = library.volumes.first(where: { $0.connection == c.id && $0.name == volume }) else { return nil }
+        return syncedDir(v, container: try Shared.container())
     }
 
     /// Asks each volume's daemon how much disk it uses. A daemon that
