@@ -734,7 +734,7 @@ async fn prepare_serving(
         }
         return Ok((Arc::new(backing), None));
     }
-    let (r, spec) = open_replica(dir, opts).await?;
+    let (mut r, spec) = open_replica(dir, opts).await?;
     let mut hydrator = None;
     if rustfuse_sync::lazy::is_lazy(dir) {
         let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(dir, r.store().clone())?);
@@ -755,6 +755,9 @@ async fn prepare_serving(
         }));
     }
     let backing = Arc::new(backing);
+    // Keeps a FUSE mount's kernel cache in step with the directory.
+    let b = backing.clone();
+    r.watch_disk(Arc::new(move |paths| b.changed(paths)));
     let b = backing.clone();
     let in_use: InUse = Arc::new(move |ino| b.in_use(ino));
     let sync = serve_sync(dir, r, spec, opts, hydrator, cache_size, in_use, provider_socket).await?;
@@ -876,6 +879,10 @@ async fn serve_until(
     }
 }
 
+/// How long a synced FUSE mount lets the kernel trust names and attributes.
+/// `git status` over a mount runs about 40% faster than with a second.
+const MOUNT_CACHE: Duration = Duration::from_secs(10);
+
 async fn mount(
     dir: &Path,
     mountpoint: &Path,
@@ -893,6 +900,11 @@ async fn mount(
     }
     let (backing, sync) = prepare_serving(dir, no_sync, cache_size, provider_socket, opts).await?;
     let mut fuse = fuse.clone();
+    if sync.is_some() {
+        // The sync reports every change it sees underneath (see
+        // `prepare_serving`), so the kernel can keep what it caches longer.
+        fuse.cache_for = Some(MOUNT_CACHE);
+    }
     if fuse.volname.is_none() {
         fuse.volname = dir.file_name().map(|n| n.to_string_lossy().into_owned());
     }
@@ -1128,6 +1140,7 @@ async fn run(cli: Cli) -> Result<()> {
                 allow_other,
                 fskit,
                 volname: None,
+                cache_for: None,
             };
             mount(
                 &dir,

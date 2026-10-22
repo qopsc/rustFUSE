@@ -51,6 +51,23 @@ pub struct SetAttr {
 /// directory fetches it on first use).
 pub type Fetch = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
+/// Something a kernel may hold in its cache that changed underneath the
+/// mount (see [`Backing::changed`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Stale {
+    /// The name `parent/name` may now point elsewhere, or nowhere.
+    Entry { parent: u64, name: Vec<u8> },
+    /// The file numbered `ino` at `parent/name` was removed.
+    Gone { parent: u64, ino: u64, name: Vec<u8> },
+    /// The attributes and content of `ino`.
+    Inode(u64),
+    /// Anything: changes were missed.
+    All,
+}
+
+/// Where [`Stale`] notes go: the FUSE frontend, which tells the kernel.
+pub type StaleSink = Box<dyn Fn(Stale) + Send + Sync>;
+
 pub struct Backing {
     root: PathBuf,
     /// Names at the root that the mount does not show (the sync state).
@@ -59,6 +76,7 @@ pub struct Backing {
     fetch: Option<Fetch>,
     /// Files held open through the mount, by real inode number.
     open: Mutex<HashMap<u64, usize>>,
+    stale: Mutex<Option<StaleSink>>,
 }
 
 #[derive(Default)]
@@ -120,7 +138,89 @@ impl Backing {
             nodes: Mutex::new(Nodes::default()),
             fetch: None,
             open: Mutex::new(HashMap::new()),
+            stale: Mutex::new(None),
         })
+    }
+
+    /// Sends what goes stale in a kernel's cache to `sink` (`None` stops).
+    pub fn on_stale(&self, sink: Option<StaleSink>) {
+        *self.stale.lock().unwrap() = sink;
+    }
+
+    /// Notes that something other than the mount changed these paths
+    /// (relative to the root): the sync applying another machine's edits,
+    /// its git pass, or any other program writing in the directory. With
+    /// `None`, anything may have changed.
+    ///
+    /// Only names the kernel has been told about can be cached, so paths
+    /// it has never looked up are skipped.
+    pub fn changed(&self, paths: Option<&[PathBuf]>) {
+        let sink = self.stale.lock().unwrap();
+        let Some(sink) = sink.as_ref() else { return };
+        let Some(paths) = paths else {
+            return sink(Stale::All);
+        };
+        for rel in paths {
+            for note in self.stale_notes(rel) {
+                sink(note);
+            }
+        }
+    }
+
+    /// Everything a kernel may have cached: every name and number handed
+    /// out.
+    pub fn all_stale(&self) -> Vec<Stale> {
+        let nodes = self.nodes.lock().unwrap();
+        let mut notes = vec![Stale::Inode(ROOT)];
+        for (&ino, (parent, name)) in &nodes.by_ino {
+            notes.push(Stale::Entry {
+                parent: *parent,
+                name: name.clone(),
+            });
+            notes.push(Stale::Inode(ino));
+        }
+        notes
+    }
+
+    fn stale_notes(&self, rel: &Path) -> Vec<Stale> {
+        let mut names = Vec::new();
+        for c in rel.components() {
+            match c {
+                std::path::Component::Normal(n) => names.push(n.as_bytes()),
+                _ => return Vec::new(),
+            }
+        }
+        let Some((&name, dirs)) = names.split_last() else {
+            return Vec::new();
+        };
+        let (parent, ino) = {
+            let nodes = self.nodes.lock().unwrap();
+            let mut parent = ROOT;
+            for d in dirs {
+                match nodes.by_name.get(&(parent, d.to_vec())) {
+                    Some(&i) => parent = i,
+                    None => return Vec::new(),
+                }
+            }
+            (parent, nodes.by_name.get(&(parent, name.to_vec())).copied())
+        };
+        if self.hidden(parent, name) {
+            return Vec::new();
+        }
+        let name = name.to_vec();
+        // The directory's listing and times changed too.
+        let mut notes = vec![Stale::Inode(parent)];
+        match ino {
+            Some(ino) if fs::symlink_metadata(self.root.join(rel)).is_err() => {
+                notes.push(Stale::Gone { parent, ino, name });
+            }
+            Some(ino) => {
+                notes.push(Stale::Entry { parent, name });
+                notes.push(Stale::Inode(ino));
+            }
+            None => notes.push(Stale::Entry { parent, name }),
+        }
+        notes
     }
 
     /// Notes a file held open through the mount (see [`in_use`](Self::in_use)).

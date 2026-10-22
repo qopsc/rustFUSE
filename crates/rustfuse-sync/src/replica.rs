@@ -111,7 +111,13 @@ pub struct Replica {
     changes: crate::provider::ChangeLog,
     /// What the user asked to keep downloaded (lazy directories).
     pins: Option<Arc<crate::lazy::Pins>>,
+    /// Told of every change the watcher sees (see [`Replica::watch_disk`]).
+    disk_watch: Option<DiskWatch>,
 }
+
+/// Called with the paths (relative to the root) of every change seen on
+/// disk while syncing, or `None` when changes may have been missed.
+pub type DiskWatch = Arc<dyn Fn(Option<&[PathBuf]>) + Send + Sync>;
 
 /// Creates the state folder, hidden from git (and tools honouring
 /// .gitignore) by a catch-all ignore file inside it.
@@ -253,6 +259,7 @@ impl Replica {
             metrics: Arc::default(),
             changes: crate::provider::ChangeLog::new(),
             pins: None,
+            disk_watch: None,
         })
     }
 
@@ -282,6 +289,13 @@ impl Replica {
     /// with the File Provider answers.
     pub fn set_pins(&mut self, pins: Arc<crate::lazy::Pins>) {
         self.pins = Some(pins);
+    }
+
+    /// Passes what the watcher sees to `f`, whoever made the change: this
+    /// replica applying other machines' edits, its git pass, or anyone
+    /// else. A mount uses it to keep the kernel's cache current.
+    pub fn watch_disk(&mut self, f: DiskWatch) {
+        self.disk_watch = Some(f);
     }
 
     pub(crate) fn pins(&self) -> Option<&crate::lazy::Pins> {
@@ -1285,9 +1299,28 @@ impl Replica {
         use notify::{RecursiveMode, Watcher};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let journal = crate::fsmonitor::Journal::new();
-        let (j, root) = (journal.clone(), self.root.clone());
-        let mut watcher = notify::recommended_watcher(move |res| {
+        let (j, root, disk_watch) = (journal.clone(), self.root.clone(), self.disk_watch.clone());
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             j.record(&root, &res);
+            if let Some(f) = &disk_watch {
+                match &res {
+                    Ok(ev) if ev.need_rescan() => f(None),
+                    Ok(ev) if matches!(ev.kind, notify::EventKind::Access(_)) => {}
+                    Ok(ev) => {
+                        let rel: Vec<PathBuf> = ev
+                            .paths
+                            .iter()
+                            .filter_map(|p| p.strip_prefix(&root).ok())
+                            .filter(|p| !p.starts_with(STATE_DIR))
+                            .map(Path::to_path_buf)
+                            .collect();
+                        if !rel.is_empty() {
+                            f(Some(&rel));
+                        }
+                    }
+                    Err(_) => f(None),
+                }
+            }
             let _ = tx.send(res);
         })
         .map_err(|e| Error::Corrupt(format!("cannot watch: {e}")))?;
