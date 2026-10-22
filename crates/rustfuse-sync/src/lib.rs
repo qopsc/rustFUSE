@@ -12,6 +12,7 @@ mod git;
 mod ignore;
 mod index;
 pub mod lazy;
+pub mod live;
 pub mod metrics;
 pub mod provider;
 pub mod remote;

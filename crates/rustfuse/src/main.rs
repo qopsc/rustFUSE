@@ -193,7 +193,8 @@ enum Command {
         #[command(flatten)]
         creds: Credentials,
     },
-    /// Show the volume, sync position and local changes not yet captured.
+    /// Show the volume, sync position and local changes not yet captured
+    /// (or, while `sync` or `mount` runs here, what it is doing).
     Status { dir: PathBuf },
     /// List conflict copies kept next to the files they conflicted with,
     /// and git branches that diverged on two machines.
@@ -564,6 +565,51 @@ fn describe_changes(dir: &Path, r: &Replica) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What `rustfuse status` prints while a sync runs in the directory.
+fn describe_live(live: &rustfuse_sync::live::Live) {
+    println!(
+        "Volume {} via hub {}, at changeset {}.",
+        live.volume,
+        live.hub.as_deref().unwrap_or("(none)"),
+        live.applied
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    println!(
+        "Syncing (process {}, running for {}).",
+        live.pid,
+        format_age(now.saturating_sub(live.started))
+    );
+    if live.in_sync() {
+        println!("Everything is synced.");
+        return;
+    }
+    if !live.connected {
+        let last = match live.in_sync_at {
+            0 => String::new(),
+            t => format!("; last in sync {} ago", format_age(now.saturating_sub(t))),
+        };
+        println!("Offline: the hub is unreachable, changes wait until it is back{last}.");
+    } else if live.applied < live.hub_head {
+        println!("Catching up: changeset {} of {}.", live.applied, live.hub_head);
+    }
+    if live.outbox > 0 {
+        println!("{} changesets waiting to be sent to the hub.", live.outbox);
+    }
+}
+
+/// `45s`, `12m`, `3h 5m`, `2d 4h`.
+fn format_age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+        _ => format!("{}d {}h", secs / 86400, secs % 86400 / 3600),
+    }
 }
 
 /// Conflict copies under `root` (relative paths, sorted), skipping what
@@ -1230,6 +1276,11 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Status { dir } => {
+            // A running sync holds the index; it reports what it is doing.
+            if let Some(live) = rustfuse_sync::live::Live::read(&dir) {
+                describe_live(&live);
+                return Ok(());
+            }
             let config = Replica::config_of(&dir)?;
             // Status only reads local state; no store access needed.
             let r = Replica::open(&dir, Arc::new(rustfuse_store::MemoryStore::new()))?;

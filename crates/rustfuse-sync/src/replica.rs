@@ -1329,6 +1329,9 @@ impl Replica {
             .map_err(|e| Error::Corrupt(format!("cannot watch {}: {e}", self.root.display())))?;
 
         let _fsmonitor = AbortOnDrop(tokio::spawn(crate::fsmonitor::serve(self.root.clone(), journal)));
+        self.metrics.position(self.counters.applied, self.outbox.len());
+        let mut live =
+            crate::live::Reporter::new(&self.root, &self.config.volume, self.config.hub.as_deref());
 
         report(self.capture(None).await?);
         self.reconcile_with_capture().await?;
@@ -1379,6 +1382,7 @@ impl Replica {
                 self.metrics.connected.set(0);
             }
 
+            live.update(&self.metrics);
             let mut dirty: HashSet<PathBuf> = HashSet::new();
             let mut rescan = false;
             let mut batch = Vec::new();
