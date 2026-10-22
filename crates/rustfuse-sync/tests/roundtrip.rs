@@ -206,16 +206,39 @@ struct Cluster {
     hub_metrics: Arc<rustfuse_hub::HubMetrics>,
 }
 
+/// `RUSTFUSE_TEST_LOG=1` prints debug logs with each failing test's output;
+/// `RUSTFUSE_TEST_LOG_FILE=<file>` appends them to a file instead, which
+/// also catches what blocking threads (the git pass) log. CI keeps the file
+/// and prints it when a test fails, so a rare failure shows how it happened.
+fn init_logging() {
+    let filter = || tracing_subscriber::EnvFilter::new("rustfuse_sync=debug,roundtrip=info");
+    if let Some(file) = std::env::var_os("RUSTFUSE_TEST_LOG_FILE") {
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+            .unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_thread_names(true)
+            .with_writer(std::sync::Mutex::new(f))
+            .try_init();
+    } else if std::env::var_os("RUSTFUSE_TEST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_test_writer()
+            .try_init();
+    }
+}
+
 impl Cluster {
     /// Machine 0 creates the volume from `populate`; the others attach.
     async fn new(n: usize, populate: impl FnOnce(&Path)) -> Cluster {
-        if std::env::var_os("RUSTFUSE_TEST_LOG").is_some() {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::new("rustfuse_sync=debug"))
-                .with_test_writer()
-                .try_init();
-        }
+        init_logging();
         let tmp = tempfile::tempdir().unwrap();
+        // Ties the machines' paths in the log to the test (the thread name).
+        tracing::info!(dir = %tmp.path().display(), "test cluster");
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = root_store(&format!("rustfuse-tests/{nanos}")).await;
         let volume = "vol";
