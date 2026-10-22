@@ -23,6 +23,7 @@ rustfuse-hub = { version = "0.1.0", path = "../rustfuse-hub" }
 rustfuse-mount = { version = "0.1.0", path = "../rustfuse-mount" }
 rustfuse-store = { version = "0.1.0", path = "../rustfuse-store" }
 rustfuse-sync = { version = "0.1.0", path = "../rustfuse-sync" }
+rustfuse-tui = { version = "0.1.0", path = "../rustfuse-tui" }
 rustfuse-types = { version = "0.1.0", path = "../rustfuse-types" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

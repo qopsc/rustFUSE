@@ -46,7 +46,12 @@ How it fits together is in [docs/design.md §2.2](../docs/design.md).
   app group layout and the saved library (connections, volumes, settings)
   with the daemon command lines built from it. `swift test` checks the
   protocol, `rustfuse ls --json` and `rustfuse conflicts --json` against
-  the same samples the daemon's tests use.
+  the same samples the daemon's tests use, and `library.json` against the
+  sample `rustfuse tui` reads.
+
+`rustfuse tui` shares the library and keychain items with the app. A folder
+or mount volume it started runs as its own launchd agent; the app then
+shows it as running from the terminal UI and leaves it alone.
 
 ## Build
 

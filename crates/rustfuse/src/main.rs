@@ -248,6 +248,13 @@ enum Command {
         #[arg(long)]
         off: bool,
     },
+    /// Manage connections and volumes in a terminal UI. Volumes keep
+    /// syncing in background services after it quits.
+    Tui,
+    /// What a volume's background service runs: syncs (or mounts) the
+    /// volume `key` from the TUI's library. Not meant to be run by hand.
+    #[command(hide = true)]
+    Daemon { key: String },
     /// The hook git runs (`core.fsmonitor`); not meant to be run by hand.
     #[command(hide = true)]
     Fsmonitor {
@@ -943,6 +950,13 @@ fn main() -> Result<()> {
         std::io::Write::write_all(&mut std::io::stdout().lock(), &out)?;
         return Ok(());
     }
+    // Neither needs a runtime: the TUI runs its own threads and the daemon
+    // command becomes `rustfuse sync` or `rustfuse mount`.
+    match &cli.command {
+        Command::Tui => return rustfuse_tui::run(),
+        Command::Daemon { key } => return rustfuse_tui::daemon::run(key),
+        _ => {}
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -1328,7 +1342,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Bench(args) => bench::bench(args).await?,
         Command::GitFsmonitor { repo, off } => git_fsmonitor(&repo, off)?,
-        Command::Fsmonitor { .. } => unreachable!("handled before the runtime starts"),
+        Command::Fsmonitor { .. } | Command::Tui | Command::Daemon { .. } => {
+            unreachable!("handled before the runtime starts")
+        }
     }
     Ok(())
 }

@@ -118,6 +118,31 @@ rustfuse get --volume project --hub hub.example:7420 src/docs ./docs
 hub, or directly with `--bucket`) and write nothing back; add `--json` for
 scripts.
 
+### Terminal UI
+
+`rustfuse tui` manages it all from a terminal, on Linux or a Mac: saved
+connections to hubs, the volumes in each bucket, and the volumes this
+machine uses, each as a plain folder or a mount.
+
+- Add a connection (`a`) with the hub's address and token, then pick one
+  of its volumes to add, or make a new volume from a folder (`n`).
+- Each volume syncs in a background service of its own (a systemd user
+  service on Linux, a launchd agent on a Mac), so it keeps syncing after
+  the TUI quits and starts again at login. `s` starts or stops it, `l`
+  shows its log. On Linux, `loginctl enable-linger` keeps services running
+  while you are logged out.
+- A volume's page shows its disk use against the cache size (`c`), its
+  conflict copies and diverged branches, its files (keep downloaded, free,
+  download) and the bucket's copy (download a file or folder elsewhere).
+
+It keeps connections and volumes in `~/.config/rustfuse/library.json` and
+tokens in `secrets.json` beside it, readable only by you
+(`~/.local/share/rustfuse` holds mounts' synced copies, sockets and
+logs). On a Mac it shares the Mac app's library and keychain items, so a
+volume added in either shows in both; Finder volumes are listed but run
+from the app. `RUSTFUSE_HOME=<dir>` keeps everything in one directory
+instead.
+
 ### Git
 
 - Commits, branches, stashes and worktrees replicate; `git fsck` stays clean.
@@ -145,6 +170,7 @@ scripts.
 | `rustfuse-hub` | The hub: per-volume ordered log, notifications |
 | `rustfuse-sync` | The sync engine: scan, capture, apply, conflict rules, git pass |
 | `rustfuse-mount` | FUSE and NFS frontends over a synced directory |
+| `rustfuse-tui` | `rustfuse tui`: terminal UI, shared library, background services |
 | `rustfuse` | CLI |
 | `macos/` | Mac app and File Provider extension (Swift; see [macos/README.md](macos/README.md)) |
 

@@ -94,4 +94,17 @@ final class LibraryTests: XCTestCase {
         XCTAssertNil(hubOnly["RUSTFUSE_ACCESS_KEY"])
         XCTAssertNil(hubOnly["RUSTFUSE_HUB_TOKEN"])
     }
+
+    /// library.json is also read by the terminal UI's tests
+    /// (crates/rustfuse-tui/src/library.rs), so both keep the same file.
+    func testSharedSampleRoundTrips() throws {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("library.json")
+        let data = try Data(contentsOf: url)
+        let lib = try JSONDecoder().decode(Library.self, from: data)
+        XCTAssertEqual(lib.volumes.map(\.mode), [.finder, .folder, .mount])
+        XCTAssertEqual(lib.settings.onQuit, .keepSyncing)
+        XCTAssertEqual(lib.connections[1].s3?.prefix, "team/")
+        let back = try JSONSerialization.jsonObject(with: JSONEncoder().encode(lib)) as! NSDictionary
+        XCTAssertEqual(back, try JSONSerialization.jsonObject(with: data) as! NSDictionary)
+    }
 }

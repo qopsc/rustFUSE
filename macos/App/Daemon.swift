@@ -138,6 +138,13 @@ final class Daemon: @unchecked Sendable {
             queue.asyncAfter(deadline: .now() + 30) { [self] in launch() }
             return
         }
+        // `rustfuse tui` may already run this volume as a background service
+        // (the two share the library); a second daemon could not start.
+        if let socket = try? Shared.socket(volume.key), (try? Client(socketPath: socket.path).anchor()) != nil {
+            onState("running from the terminal UI")
+            queue.asyncAfter(deadline: .now() + 30) { [self] in launch() }
+            return
+        }
         do {
             let container = try Shared.container()
             let dir = syncedDir(volume, container: container)
