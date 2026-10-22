@@ -51,6 +51,12 @@ enum Command {
         /// Volume name, unique within the bucket and prefix.
         #[arg(long)]
         volume: String,
+        /// Encrypt file content and names before they leave this machine,
+        /// with a key unlocked by a passphrase (asked for, or
+        /// `RUSTFUSE_PASSPHRASE`). Every machine needs the passphrase to
+        /// attach; lose it and the volume cannot be read.
+        #[arg(long)]
+        encrypt: bool,
         #[command(flatten)]
         hub: HubArgs,
         #[command(flatten)]
@@ -458,8 +464,41 @@ impl StoreArgs {
             via_hub,
             replica: ReplicaId(getrandom::u64().map_err(|e| anyhow::anyhow!("no randomness: {e}"))?),
             seed,
+            encrypted: false,
         })
     }
+}
+
+/// An encrypted volume's passphrase: `RUSTFUSE_PASSPHRASE`, or asked for
+/// on the terminal (twice with `confirm`).
+fn passphrase(confirm: bool) -> Result<String> {
+    if let Ok(p) = std::env::var("RUSTFUSE_PASSPHRASE")
+        && !p.is_empty()
+    {
+        return Ok(p);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        bail!("this volume is encrypted: set RUSTFUSE_PASSPHRASE");
+    }
+    let p = rpassword::prompt_password("Volume passphrase: ")?;
+    if p.is_empty() {
+        bail!("the passphrase is empty");
+    }
+    if confirm && rpassword::prompt_password("Again: ")? != p {
+        bail!("the passphrases differ");
+    }
+    Ok(p)
+}
+
+/// The key of the volume in `store`, if it is encrypted (unlocked with
+/// the passphrase).
+async fn volume_cipher(store: &Arc<dyn ObjectStore>) -> Result<Option<Arc<rustfuse_crypt::Cipher>>> {
+    let volume = rustfuse_hub::Volume::new(store.clone());
+    let Some(info) = volume.key_info().await? else {
+        return Ok(None);
+    };
+    let key = info.unlock(&passphrase(false)?)?;
+    Ok(Some(Arc::new(rustfuse_crypt::Cipher::new(&key))))
 }
 
 async fn connect(
@@ -534,7 +573,8 @@ async fn remote_tree(
     let spec = hub.spec()?;
     let config = store.config(volume, hub)?;
     let s = volume_store(&config, creds, &spec).await?;
-    Ok(rustfuse_sync::remote::RemoteTree::load(s).await?)
+    let cipher = volume_cipher(&s).await?;
+    Ok(rustfuse_sync::remote::RemoteTree::load(s, cipher).await?)
 }
 
 /// One sync round after init/attach; failing it is not fatal, since `sync`
@@ -1087,15 +1127,21 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Init {
             dir,
             volume,
+            encrypt,
             hub,
             store,
             creds,
         } => {
             let spec = hub.spec()?;
             let config = store.config(volume, &hub)?;
+            let encryption = if encrypt {
+                Some(rustfuse_crypt::KeyInfo::create(&passphrase(true)?)?)
+            } else {
+                None
+            };
             let s = volume_store(&config, &creds, &spec).await?;
             let dir = dir.canonicalize().with_context(|| format!("{}", dir.display()))?;
-            let (mut r, stats) = Replica::init(&dir, config, s).await?;
+            let (mut r, stats) = Replica::init_with(&dir, config, s, encryption).await?;
             println!(
                 "Created volume {}: {} entries, {} read, {} uploaded in {} packs.",
                 r.config().volume,
@@ -1117,7 +1163,11 @@ async fn run(cli: Cli) -> Result<()> {
             let spec = hub.spec()?;
             let config = store.config(volume, &hub)?;
             let s = volume_store(&config, &creds, &spec).await?;
-            let mut r = Replica::attach_with(&dir, config, s, lazy).await?;
+            let pass = match rustfuse_hub::Volume::new(s.clone()).key_info().await? {
+                Some(_) => Some(passphrase(false)?),
+                None => None,
+            };
+            let mut r = Replica::attach_with(&dir, config, s, lazy, pass.as_deref()).await?;
             println!(
                 "Attached volume {} at {} ({} entries).",
                 r.config().volume,
@@ -1372,6 +1422,7 @@ async fn run(cli: Cli) -> Result<()> {
                 retention: Duration::from_secs(retention_days * 24 * 3600),
                 delay: Duration::from_secs(delay_minutes * 60),
                 dry_run,
+                cipher: volume_cipher(&s).await?,
                 ..Default::default()
             };
             let st = rustfuse_sync::gc::collect(s, &opts).await?;

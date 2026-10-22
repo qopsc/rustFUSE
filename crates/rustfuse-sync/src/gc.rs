@@ -66,6 +66,9 @@ pub struct GcOptions {
     pub dry_run: bool,
     /// The current time (a parameter so tests can move it).
     pub now: SystemTime,
+    /// An encrypted volume's key: cleanup reads the log to see what is
+    /// used, and checks chunks before copying them.
+    pub cipher: Option<Arc<rustfuse_crypt::Cipher>>,
 }
 
 impl Default for GcOptions {
@@ -75,6 +78,7 @@ impl Default for GcOptions {
             delay: Duration::from_secs(3600),
             dry_run: false,
             now: SystemTime::now(),
+            cipher: None,
         }
     }
 }
@@ -105,8 +109,11 @@ pub struct GcStats {
 
 /// Runs one cleanup pass over the volume `store` is scoped to.
 pub async fn collect(store: Arc<dyn ObjectStore>, opts: &GcOptions) -> Result<GcStats> {
-    let volume = Volume::new(store.clone());
+    let volume = Volume::new(store.clone()).with_cipher(opts.cipher.clone());
     volume.check().await?;
+    if opts.cipher.is_none() && volume.key_info().await?.is_some() {
+        return Err(rustfuse_hub::Error::NeedKey.into());
+    }
     let cutoff = opts.now.checked_sub(opts.retention).unwrap_or(UNIX_EPOCH);
     let refs = used_refs(&volume, cutoff).await?;
     let forwards = load_forwards(store.as_ref()).await?;
@@ -227,7 +234,8 @@ pub async fn collect(store: Arc<dyn ObjectStore>, opts: &GcOptions) -> Result<Gc
             async move { store.delete(&rustfuse_chunk::forward_key(p)).await }
         }))
         .await?;
-        compact(store.as_ref(), &sparse, &live, &forwards, &stamp).await?;
+        let sealing = rustfuse_chunk::Sealing::with(opts.cipher.clone());
+        compact(store.as_ref(), &sealing, &sparse, &live, &forwards, &stamp).await?;
     }
     info!(?stats, dry_run = opts.dry_run, "cleanup done");
     Ok(stats)
@@ -250,14 +258,14 @@ async fn used_refs(volume: &Volume, cutoff: SystemTime) -> Result<HashMap<(PackI
     // count while recent.
     let (before, after): (Vec<u64>, Vec<u64>) = seqs.into_iter().partition(|&s| s <= start);
     for seq in after {
-        let cs = volume.get_changeset(seq).await?;
+        let cs = volume.open_changeset(volume.get_changeset(seq).await?)?;
         tree.apply(cs.version, &cs.ops);
         if cs.version.time.0 >= cutoff_ns {
             add_ops(&mut used, &cs.ops);
         }
     }
     for seq in before.into_iter().rev() {
-        let cs = volume.get_changeset(seq).await?;
+        let cs = volume.open_changeset(volume.get_changeset(seq).await?)?;
         // The log is close to HLC order; this window is only a margin
         // (machines repair what they need), so the first old one ends it.
         if cs.version.time.0 < cutoff_ns {
@@ -325,6 +333,7 @@ fn follow_forwards(
 /// the table exists the old pack must stay.
 async fn compact(
     store: &dyn ObjectStore,
+    sealing: &rustfuse_chunk::Sealing,
     sparse: &[(PackId, u64)],
     live: &HashMap<PackId, HashMap<u64, ChunkRef>>,
     forwards: &HashMap<PackId, Forward>,
@@ -345,7 +354,7 @@ async fn compact(
                 .get(c.offset as usize..(c.offset + u64::from(c.stored_len)) as usize)
                 .ok_or_else(|| Error::Corrupt(format!("{}: too short", pack.object_key())))?;
             // Never copy damage into the new pack.
-            rustfuse_chunk::decode(c, stored)?;
+            sealing.decode(c, stored)?;
             let moved = ChunkRef {
                 pack: id,
                 offset: buf.len() as u64,

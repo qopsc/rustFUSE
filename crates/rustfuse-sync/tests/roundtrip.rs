@@ -52,8 +52,16 @@ fn config(volume: &str, replica: u64) -> Config {
         via_hub: false,
         replica: ReplicaId(replica),
         seed: [replica as u8; 16],
+        encrypted: false,
     }
 }
+
+/// Argon2 settings that keep tests fast.
+const CHEAP_KDF: rustfuse_crypt::KdfParams = rustfuse_crypt::KdfParams {
+    memory_kib: 64,
+    iterations: 1,
+    lanes: 1,
+};
 
 /// A store that can be switched off to simulate losing the network.
 struct Flaky {
@@ -235,6 +243,11 @@ fn init_logging() {
 impl Cluster {
     /// Machine 0 creates the volume from `populate`; the others attach.
     async fn new(n: usize, populate: impl FnOnce(&Path)) -> Cluster {
+        Cluster::new_with(n, populate, None).await
+    }
+
+    /// Like [`new`](Self::new); with a passphrase the volume is encrypted.
+    async fn new_with(n: usize, populate: impl FnOnce(&Path), passphrase: Option<&str>) -> Cluster {
         init_logging();
         let tmp = tempfile::tempdir().unwrap();
         // Ties the machines' paths in the log to the test (the thread name).
@@ -287,11 +300,14 @@ impl Cluster {
             let r = if i == 0 {
                 fs::create_dir(&dir).unwrap();
                 populate.take().unwrap()(&dir);
-                let (mut r, _) = Replica::init(&dir, cfg, store).await.unwrap();
+                let key = passphrase.map(|p| rustfuse_crypt::KeyInfo::create_with(p, CHEAP_KDF).unwrap());
+                let (mut r, _) = Replica::init_with(&dir, cfg, store, key).await.unwrap();
                 r.sync_once(&c.hub, TIMEOUT).await.unwrap();
                 r
             } else {
-                Replica::attach(&dir, cfg, store).await.unwrap()
+                Replica::attach_with(&dir, cfg, store, false, passphrase)
+                    .await
+                    .unwrap()
             };
             c.dirs.push(dir);
             c.replicas.push(r);
@@ -1664,7 +1680,7 @@ async fn lazy_directory_fetches_on_demand() {
     let lazy = c._tmp.path().join("lazy");
     let mut cfg = config("vol", 9);
     cfg.hub = Some(c.hub.addr.clone());
-    let mut r = Replica::attach_with(&lazy, cfg, c.volume.clone(), true)
+    let mut r = Replica::attach_with(&lazy, cfg, c.volume.clone(), true, None)
         .await
         .unwrap();
     assert!(rustfuse_sync::lazy::is_lazy(&lazy));
@@ -1837,7 +1853,7 @@ async fn keep_downloaded_free_up_space_and_usage() {
     let lazy = c._tmp.path().join("lazy");
     let mut cfg = config("vol", 9);
     cfg.hub = Some(c.hub.addr.clone());
-    let mut r = Replica::attach_with(&lazy, cfg, c.volume.clone(), true)
+    let mut r = Replica::attach_with(&lazy, cfg, c.volume.clone(), true, None)
         .await
         .unwrap();
     let h = Arc::new(rustfuse_sync::lazy::Hydrator::new(&lazy, c.volume.clone()).unwrap());
@@ -1976,7 +1992,7 @@ async fn remote_tree_lists_and_downloads_without_a_replica() {
     fs::remove_file(c.dir(0).join("README.md")).unwrap();
     c.sync(0).await;
 
-    let tree = rustfuse_sync::remote::RemoteTree::load(c.volume.clone())
+    let tree = rustfuse_sync::remote::RemoteTree::load(c.volume.clone(), None)
         .await
         .unwrap();
     let names = |p: &str| -> Vec<String> {
@@ -2022,4 +2038,104 @@ async fn remote_tree_lists_and_downloads_without_a_replica() {
         tree.download(Path::new("run.sh"), &one).await.is_err(),
         "never overwrites"
     );
+}
+
+/// Every object in the volume's part of the bucket.
+async fn all_objects(store: &Arc<dyn ObjectStore>) -> Vec<(String, Bytes)> {
+    let mut out = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store.list("", after.as_deref(), 1000).await.unwrap();
+        for o in page.objects {
+            let data = store.get(&o.key).await.unwrap();
+            out.push((o.key, data));
+        }
+        match page.next_start_after {
+            Some(a) => after = Some(a),
+            None => return out,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_volume_hides_names_and_content() {
+    let pass = "correct horse battery staple";
+    let mut c = Cluster::new_with(2, sample_tree, Some(pass)).await;
+    fs::write(c.dir(1).join("secret-plan.txt"), "attack at dawn\n").unwrap();
+    fs::rename(c.dir(0).join("src/main.rs"), c.dir(0).join("src/renamed.rs")).unwrap();
+    c.settle().await;
+    assert!(c.dir(0).join("secret-plan.txt").exists());
+
+    // The bucket holds no names, paths or file contents.
+    let objects = all_objects(&c.volume).await;
+    assert!(objects.len() > 3, "{}", objects.len());
+    let needles: [&[u8]; 7] = [
+        b"README.md",
+        b"secret-plan",
+        b"renamed.rs",
+        b"nested",
+        b"attack at dawn",
+        b"fn main",
+        b"line\nline\n",
+    ];
+    for (key, data) in &objects {
+        for n in needles {
+            let n_str = String::from_utf8_lossy(n);
+            assert!(!key.contains(n_str.as_ref()), "{key} names {n_str}");
+            assert!(!data.windows(n.len()).any(|w| w == n), "{key} contains {n_str}");
+        }
+    }
+    // Same content in another volume would hash differently: chunk ids
+    // are keyed, so no plain BLAKE3 hash of a file appears as a key.
+    let plain = blake3_hex(b"attack at dawn\n");
+    assert!(objects.iter().all(|(k, _)| !k.contains(&plain)));
+
+    // Without the passphrase (or with a wrong one) nothing can be read.
+    let other = c._tmp.path().join("nokey");
+    let err = Replica::attach_with(&other, config("vol", 9), c.volume.clone(), false, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("passphrase"), "{err}");
+    let err = Replica::attach_with(&other, config("vol", 9), c.volume.clone(), false, Some("nope"))
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("passphrase"), "{err}");
+    assert!(
+        rustfuse_sync::remote::RemoteTree::load(c.volume.clone(), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        rustfuse_sync::gc::collect(c.volume.clone(), &Default::default())
+            .await
+            .is_err()
+    );
+
+    // With the key: browsing, downloading and cleanup work.
+    let info = rustfuse_hub::Volume::new(c.volume.clone())
+        .key_info()
+        .await
+        .unwrap()
+        .unwrap();
+    let cipher = Arc::new(rustfuse_crypt::Cipher::new(&info.unlock(pass).unwrap()));
+    let tree = rustfuse_sync::remote::RemoteTree::load(c.volume.clone(), Some(cipher.clone()))
+        .await
+        .unwrap();
+    let dest = c._tmp.path().join("plan.txt");
+    tree.download(Path::new("secret-plan.txt"), &dest).await.unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), b"attack at dawn\n");
+    let opts = rustfuse_sync::gc::GcOptions {
+        cipher: Some(cipher),
+        ..Default::default()
+    };
+    rustfuse_sync::gc::collect(c.volume.clone(), &opts).await.unwrap();
+
+    // A third machine attaches with the passphrase and gets everything.
+    let third = c._tmp.path().join("m2");
+    Replica::attach_with(&third, config("vol", 3), c.volume.clone(), false, Some(pass))
+        .await
+        .unwrap();
+    assert_same(c.dir(0), &third);
 }

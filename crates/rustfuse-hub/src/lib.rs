@@ -58,6 +58,10 @@ pub enum Error {
     Refused(String),
     #[error("hub TLS: {0}")]
     Tls(String),
+    #[error("this volume is encrypted; give its passphrase")]
+    NeedKey,
+    #[error(transparent)]
+    Crypt(#[from] rustfuse_crypt::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

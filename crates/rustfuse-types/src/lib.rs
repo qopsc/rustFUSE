@@ -72,6 +72,10 @@ impl fmt::Debug for PackId {
 pub enum Codec {
     Raw,
     Zstd,
+    /// Encrypted with the volume's key (`rustfuse-crypt`), after
+    /// compression for `SealedZstd`.
+    SealedRaw,
+    SealedZstd,
 }
 
 /// Where one chunk of file content is stored.
@@ -273,12 +277,18 @@ pub enum Op {
         node: NodeId,
         base: Versions,
     },
+    /// All of an encrypted volume's ops in one changeset, sealed with its
+    /// key (`rustfuse-crypt`); the only op such a changeset holds. Opened
+    /// before anything reads them, so it never reaches a tree.
+    Sealed(Vec<u8>),
 }
 
 impl Op {
+    /// The node the op changes (none for a sealed op).
     pub fn node(&self) -> NodeId {
         match self {
             Op::Upsert { node, .. } | Op::Remove { node, .. } => *node,
+            Op::Sealed(_) => NodeId::ROOT,
         }
     }
 }

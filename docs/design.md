@@ -342,7 +342,7 @@ replicas converge to the same result).
 - Chunks are batched into **pack objects** (~8–32 MiB) per push, with an
   index, so a 100k-file repo is not 100k S3 PUTs. Packs are immutable;
   cleanup deletes unused ones and compacts sparse ones (§5.5).
-- Optional zstd compression and client-side encryption per chunk.
+- zstd compression per chunk, and optional client-side encryption (§5.6).
 - Each daemon keeps a local **chunk cache** so applying remote ops for
   content it already has costs nothing.
 
@@ -393,6 +393,47 @@ names it directly. Measured on a 700 MB repository (24k loose objects,
 then `git gc`): the bucket held 199 MiB after syncing the gc; one run
 compacted 7 packs (112 MiB into 30 MiB) in 1.4 s, and the next deleted
 the originals, leaving 117 MiB.
+
+### 5.6 Encryption
+
+`rustfuse init --encrypt` creates an encrypted volume: file content, names,
+paths, modes, symlink targets and git refs are sealed on each machine
+before they leave it. The hub, the bucket and anyone holding the S3
+credentials see only object sizes, counts and timing. Existing volumes
+stay unencrypted; there is no in-place conversion.
+
+**Keys.** A random 32-byte volume key is generated at `init`. It is
+wrapped with a key derived from the volume's passphrase (Argon2id, 64 MiB,
+3 passes) and stored, with the salt and parameters, as `encryption` in
+`volume.json`. `attach` (and `ls`, `get`, `gc`) asks for the passphrase,
+or reads `RUSTFUSE_PASSPHRASE`, and unwraps the key; a wrong passphrase
+fails the AEAD check. Each machine then keeps the key in
+`.rustfuse/key` (mode 0600), next to the plaintext files it protects, so
+`sync`, `mount` and the File Provider socket never ask again. Losing the
+passphrase and every machine's copy loses the volume.
+
+Three subkeys are derived from the volume key with BLAKE3's key
+derivation (one each for chunk ids, chunk content and metadata), and
+everything is sealed with XChaCha20-Poly1305 and a random 24-byte nonce:
+
+- **Chunks.** A chunk's id is a keyed BLAKE3 hash of its plaintext, so ids
+  reveal nothing and cannot be checked against known files, while
+  identical chunks still deduplicate within the volume. The stored bytes
+  are `nonce || ciphertext` of the (possibly zstd-compressed) chunk, with
+  the id as associated data so a chunk cannot be swapped for another.
+  Codecs `SealedRaw` and `SealedZstd` mark them.
+- **Changesets.** The ops of a changeset (which carry names, inline file
+  data and refs) are replaced by one `Sealed` op; the version (time and
+  machine) stays in the clear for ordering and is bound in as associated
+  data. The hub appends changesets without opening them.
+- **Snapshots.** The whole snapshot is sealed, bound to its sequence
+  number.
+
+The new enum variants are appended, so the format version is unchanged and
+older logs still decode. A machine refuses sealed data without the key and
+plaintext ops in an encrypted volume. Not hidden: how many changesets and
+chunks there are, their sizes (so roughly how much changed and how large
+files are) and which machine wrote each changeset.
 
 ## 6. Change capture and apply
 
@@ -679,6 +720,7 @@ crates/
   rustfuse-types   ids, HLC, versions, ops, changesets, snapshots
   rustfuse-store   ObjectStore trait + S3 + memory + prefix views
   rustfuse-chunk   FastCDC + BLAKE3 + packs
+  rustfuse-crypt   volume keys, passphrase wrap, sealing (§5.6)
   rustfuse-hub     log in the bucket, wire protocol, hub server + client
   rustfuse-sync    tree + conflict rules, redb index, scanner, watcher,
                    applier, outbox, sync loop, File Provider protocol (§2.2)
@@ -712,7 +754,7 @@ macos/             Mac app + File Provider extension (Swift, §2.2)
 | **1. Single machine** (**done**) | Chunking + packs, local index, watcher + scanner, `rustfuse init` (upload a tree), `rustfuse attach` (materialize a tree on another dir), one-way sync. This already gives backup and restore. |
 | **2. Hub + multi-machine** (**done**) | Hub, op log, HLC, outbox, push/pull, live notifications, generic conflict rules, convergence test harness |
 | **3. Git awareness** (**done**) | Objects union, ref ancestry merge, packed-refs, reflogs, index handling, worktree cleanup after branch conflicts, portable linked worktrees, exclusions, git scenario tests |
-| **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Deferred: client-side encryption (rustFS server-side encryption for now); a full 25 GB run |
+| **4. Scale & speed** (**done**) | Measured on a 300k-file repo (§8.1); parallel apply, leaner index, fsmonitor hook, batched git cleanup, hub TLS, streamed large files with local chunk reuse (**done**); chunks are zstd-compressed since Phase 1. Client-side encryption (§5.6) added later. Deferred: a full 25 GB run |
 | **5. Remote & ops** (**done**) | Hub as storage proxy for remote machines (**done**), cleanup of unused packs and old snapshots, compaction of sparse packs (**done**), metrics (**done**), several hubs per bucket with failover (**done**), per-machine keys (**done**) |
 | **6. Optional mount** | Read/write FUSE (Linux; macOS through macFUSE, kernel or FSKit backend) and NFS (Linux, macOS) frontends over the replica, and lazy directories that fetch content on first open, §2.1, with `--cache-size` to drop fetched content again (**done**). macOS File Provider lazy mode, §2.2 (daemon side done; Mac app next) |
 

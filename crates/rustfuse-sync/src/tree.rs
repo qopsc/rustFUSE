@@ -204,6 +204,9 @@ impl Tree {
                     changed,
                 } => cx.upsert(*node, entry, *base, *changed),
                 Op::Remove { node, base } => cx.remove(*node, *base),
+                // Opened before it reaches a tree (`Volume::open_changeset`);
+                // its node is the root, skipped above.
+                Op::Sealed(_) => {}
             }
         }
         cx.settle();

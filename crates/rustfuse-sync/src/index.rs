@@ -50,6 +50,10 @@ pub struct Config {
     pub replica: ReplicaId,
     /// Unique seed for this replica's pack ids.
     pub seed: [u8; 16],
+    /// The volume is encrypted; its key is in `.rustfuse/key`
+    /// (`crate::crypt`).
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 impl Config {

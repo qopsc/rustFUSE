@@ -9,12 +9,18 @@
 //!
 //! Only the hub appends to the log; machines read snapshots and log
 //! entries directly to catch up.
+//!
+//! In an encrypted volume (`volume.json` holds its wrapped key), each
+//! changeset carries its ops as one [`Op::Sealed`], and each snapshot
+//! object is sealed whole. The hub stores and forwards them as they are;
+//! machines seal and open them with a [`Volume`] that has the key.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use rustfuse_crypt::{Cipher, KeyInfo, Meta};
 use rustfuse_store::ObjectStore;
-use rustfuse_types::{Changeset, FORMAT_VERSION, Snapshot};
+use rustfuse_types::{Changeset, FORMAT_VERSION, Op, Snapshot, Version};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, codec};
@@ -25,6 +31,10 @@ const VOLUME_KEY: &str = "volume.json";
 struct VolumeInfo {
     format: u32,
     created: rustfuse_types::Timestamp,
+    /// The volume key, wrapped with the passphrase; absent when the
+    /// volume is not encrypted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption: Option<KeyInfo>,
 }
 
 fn log_key(seq: u64) -> String {
@@ -75,12 +85,104 @@ fn seq_of(key: &str) -> Option<u64> {
 #[derive(Clone)]
 pub struct Volume {
     store: Arc<dyn ObjectStore>,
+    cipher: Option<Arc<Cipher>>,
+}
+
+fn version_bytes(v: Version) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&v.time.0.to_le_bytes());
+    b[8..].copy_from_slice(&v.replica.0.to_le_bytes());
+    b
 }
 
 impl Volume {
     /// `store` must already be scoped to the volume's prefix.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Volume { store }
+        Volume { store, cipher: None }
+    }
+
+    /// Seals and opens with `cipher` (an encrypted volume's key).
+    pub fn with_cipher(mut self, cipher: Option<Arc<Cipher>>) -> Self {
+        self.cipher = cipher;
+        self
+    }
+
+    pub fn cipher(&self) -> Option<&Arc<Cipher>> {
+        self.cipher.as_ref()
+    }
+
+    /// The wrapped key of an encrypted volume (`None`: not encrypted).
+    pub async fn key_info(&self) -> Result<Option<KeyInfo>> {
+        Ok(self.info().await?.encryption)
+    }
+
+    async fn info(&self) -> Result<VolumeInfo> {
+        let raw = match self.store.get(VOLUME_KEY).await {
+            Ok(raw) => raw,
+            Err(rustfuse_store::Error::NotFound(_)) => return Err(Error::NoVolume),
+            Err(e) => return Err(e.into()),
+        };
+        serde_json::from_slice(&raw).map_err(|e| Error::Corrupt(format!("{VOLUME_KEY}: {e}")))
+    }
+
+    /// Replaces an encrypted volume's wrapped key (a new passphrase for
+    /// the same key).
+    pub async fn set_key_info(&self, key: KeyInfo) -> Result<()> {
+        let mut info = self.info().await?;
+        if info.encryption.is_none() {
+            return Err(Error::Corrupt("the volume is not encrypted".into()));
+        }
+        info.encryption = Some(key);
+        self.store
+            .put(VOLUME_KEY, Bytes::from(serde_json::to_vec(&info).unwrap()))
+            .await?;
+        Ok(())
+    }
+
+    /// The changeset as the hub stores it: in an encrypted volume, its ops
+    /// sealed into one [`Op::Sealed`].
+    pub fn seal_changeset(&self, cs: &Changeset) -> Changeset {
+        let Some(c) = &self.cipher else {
+            return cs.clone();
+        };
+        let what = Meta::Changeset {
+            version: version_bytes(cs.version),
+            local: cs.local,
+        };
+        Changeset {
+            ops: vec![Op::Sealed(c.seal_meta(what, &codec::encode(&cs.ops)))],
+            ..cs.clone()
+        }
+    }
+
+    /// The changeset with its ops readable. In an encrypted volume they
+    /// must be sealed with its key; in any other they must not be sealed.
+    pub fn open_changeset(&self, mut cs: Changeset) -> Result<Changeset> {
+        let sealed = match cs.ops.as_slice() {
+            [Op::Sealed(data)] => Some(data),
+            ops if ops.iter().any(|o| matches!(o, Op::Sealed(_))) => {
+                return Err(Error::Corrupt(format!("changeset {}: mixed sealed ops", cs.seq)));
+            }
+            _ => None,
+        };
+        match (&self.cipher, sealed) {
+            (None, None) => Ok(cs),
+            (None, Some(_)) => Err(Error::NeedKey),
+            (Some(_), None) if cs.ops.is_empty() => Ok(cs),
+            (Some(_), None) => Err(Error::Corrupt(format!(
+                "changeset {} is not sealed in an encrypted volume",
+                cs.seq
+            ))),
+            (Some(c), Some(data)) => {
+                let what = Meta::Changeset {
+                    version: version_bytes(cs.version),
+                    local: cs.local,
+                };
+                let raw = c.open_meta(what, data)?;
+                cs.ops = codec::decode(&format!("changeset {}", cs.seq), &raw)?;
+                Ok(cs)
+            }
+        }
     }
 
     pub fn store(&self) -> &Arc<dyn ObjectStore> {
@@ -92,12 +194,18 @@ impl Volume {
     }
 
     pub async fn create(&self) -> Result<()> {
+        self.create_with(None).await
+    }
+
+    /// Creates the volume, encrypted with the key `encryption` wraps.
+    pub async fn create_with(&self, encryption: Option<KeyInfo>) -> Result<()> {
         if self.exists().await? {
             return Err(Error::VolumeExists);
         }
         let info = VolumeInfo {
             format: FORMAT_VERSION,
             created: rustfuse_types::Timestamp::now(),
+            encryption,
         };
         self.store
             .put(VOLUME_KEY, Bytes::from(serde_json::to_vec(&info).unwrap()))
@@ -106,13 +214,7 @@ impl Volume {
     }
 
     pub async fn check(&self) -> Result<()> {
-        let raw = match self.store.get(VOLUME_KEY).await {
-            Ok(raw) => raw,
-            Err(rustfuse_store::Error::NotFound(_)) => return Err(Error::NoVolume),
-            Err(e) => return Err(e.into()),
-        };
-        let info: VolumeInfo =
-            serde_json::from_slice(&raw).map_err(|e| Error::Corrupt(format!("{VOLUME_KEY}: {e}")))?;
+        let info = self.info().await?;
         if info.format != FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
                 "unsupported volume format {}",
@@ -156,7 +258,11 @@ impl Volume {
     }
 
     pub async fn put_snapshot(&self, snap: &Snapshot) -> Result<()> {
-        self.store.put(&snap_key(snap.seq), codec::encode(snap)).await?;
+        let mut data = codec::encode(snap);
+        if let Some(c) = &self.cipher {
+            data = Bytes::from(c.seal_meta(Meta::Snapshot { seq: snap.seq }, &data));
+        }
+        self.store.put(&snap_key(snap.seq), data).await?;
         Ok(())
     }
 
@@ -165,7 +271,14 @@ impl Volume {
             return Ok(None);
         };
         let key = snap_key(seq);
-        let snap: Snapshot = codec::decode(&key, &self.store.get(&key).await?)?;
+        let mut data = self.store.get(&key).await?;
+        if let Some(c) = &self.cipher {
+            data = Bytes::from(c.open_meta(Meta::Snapshot { seq }, &data)?);
+        }
+        let snap: Snapshot = codec::decode(&key, &data)?;
+        if snap.seq != seq {
+            return Err(Error::Corrupt(format!("{key}: holds snapshot {}", snap.seq)));
+        }
         if snap.format != FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
                 "{key}: unsupported format {}",
@@ -235,5 +348,57 @@ mod tests {
             .unwrap();
         }
         assert_eq!(v.latest_snapshot().await.unwrap().unwrap().seq, 10);
+    }
+
+    #[tokio::test]
+    async fn encrypted_volumes_seal_changesets_and_snapshots() {
+        use rustfuse_types::{NodeId, Versions};
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let (info, _) = KeyInfo::create_with(
+            "pass",
+            rustfuse_crypt::KdfParams {
+                memory_kib: 64,
+                iterations: 1,
+                lanes: 1,
+            },
+        )
+        .unwrap();
+        let hub = Volume::new(store.clone());
+        hub.create_with(Some(info.clone())).await.unwrap();
+        assert_eq!(hub.key_info().await.unwrap(), Some(info.clone()));
+        let key = info.unlock("pass").unwrap();
+        let machine = Volume::new(store.clone()).with_cipher(Some(Arc::new(Cipher::new(&key))));
+
+        let mut plain = cs(0);
+        plain.ops = vec![Op::Remove {
+            node: NodeId(42),
+            base: Versions::default(),
+        }];
+        let mut sealed = machine.seal_changeset(&plain);
+        assert!(matches!(sealed.ops.as_slice(), [Op::Sealed(_)]));
+        // The hub numbers and stores it without reading it.
+        sealed.seq = 1;
+        hub.put_changeset(&sealed).await.unwrap();
+        let back = machine
+            .open_changeset(hub.get_changeset(1).await.unwrap())
+            .unwrap();
+        assert_eq!(back.ops, plain.ops);
+        assert!(matches!(hub.open_changeset(sealed.clone()), Err(Error::NeedKey)));
+        // A hub cannot pass off ops in the clear, or one changeset's ops
+        // as another's.
+        assert!(machine.open_changeset(plain.clone()).is_err());
+        let mut moved = sealed.clone();
+        moved.local += 1;
+        assert!(machine.open_changeset(moved).is_err());
+
+        let snap = Snapshot {
+            format: FORMAT_VERSION,
+            seq: 1,
+            nodes: vec![],
+            removed: vec![],
+        };
+        machine.put_snapshot(&snap).await.unwrap();
+        assert_eq!(machine.latest_snapshot().await.unwrap(), Some(snap));
+        assert!(hub.latest_snapshot().await.is_err());
     }
 }
