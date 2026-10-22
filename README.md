@@ -90,6 +90,11 @@ sudo mount -t nfs -o vers=3,tcp,port=20490,mountport=20490,nolock 127.0.0.1:/ /m
 
 NFS has no authentication; listen on a trusted network only.
 
+Edits from other machines show in a FUSE mount as soon as they land. Tools
+that watch for changes (editors, dev servers) should watch the synced
+directory rather than the mount: Linux does not tell watchers of a FUSE
+mount about changes made underneath it.
+
 To avoid downloading a large volume up front, attach it lazily and use it
 only through a mount: files keep their real size and date, and content is
 fetched the first time something opens a file (git data always comes in

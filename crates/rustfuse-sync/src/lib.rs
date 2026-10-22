@@ -24,7 +24,7 @@ use std::path::PathBuf;
 pub use git::original_name;
 pub use ignore::Ignore;
 pub use index::Config;
-pub use replica::{CaptureStats, HubSpec, Replica, SyncStats};
+pub use replica::{CaptureStats, DiskWatch, HubSpec, Replica, SyncStats};
 pub use rustfuse_hub::Volume;
 pub use scan::Change;
 pub use tree::{Tree, conflict_name};

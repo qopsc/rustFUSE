@@ -15,6 +15,6 @@ mod fuse;
 mod fuse;
 mod nfs;
 
-pub use backing::{Backing, Errno, ROOT, SetAttr};
+pub use backing::{Backing, Errno, ROOT, SetAttr, Stale, StaleSink};
 pub use fuse::{FUSE, FuseMount, FuseOpts, mount_fuse};
 pub use nfs::NfsServer;

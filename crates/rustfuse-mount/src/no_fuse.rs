@@ -14,6 +14,7 @@ pub struct FuseOpts {
     pub allow_other: bool,
     pub fskit: bool,
     pub volname: Option<String>,
+    pub cache_for: Option<std::time::Duration>,
 }
 
 /// A FUSE mount; never made in this build.
