@@ -93,12 +93,15 @@ public enum OnQuit: String, Codable, CaseIterable, Sendable {
     case keepSyncing
 }
 
-/// macFUSE's two ways to mount.
+/// How mounts are made.
 public enum MountBackend: String, Codable, CaseIterable, Sendable {
-    /// No kernel extension (macOS 15.4 or later).
+    /// macFUSE without its kernel extension (macOS 15.4 or later).
     case fskit
     /// macFUSE's kernel extension.
     case kernel
+    /// The app's own FSKit extension, no macFUSE (macOS 26 or later;
+    /// `rustfuse mount --native`).
+    case native
 }
 
 public let defaultCacheSize: UInt64 = 20_000_000_000
@@ -224,8 +227,13 @@ public func daemonArguments(_ v: VolumeConfig, dir: URL, socket: URL, settings: 
     case .finder, .folder:
         return ["sync", dir.path, "--provider-socket", socket.path] + cache
     case .mount:
-        let fskit = settings.mountBackend == .fskit ? ["--fskit"] : []
-        return ["mount", dir.path, v.path ?? "", "--provider-socket", socket.path] + cache + fskit
+        let backend: [String] =
+            switch settings.mountBackend {
+            case .fskit: ["--fskit"]
+            case .native: ["--native"]
+            case .kernel: []
+            }
+        return ["mount", dir.path, v.path ?? "", "--provider-socket", socket.path] + cache + backend
     }
 }
 

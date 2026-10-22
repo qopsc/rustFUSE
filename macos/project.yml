@@ -26,6 +26,7 @@ targets:
     dependencies:
       - package: RustFuseKit
       - target: RustFuseFileProvider
+      - target: RustFuseFS
     info:
       path: App/Info.plist
       properties:
@@ -70,6 +71,44 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app.fileprovider
+  # The FSKit module behind `rustfuse mount --native` (design.md §2.1):
+  # mounts a synced directory without macFUSE. macOS 26 only; signing it
+  # needs a team granted the FSKit entitlement.
+  RustFuseFS:
+    type: extensionkit-extension
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources: [FS]
+    dependencies:
+      - package: RustFuseKit
+      - sdk: FSKit.framework
+    info:
+      path: FS/Info.plist
+      properties:
+        CFBundleDisplayName: rustFUSE
+        RustFuseAppGroup: $(RUSTFUSE_APP_GROUP)
+        EXAppExtensionAttributes:
+          EXExtensionPointIdentifier: com.apple.fskit.fsmodule
+          FSShortName: rustfuse
+          FSSupportsPathURLs: true
+          FSSupportsBlockResources: false
+          FSRequiresSecurityScopedPathURLResources: false
+          FSActivateOptionSyntax:
+            shortOptions: ""
+          FSPersonalities:
+            rustfuse:
+              FSName: rustFUSE
+    entitlements:
+      path: FS/RustFuseFS.entitlements
+      properties:
+        com.apple.developer.fskit.fsmodule: true
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups: [$(RUSTFUSE_APP_GROUP)]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app.fs
+        # FSKit's operation protocols predate strict concurrency.
+        SWIFT_VERSION: "5.0"
 schemes:
   rustFUSE:
     build:

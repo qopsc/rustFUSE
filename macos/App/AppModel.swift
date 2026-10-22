@@ -242,8 +242,8 @@ final class AppModel: ObservableObject {
         if mode == .folder, let p = v.path, FileManager.default.fileExists(atPath: p) {
             throw failure("\(p) already exists; choose a new folder.")
         }
-        if mode == .mount && !macfuseAvailable() {
-            throw failure("Mounting needs macFUSE.")
+        if mode == .mount && !mountAvailable(settings) {
+            throw failure(settings.mountBackend == .native ? "Native mounts need macOS 26." : "Mounting needs macFUSE.")
         }
         let dir = syncedDir(v, container: try Shared.container())
         if mode != .folder {

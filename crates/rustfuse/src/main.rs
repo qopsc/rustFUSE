@@ -118,6 +118,12 @@ enum Command {
         /// extension (macOS 15.4 or later; mount under /Volumes).
         #[arg(long)]
         fskit: bool,
+        /// macOS 26 or later: mount with the rustFUSE app's own file system
+        /// extension instead of FUSE (no macFUSE). Needs the app installed
+        /// and its extension turned on in System Settings > General > Login
+        /// Items & Extensions > File System Extensions.
+        #[arg(long, conflicts_with_all = ["fskit", "allow_other", "no_sync"])]
+        native: bool,
         /// Only serve the directory; a `rustfuse sync` runs elsewhere.
         #[arg(long)]
         no_sync: bool,
@@ -1020,6 +1026,61 @@ async fn mount(
     res
 }
 
+/// The file system type the Mac app's FSKit extension registers
+/// (`FSShortName`, macos/FS/Info.plist).
+const NATIVE_FS_TYPE: &str = "rustfuse";
+
+/// `mount --native`: keeps `dir` in sync and has the system mount it at
+/// `mountpoint` through the Mac app's FSKit extension, a passthrough over
+/// the directory that asks this process (over `provider_socket`) for the
+/// content of placeholders it opens. Unmounts on exit.
+async fn mount_native(
+    dir: &Path,
+    mountpoint: &Path,
+    cache_size: Option<u64>,
+    provider_socket: Option<PathBuf>,
+    opts: &SyncOpts,
+) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("--native mounts need macOS 26 or later and the rustFUSE app");
+    }
+    let (_backing, sync) = prepare_serving(dir, false, cache_size, provider_socket, opts).await?;
+    let (from, at) = (dir.to_owned(), mountpoint.to_owned());
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("/sbin/mount")
+            .args(["-t", NATIVE_FS_TYPE])
+            .arg(&from)
+            .arg(&at)
+            .output()
+    })
+    .await??;
+    if !out.status.success() {
+        bail!(
+            "mount at {} failed: {}\nIs the rustFUSE app installed, and its extension turned on in System Settings > \
+             General > Login Items & Extensions > File System Extensions?",
+            mountpoint.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    println!(
+        "Mounted {} at {} (Ctrl-C to unmount).",
+        dir.display(),
+        mountpoint.display()
+    );
+    let res = serve_until(sync, std::future::pending()).await;
+    let at = mountpoint.to_owned();
+    let unmounted =
+        tokio::task::spawn_blocking(move || std::process::Command::new("/sbin/umount").arg(&at).status())
+            .await?;
+    if !unmounted.is_ok_and(|s| s.success()) {
+        tracing::warn!(
+            "could not unmount {}; it may still be in use",
+            mountpoint.display()
+        );
+    }
+    res
+}
+
 async fn serve_nfs(
     dir: &Path,
     listen: &str,
@@ -1239,8 +1300,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Mount {
             dir,
             mountpoint,
+            native: true,
+            cache_size,
+            provider_socket,
+            opts,
+            ..
+        } => mount_native(&dir, &mountpoint, cache_size, provider_socket, &opts).await?,
+        Command::Mount {
+            dir,
+            mountpoint,
             allow_other,
             fskit,
+            native: _,
             no_sync,
             cache_size,
             provider_socket,

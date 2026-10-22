@@ -68,6 +68,18 @@ becomes `._*` files that would sync and show in `git status`. NFS stays at
 v3: the macOS client has no v4.1, and the server is local. A native lazy
 mode through Apple's File Provider framework is in progress (§2.2).
 
+`--native` mounts without macFUSE, through rustFUSE's own FSKit module
+(macOS 26+, `macos/FS`, shipped in the Mac app). `rustfuse mount --native`
+runs the sync and the provider socket as usual, then calls
+`mount -t rustfuse <dir> <mountpoint>`; macOS hands the directory to the
+module as a path resource, and the module serves it as a passthrough like
+the FUSE backends, hiding `.rustfuse`. It fills placeholders through the
+daemon's provider socket (`Fetch` with the path-named id) before opening
+or reading them, and repeats that every 30 s while a file is in use, so
+eviction leaves it alone. The user turns the module on once in System
+Settings › General › Login Items & Extensions › File System Extensions,
+and its signature needs a team granted the FSKit entitlement.
+
 Both pass every operation straight to the synced directory
 (`rustfuse-mount/src/backing.rs`). The sync engine therefore sees a write
 through the mount exactly like an edit made in the directory: it is

@@ -135,8 +135,16 @@ struct SettingsView: View {
                 Picker("Mount with", selection: $backend) {
                     Text("FSKit (no kernel extension)").tag(MountBackend.fskit)
                     Text("macFUSE kernel extension").tag(MountBackend.kernel)
+                    Text("rustFUSE extension (macOS 26, no macFUSE)").tag(MountBackend.native)
                 }
-                if macfuseAvailable() {
+                if backend == .native {
+                    Text(
+                        nativeMountSupported()
+                            ? "Turn on rustFUSE in System Settings > General > Login Items & Extensions > File System Extensions."
+                            : "Needs macOS 26 or later."
+                    )
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                } else if macfuseAvailable() {
                     Text("macFUSE is installed.").font(.caption).foregroundStyle(.secondary)
                 } else {
                     HStack {
@@ -145,7 +153,7 @@ struct SettingsView: View {
                     }
                 }
             } footer: {
-                Text("FSKit mounts belong under /Volumes. Changing this restarts mounted volumes.")
+                Text("macFUSE's FSKit mounts belong under /Volumes. Changing this restarts mounted volumes.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             ErrorText(text: model.lastError)

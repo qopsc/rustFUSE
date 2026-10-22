@@ -70,6 +70,7 @@ jobs:
           cache: rust
       # macFUSE too, so the bundle gets its mount-mode daemon.
       - run: brew install xcodegen pkgconf && brew install --cask macfuse
+      - run: sw_vers && xcodebuild -version
       - run: swift test --package-path macos/RustFuseKit
       - name: Build the app and extension (unsigned)
         working-directory: macos
@@ -86,6 +87,8 @@ jobs:
           "$app/Contents/Helpers/rustfuse" volumes --help | grep -q json
           "$app/Contents/Helpers/rustfuse-macfuse" mount --help | grep -q fskit
           plutil -p "$app/Contents/PlugIns/RustFuseFileProvider.appex/Contents/Info.plist" | grep -q fileprovider-nonui
+          plutil -p "$app/Contents/Extensions/RustFuseFS.appex/Contents/Info.plist" | grep -q fskit.fsmodule
+          "$app/Contents/Helpers/rustfuse" mount --help | grep -q native
       # The UI with sample data (`rustFUSE --screenshots`), kept as an
       # artifact and printed as small JPEGs between markers so the log alone
       # shows it. Best effort: a runner without a window server skips it.
