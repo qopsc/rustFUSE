@@ -1060,8 +1060,13 @@ impl App {
             let backend = match s.mount_backend {
                 MountBackend::Fskit => "fskit",
                 MountBackend::Kernel => "kernel",
+                MountBackend::Native => "native",
             };
-            fields.push(Field::choice("Mount with", &["fskit", "kernel"], backend));
+            fields.push(Field::choice(
+                "Mount with",
+                &["fskit", "kernel", "native"],
+                backend,
+            ));
         }
         let form = Form::new("Settings", fields).with_note(&format!(
             "Library: {}\nVolumes run as a {}.",
@@ -1138,10 +1143,10 @@ impl App {
             FormFor::Settings => {
                 self.lib.settings.default_cache_size = parse_size(&form.get("Default cache size"))?;
                 if form.field("Mount with").is_some() {
-                    self.lib.settings.mount_backend = if form.get("Mount with") == "kernel" {
-                        MountBackend::Kernel
-                    } else {
-                        MountBackend::Fskit
+                    self.lib.settings.mount_backend = match form.get("Mount with").as_str() {
+                        "kernel" => MountBackend::Kernel,
+                        "native" => MountBackend::Native,
+                        _ => MountBackend::Fskit,
                     };
                 }
                 self.save()?;

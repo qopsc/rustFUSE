@@ -23,6 +23,19 @@ func macfuseAvailable() -> Bool {
         && FileManager.default.isExecutableFile(atPath: macfuseTool().path)
 }
 
+/// Whether the native mount can work here: macOS 26 or later, where the
+/// app's FSKit extension serves a folder (it must also be turned on in
+/// System Settings, which only `mount` can tell).
+func nativeMountSupported() -> Bool {
+    if #available(macOS 26.0, *) { return true }
+    return false
+}
+
+/// Whether mount mode can work here with the chosen backend.
+func mountAvailable(_ settings: AppSettings) -> Bool {
+    settings.mountBackend == .native ? nativeMountSupported() : macfuseAvailable()
+}
+
 /// The environment carrying `connection`'s secrets (and an encrypted
 /// volume's passphrase).
 func toolEnv(for connection: Connection?, passphrase: String? = nil) -> [String: String] {
@@ -134,9 +147,10 @@ final class Daemon: @unchecked Sendable {
 
     private func launch() {
         guard !stopped else { return }
-        let tool = volume.mode == .mount ? macfuseTool() : rustfuseTool()
-        if volume.mode == .mount && !macfuseAvailable() {
-            onState("needs macFUSE")
+        let native = settings.mountBackend == .native
+        let tool = volume.mode == .mount && !native ? macfuseTool() : rustfuseTool()
+        if volume.mode == .mount && !mountAvailable(settings) {
+            onState(native ? "needs macOS 26" : "needs macFUSE")
             queue.asyncAfter(deadline: .now() + 30) { [self] in launch() }
             return
         }

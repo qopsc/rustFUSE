@@ -147,11 +147,11 @@ struct AddVolumeSheet: View {
                 Picker("Show it", selection: $mode) {
                     Text("In Finder").tag(Mode.finder)
                     Text("As a folder").tag(Mode.folder)
-                    Text(macfuseAvailable() ? "As a mount" : "As a mount (needs macFUSE)").tag(Mode.mount)
+                    Text(mountAvailable(model.settings) ? "As a mount" : "As a mount (\(mountNeeds))").tag(Mode.mount)
                 }
                 .pickerStyle(.radioGroup)
                 Text(modeHelp).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                if mode == .mount && !macfuseAvailable() {
+                if mode == .mount && !mountAvailable(model.settings) && model.settings.mountBackend != .native {
                     Link("Install macFUSE", destination: URL(string: "https://macfuse.github.io")!)
                 }
                 if mode != .finder {
@@ -183,7 +183,7 @@ struct AddVolumeSheet: View {
                 Button(busy ? "Adding…" : "Add") { add() }
                     .keyboardShortcut(.defaultAction)
                     .mainButton()
-                    .disabled(busy || name.isEmpty || (mode == .mount && !macfuseAvailable()))
+                    .disabled(busy || name.isEmpty || (mode == .mount && !mountAvailable(model.settings)))
             }
         }
         .padding(20)
@@ -194,6 +194,10 @@ struct AddVolumeSheet: View {
         .onAppear { cacheGB = Double(model.settings.defaultCacheSize) / Double(gigabyte) }
     }
 
+    private var mountNeeds: String {
+        model.settings.mountBackend == .native ? "needs macOS 26" : "needs macFUSE"
+    }
+
     private var modeHelp: String {
         switch mode {
         case .finder:
@@ -201,7 +205,9 @@ struct AddVolumeSheet: View {
         case .folder:
             return "A normal folder anywhere, holding a full copy of the volume. Best for builds and tools that read everything."
         case .mount:
-            return "Mounted with macFUSE anywhere you choose. Files download when first opened; git data is always kept."
+            let with =
+                model.settings.mountBackend == .native ? "rustFUSE's own file system extension" : "macFUSE"
+            return "Mounted with \(with) anywhere you choose. Files download when first opened; git data is always kept."
         }
     }
 

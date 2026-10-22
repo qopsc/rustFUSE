@@ -8,8 +8,10 @@ volumes on this Mac. Each volume is shown one of three ways:
   extension or macFUSE.
 - **As a folder** anywhere, holding a full copy.
 - **As a mount** anywhere, through macFUSE (FSKit or its kernel
-  extension); files download when first opened. Greyed out until macFUSE
-  is installed.
+  extension) or, on macOS 26, rustFUSE's own file system extension (no
+  macFUSE; turn it on once in System Settings › General › Login Items &
+  Extensions › File System Extensions); files download when first opened.
+  Greyed out until the chosen backend is available.
 
 Volumes come from saved **connections**: a hub address, its token and CA,
 and optionally S3 keys to read the bucket directly. The app lists the
@@ -42,6 +44,10 @@ How it fits together is in [docs/design.md §2.2](../docs/design.md).
   (`rustFUSE --daemon <volume>`) instead.
 - `Extension/`: the File Provider extension. It holds no sync logic and
   asks the volume's daemon for everything over its socket.
+- `FS/`: the FSKit module behind `rustfuse mount --native` (macOS 26). It
+  serves the synced directory as a passthrough and asks the daemon to fill
+  placeholders in before they are read. Its target builds in Swift 5 mode,
+  since FSKit's protocols predate strict concurrency.
 - `RustFuseKit/`: what both share: the wire protocol, the socket client, the
   app group layout and the saved library (connections, volumes, settings)
   with the daemon command lines built from it. `swift test` checks the

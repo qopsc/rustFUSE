@@ -117,15 +117,18 @@ pub enum OnQuit {
     KeepSyncing,
 }
 
-/// macFUSE's two ways to mount on a Mac.
+/// How mounts are made on a Mac.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MountBackend {
-    /// No kernel extension (macOS 15.4 or later).
+    /// macFUSE without its kernel extension (macOS 15.4 or later).
     #[default]
     Fskit,
     /// macFUSE's kernel extension.
     Kernel,
+    /// The Mac app's own FSKit extension, no macFUSE (macOS 26 or later;
+    /// `mount --native`).
+    Native,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,8 +345,12 @@ pub fn daemon_args(v: &VolumeConfig, dir: &Path, socket: &Path, settings: &Setti
         let size = v.cache_size.unwrap_or(settings.default_cache_size);
         args.extend(["--cache-size".to_string(), size.to_string()]);
     }
-    if v.mode == Mode::Mount && cfg!(target_os = "macos") && settings.mount_backend == MountBackend::Fskit {
-        args.push("--fskit".into());
+    if v.mode == Mode::Mount && cfg!(target_os = "macos") {
+        match settings.mount_backend {
+            MountBackend::Fskit => args.push("--fskit".into()),
+            MountBackend::Native => args.push("--native".into()),
+            MountBackend::Kernel => {}
+        }
     }
     args
 }
@@ -472,6 +479,14 @@ mod tests {
             format!(
                 "mount /D/volumes/proj-2 /mnt/proj --provider-socket /D/s/proj.sock --cache-size 1000{fskit}"
             )
+        );
+        let native = Settings {
+            mount_backend: MountBackend::Native,
+            ..settings.clone()
+        };
+        assert_eq!(
+            daemon_args(&mount, &dir, sock, &native).contains(&"--native".to_string()),
+            cfg!(target_os = "macos")
         );
         let folder = VolumeConfig {
             mode: Mode::Folder,

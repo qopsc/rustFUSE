@@ -6,3 +6,5 @@
 /App/rustFUSE.entitlements
 /Extension/Info.plist
 /Extension/RustFuseFileProvider.entitlements
+/FS/Info.plist
+/FS/RustFuseFS.entitlements

@@ -73,6 +73,9 @@ final class LibraryTests: XCTestCase {
             ])
         settings.mountBackend = .kernel
         XCTAssertFalse(daemonArguments(mount, dir: dir, socket: socket, settings: settings).contains("--fskit"))
+        var native = settings
+        native.mountBackend = .native
+        XCTAssertEqual(daemonArguments(mount, dir: dir, socket: socket, settings: native).last, "--native")
     }
 
     func testDirectBucketAccess() {
