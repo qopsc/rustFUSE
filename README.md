@@ -12,6 +12,25 @@ about 15 s and downloads in about 35 s; `git status` with the fsmonitor
 hook takes 0.06 s. See [docs/design.md](docs/design.md) for the
 architecture and roadmap.
 
+## Install
+
+Each release has static Linux binaries (x86-64, arm64) and Apple silicon
+Mac binaries on the [releases page](https://github.com/qopsc/rustFUSE/releases).
+With Homebrew (macOS or Linux), this repository is the tap:
+
+```sh
+brew tap qopsc/rustfuse https://github.com/qopsc/rustFUSE
+brew install qopsc/rustfuse/rustfuse
+```
+
+On a Mac, `rustfuse-macfuse` comes along for FUSE mounts once macFUSE is
+installed. From source: `cargo install --locked --path crates/rustfuse`
+(add `--features macfuse` on a Mac with macFUSE).
+
+To cut a release, set the version in `Cargo.toml` and push a tag
+`v<version>`: the release workflow builds and publishes the binaries and
+opens a pull request with the updated `Formula/rustfuse.rb`.
+
 ## Usage
 
 ```sh
