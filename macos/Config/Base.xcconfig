@@ -4,6 +4,10 @@
 RUSTFUSE_BUNDLE_PREFIX = dev.rustfuse
 DEVELOPMENT_TEAM =
 CODE_SIGN_STYLE = Automatic
+// Provisioning profiles by name, for manual signing (sign.sh sets them).
+RUSTFUSE_PROFILE_APP =
+RUSTFUSE_PROFILE_FILEPROVIDER =
+RUSTFUSE_PROFILE_FS =
 
 #include? "Local.xcconfig"
 

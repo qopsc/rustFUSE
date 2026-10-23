@@ -97,6 +97,49 @@ Then run `xcodegen generate`, open `rustFUSE.xcodeproj`, run the `rustFUSE`
 scheme, choose **Open rustFUSE…** in the menu bar item, add a connection
 (the hub address and token), then add one of its volumes.
 
+## Signing and releasing
+
+A release tag (see the main README) also builds the app with Developer ID,
+notarizes it and attaches `rustFUSE-<version>.zip` to the release; the Mac
+command line tools in the release are signed and notarized too. This runs
+only when the repository has these secrets (Settings › Secrets and variables
+› Actions); without them, releases carry unsigned tools and no app.
+`macos/sign.sh` does the work.
+
+One-time setup in a paid Apple Developer account:
+
+1. **Certificate.** In Certificates, create a *Developer ID Application*
+   certificate, install it, and export it with its key from Keychain
+   Access as a `.p12` with a password.
+2. **Identifiers.** Register three App IDs: `<prefix>.app`,
+   `<prefix>.app.fileprovider` and `<prefix>.app.fs`, where `<prefix>` is
+   `dev.rustfuse` unless you set `APPLE_BUNDLE_PREFIX`. Give all three the
+   *App Groups* capability (the app uses the group `<TEAMID>.<prefix>`;
+   team-prefixed groups on macOS need no group registered), and
+   `<prefix>.app.fs` also the *FSKit Module* capability.
+3. **Profiles.** Create a *Developer ID* provisioning profile for each App
+   ID and download them.
+4. **Notary key.** In App Store Connect › Users and Access › Integrations,
+   create an API key with the Developer role; note its key ID and issuer
+   ID, and download the `.p8`.
+5. **Secrets.** Add them to the repository (`base64 -i <file>` for files):
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_TEAM_ID` | the team ID, e.g. `ABCDE12345` |
+| `APPLE_BUNDLE_PREFIX` | optional, default `dev.rustfuse` |
+| `APPLE_DEVELOPER_ID_P12` | base64 of the `.p12` |
+| `APPLE_DEVELOPER_ID_P12_PASSWORD` | its password |
+| `APPLE_PROFILE_APP` | base64 of the app's profile |
+| `APPLE_PROFILE_FILEPROVIDER` | base64 of the File Provider extension's profile |
+| `APPLE_PROFILE_FS` | base64 of the FSKit module's profile |
+| `APPLE_API_KEY_ID` | the API key's ID |
+| `APPLE_API_ISSUER_ID` | its issuer ID |
+| `APPLE_API_KEY_P8` | base64 of the `.p8` |
+
+The release workflow runs on pull requests that change `macos/sign.sh`, so
+a signing change can be tried before a tag.
+
 ## Not checked on a Mac yet
 
 All of this compiles in CI, but none of it has run on a Mac yet. Before
