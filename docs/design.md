@@ -455,7 +455,9 @@ files are) and which machine wrote each changeset.
 2. A debounced worker (default 100–300 ms after the last event) stats
    dirty paths, compares to the index (size, mtime, inode, ctime), hashes
    changed files, and emits ops. Renames are detected by inode identity
-   (same dev/inode, new path).
+   (same dev/inode, new path) with the same size and mtime; a new file that
+   merely got a deleted file's inode back is a new file, so another
+   machine's edit of the deleted file never lands in it.
 3. A periodic and startup **verification scan** catches anything events
    missed (overflow, daemon not running). It is a parallel stat walk that
    only hashes files whose stat changed.

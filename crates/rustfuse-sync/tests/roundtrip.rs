@@ -492,6 +492,52 @@ async fn moves_do_not_reupload() {
     c.settle().await;
 }
 
+/// A deleted file's inode reused by a new file is not a move: otherwise the
+/// new file takes the deleted one's identity, and another machine's edit of
+/// the deleted file lands in it (as it did in a git object written right
+/// after `git rm`).
+#[tokio::test]
+async fn reused_inode_is_not_a_move() {
+    use std::os::unix::fs::MetadataExt;
+    let mut c = Cluster::new(2, sample_tree).await;
+    let (a, b) = (c.dir(0).to_path_buf(), c.dir(1).to_path_buf());
+    let ino = fs::metadata(a.join("README.md")).unwrap().ino();
+    fs::remove_file(a.join("README.md")).unwrap();
+    // Create files of other content next to it until one gets the freed
+    // inode; keep that one as `new.txt`, remove the rest before the scan.
+    let mut tries = Vec::new();
+    let mut reused = None;
+    for i in 0..2000 {
+        let f = a.join(format!("try-{i}"));
+        fs::write(&f, "a new file, not README\n").unwrap();
+        if fs::metadata(&f).unwrap().ino() == ino {
+            reused = Some(f);
+            break;
+        }
+        tries.push(f);
+    }
+    for f in tries {
+        fs::remove_file(f).unwrap();
+    }
+    let Some(reused) = reused else {
+        eprintln!("the file system did not reuse the inode; nothing to check");
+        return;
+    };
+    fs::rename(&reused, a.join("new.txt")).unwrap();
+    fs::write(b.join("README.md"), "edited on b\n").unwrap();
+    c.replicas[0].capture(None).await.unwrap();
+    c.replicas[1].capture(None).await.unwrap();
+    c.settle().await;
+    for dir in [&a, &b] {
+        assert_eq!(
+            fs::read_to_string(dir.join("new.txt")).unwrap(),
+            "a new file, not README\n",
+            "in {}",
+            dir.display()
+        );
+    }
+}
+
 #[tokio::test]
 async fn partial_scan_from_watch_paths() {
     let mut c = Cluster::new(2, sample_tree).await;

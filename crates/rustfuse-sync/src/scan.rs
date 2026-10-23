@@ -224,6 +224,11 @@ impl Scanner<'_> {
             }
 
             // Match new names against removed nodes by inode: those are moves.
+            // Only when size and mtime match too: a deleted file's inode is
+            // soon reused (git writes objects right after `git rm`), and
+            // taking that new file for the old one moved would give it the
+            // old file's identity, so another machine's edit of the deleted
+            // file would land in it.
             let mut by_inode: HashMap<(u64, u64), NodeId> = HashMap::new();
             for n in &removed {
                 if let Some(s) = self.stats.get(n)
@@ -235,15 +240,16 @@ impl Scanner<'_> {
             for c in std::mem::take(&mut candidates) {
                 let moved = by_inode
                     .remove(&(c.found.stat.dev, c.found.stat.ino))
-                    .filter(|n| Kind::of_content(&self.tree.get(*n).unwrap().content) == c.found.kind);
+                    .filter(|n| {
+                        Kind::of_content(&self.tree.get(*n).unwrap().content) == c.found.kind
+                            && self
+                                .stats
+                                .get(n)
+                                .is_some_and(|s| s.unchanged_after_move(&c.found.stat))
+                    });
                 match moved {
                     Some(node) => {
                         removed_set.remove(&node);
-                        let read = c.found.kind != Kind::Dir
-                            && !self
-                                .stats
-                                .get(&node)
-                                .is_some_and(|s| s.unchanged_after_move(&c.found.stat));
                         if c.found.kind == Kind::Dir {
                             // Its children are no longer removed; compare
                             // them at the new location instead.
@@ -262,7 +268,7 @@ impl Scanner<'_> {
                             name: c.name,
                             path: c.path,
                             found: c.found,
-                            read,
+                            read: false,
                         });
                     }
                     None => {
