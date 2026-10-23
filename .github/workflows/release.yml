@@ -1,0 +1,167 @@
+name: Release
+
+# A tag `v<version>` (matching the workspace version) builds the binaries,
+# publishes them as a GitHub release and proposes the Homebrew formula for
+# it. On a pull request that touches the release files, the same builds run
+# without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - dev/formula.sh
+      - Formula/**
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  # Binaries for macOS 13 and later.
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: static (musl), so one binary runs on any distribution.
+          - os: linux-amd64
+            target: x86_64-unknown-linux-musl
+          - os: linux-arm64
+            target: aarch64-unknown-linux-musl
+          - os: macos-arm64
+            target: aarch64-apple-darwin
+    runs-on: namespace-profile-rustfuse-${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools file
+      - if: runner.os == 'macOS'
+        run: brew install --cask macfuse && brew install pkgconf
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$version" ]]; then
+            echo "tag ${GITHUB_REF#refs/tags/} does not match the workspace version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: cargo build --release --locked -p rustfuse --target ${{ matrix.target }}
+      # macOS also gets a build with macFUSE mounts, which only starts where
+      # macFUSE is installed; `rustfuse` itself needs nothing extra.
+      - if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked -p rustfuse --features macfuse \
+            --target ${{ matrix.target }} --target-dir target/macfuse
+      - name: Package
+        id: package
+        run: |
+          name=rustfuse-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          bin=target/${{ matrix.target }}/release/rustfuse
+          "$bin" --version | grep -qx "rustfuse ${{ steps.version.outputs.version }}"
+          cp "$bin" README.md LICENSE-APACHE LICENSE-MIT "dist/$name/"
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "$bin" | grep -q "static"
+          else
+            cp target/macfuse/${{ matrix.target }}/release/rustfuse "dist/$name/rustfuse-macfuse"
+            ! otool -L "$bin" | grep -qi fuse
+          fi
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # The formula from the built archives, checked by Homebrew itself.
+  formula:
+    needs: build
+    runs-on: namespace-profile-rustfuse-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write the formula
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          dev/formula.sh "$version" dist > dist/rustfuse.rb
+          cat dist/rustfuse.rb
+      - name: Install from the local archive and test
+        run: |
+          # The formula points at the release; here the archive is served
+          # from the build instead.
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          brew tap-new --no-git rustfuse/local
+          tap=$(brew --repository rustfuse/local)
+          sed "s|https://github.com/qopsc/rustFUSE/releases/download/v$version/|file://$PWD/dist/|" \
+            dist/rustfuse.rb > "$tap/Formula/rustfuse.rb"
+          brew install --formula rustfuse/local/rustfuse
+          brew test rustfuse/local/rustfuse
+          rustfuse --version
+          brew uninstall rustfuse/local/rustfuse
+          brew untap rustfuse/local
+      - uses: actions/upload-artifact@v4
+        with:
+          name: formula
+          path: dist/rustfuse.rb
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, formula]
+    runs-on: namespace-profile-rustfuse-linux-amd64
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          (cd dist && cat *.sha256 > SHA256SUMS)
+          gh release create "$tag" --title "rustFUSE ${tag#v}" --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS dist/rustfuse.rb
+      # The tap is this repository: the formula goes in by pull request.
+      - name: Propose the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          mkdir -p Formula
+          cp dist/rustfuse.rb Formula/rustfuse.rb
+          git add Formula/rustfuse.rb
+          if git diff --cached --quiet; then exit 0; fi
+          branch=formula/$tag
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -m "Homebrew formula for $tag"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "Homebrew formula for $tag" \
+            --body "Points \`brew install\` at the $tag release." \
+          || echo "::warning::Could not open the pull request (Actions may not be allowed to create them); merge $branch by hand."
