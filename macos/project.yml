@@ -41,6 +41,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app
+        PROVISIONING_PROFILE_SPECIFIER: $(RUSTFUSE_PROFILE_APP)
         ENABLE_USER_SCRIPT_SANDBOXING: NO
     postBuildScripts:
       - name: Bundle the rustfuse daemon
@@ -71,6 +72,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app.fileprovider
+        PROVISIONING_PROFILE_SPECIFIER: $(RUSTFUSE_PROFILE_FILEPROVIDER)
   # The FSKit module behind `rustfuse mount --native` (design.md §2.1):
   # mounts a synced directory without macFUSE. macOS 26 only; signing it
   # needs a team granted the FSKit entitlement.
@@ -107,6 +109,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(RUSTFUSE_BUNDLE_PREFIX).app.fs
+        PROVISIONING_PROFILE_SPECIFIER: $(RUSTFUSE_PROFILE_FS)
         # FSKit's operation protocols predate strict concurrency.
         SWIFT_VERSION: "5.0"
 schemes:
