@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "qopsc/rustFUSE: patch, minor and digest updates automerge after CI; majors wait for approval on the dependency dashboard. Releases are tag-triggered, so merging to main publishes nothing.",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "timezone": "UTC",
+  "schedule": ["every weekend"],
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "prHourlyLimit": 0,
+  "prConcurrentLimit": 10,
+  "dependencyDashboard": true,
+  "labels": ["deps"],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": { "schedule": ["at any time"], "addLabels": ["security"] },
+  "platformAutomerge": false,
+  "packageRules": [
+    {
+      "description": "Majors wait for approval on the dependency dashboard",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Patch, minor and digest updates merge themselves once CI is green",
+      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
+      "automerge": true
+    },
+    {
+      "description": "Crates move in one weekly PR",
+      "matchManagers": ["cargo"],
+      "groupName": "cargo"
+    }
+  ]
+}
