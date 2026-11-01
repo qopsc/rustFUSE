@@ -17,11 +17,11 @@ jobs:
   lint:
     runs-on: namespace-profile-rustfuse-linux-amd64
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: rust
       - run: cargo fmt --all --check
@@ -34,9 +34,9 @@ jobs:
         os: [linux-amd64, linux-arm64, macos-arm64]
     runs-on: namespace-profile-rustfuse-${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: rust
       - run: cargo test --all-targets
@@ -47,11 +47,11 @@ jobs:
   macfuse:
     runs-on: namespace-profile-rustfuse-macos-arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: rust
       - run: brew install --cask macfuse && brew install pkgconf
@@ -63,9 +63,9 @@ jobs:
   macos-app:
     runs-on: namespace-profile-rustfuse-macos-arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: rust
       # macFUSE too, so the bundle gets its mount-mode daemon.
@@ -110,7 +110,7 @@ jobs:
             echo "=== END ==="
           done
           ls screenshots/*.png >/dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: screenshots
@@ -132,9 +132,9 @@ jobs:
       # Sync tests log here; printed below if a test fails.
       RUSTFUSE_TEST_LOG_FILE: /tmp/rustfuse-sync-tests.log
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: rust
       - name: Wait for rustFS
