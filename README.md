@@ -15,7 +15,8 @@ architecture and roadmap.
 ## Install
 
 Each release has static Linux binaries (x86-64, arm64) and Apple silicon
-Mac binaries on the [releases page](https://github.com/qopsc/rustFUSE/releases).
+Mac binaries on the [releases page](https://github.com/qopsc/rustFUSE/releases),
+and, once Apple signing is set up (`macos/README.md`), the notarized Mac app.
 With Homebrew (macOS or Linux), this repository is the tap:
 
 ```sh

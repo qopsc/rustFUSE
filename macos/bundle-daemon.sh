@@ -28,8 +28,11 @@ else
   echo "macFUSE not installed: building without mount mode" >&2
 fi
 if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${CODE_SIGNING_ALLOWED:-YES}" = YES ]; then
+  # Release builds are notarized, which needs a secure timestamp.
+  timestamp=--timestamp=none
+  [ "$CONFIGURATION" = Release ] && timestamp=--timestamp
   for tool in "$helpers"/*; do
-    codesign --force --options runtime --timestamp=none \
+    codesign --force --options runtime "$timestamp" \
       --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$tool"
   done
 fi

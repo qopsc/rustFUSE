@@ -2,7 +2,8 @@ name: Release
 
 # A tag `v<version>` (matching the workspace version) builds the binaries,
 # publishes them as a GitHub release and proposes the Homebrew formula for
-# it. On a pull request that touches the release files, the same builds run
+# it. With the Apple signing secrets set (macos/README.md), the Mac tools
+# are signed and notarized, and a signed, notarized Mac app comes along. On a pull request that touches the release files, the same builds run
 # without publishing anything.
 on:
   push:
@@ -12,6 +13,7 @@ on:
       - .github/workflows/release.yml
       - dev/formula.sh
       - Formula/**
+      - macos/sign.sh
 
 permissions:
   contents: read
@@ -64,6 +66,25 @@ jobs:
         run: |
           cargo build --release --locked -p rustfuse --features macfuse \
             --target ${{ matrix.target }} --target-dir target/macfuse
+      - name: Sign and notarize (with the Apple secrets)
+        if: runner.os == 'macOS'
+        env: &apple
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_BUNDLE_PREFIX: ${{ secrets.APPLE_BUNDLE_PREFIX }}
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_PROFILE_APP: ${{ secrets.APPLE_PROFILE_APP }}
+          APPLE_PROFILE_FILEPROVIDER: ${{ secrets.APPLE_PROFILE_FILEPROVIDER }}
+          APPLE_PROFILE_FS: ${{ secrets.APPLE_PROFILE_FS }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          rc=0; macos/sign.sh available || rc=$?
+          if [ "$rc" = 1 ]; then echo "::notice::No Apple signing secrets: the Mac tools stay unsigned."; exit 0; fi
+          [ "$rc" = 0 ] || exit "$rc"
+          macos/sign.sh cli target/${{ matrix.target }}/release/rustfuse \
+            target/macfuse/${{ matrix.target }}/release/rustfuse
       - name: Package
         id: package
         run: |
@@ -88,6 +109,30 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
+
+  # The Mac app, signed with Developer ID and notarized; skipped without
+  # the Apple secrets (CI's macos-app job still builds it unsigned).
+  mac-app:
+    runs-on: namespace-profile-rustfuse-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+      - name: Build, sign and notarize
+        env: *apple
+        run: |
+          rc=0; macos/sign.sh available || rc=$?
+          if [ "$rc" = 1 ]; then echo "::notice::No Apple signing secrets: no Mac app in this release."; exit 0; fi
+          [ "$rc" = 0 ] || exit "$rc"
+          brew install xcodegen pkgconf && brew install --cask macfuse
+          macos/sign.sh app dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-app
+          path: dist/
+          if-no-files-found: ignore
 
   # The formula from the built archives, checked by Homebrew itself.
   formula:
@@ -125,7 +170,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, formula]
+    needs: [build, formula, mac-app]
     runs-on: namespace-profile-rustfuse-linux-amd64
     permissions:
       contents: write
@@ -144,8 +189,9 @@ jobs:
         run: |
           tag=${GITHUB_REF#refs/tags/}
           (cd dist && cat *.sha256 > SHA256SUMS)
+          shopt -s nullglob
           gh release create "$tag" --title "rustFUSE ${tag#v}" --generate-notes \
-            dist/*.tar.gz dist/SHA256SUMS dist/rustfuse.rb
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/rustfuse.rb
       # The tap is this repository: the formula goes in by pull request.
       - name: Propose the formula
         env:
